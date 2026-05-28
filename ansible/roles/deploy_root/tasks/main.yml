@@ -5,29 +5,48 @@
   check_mode: false
   changed_when: false
 
+- name: Ensure deploy owner exists
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      nologin=/usr/sbin/nologin
+      if id -u {{ medusa_deploy_owner | quote }} >/dev/null 2>&1; then
+        sudo -n usermod -g {{ medusa_deploy_group | quote }} {{ medusa_deploy_owner | quote }}
+      else
+        sudo -n useradd --create-home --gid {{ medusa_deploy_group | quote }} --shell "$nologin" {{ medusa_deploy_owner | quote }}
+      fi
+      if [ {{ medusa_deploy_owner | quote }} != {{ ansible_user | quote }} ]; then
+        sudo -n usermod -s "$nologin" {{ medusa_deploy_owner | quote }}
+        sudo -n passwd -l {{ medusa_deploy_owner | quote }} >/dev/null || true
+      fi
+  check_mode: false
+  changed_when: false
+
+- name: Ensure deploy owner home root exists
+  ansible.builtin.command:
+    cmd: >-
+      sudo -n install -d
+      -o {{ medusa_deploy_owner }}
+      -g {{ medusa_deploy_group }}
+      -m 2750
+      {{ medusa_home_root }}
+  check_mode: false
+  changed_when: false
+
 - name: Ensure deploy owner is in deployment group
   ansible.builtin.command:
     cmd: "sudo -n usermod -aG {{ medusa_deploy_group }} {{ medusa_deploy_owner }}"
   check_mode: false
   changed_when: false
 
-- name: Ensure remote user is in deployment group
+- name: Ensure Ansible connection user is in deployment group
   ansible.builtin.command:
-    cmd: "sudo -n usermod -aG {{ medusa_deploy_group }} {{ medusa_remote_user }}"
+    cmd: "sudo -n usermod -aG {{ medusa_deploy_group }} {{ ansible_user }}"
   check_mode: false
   changed_when: false
 
-- name: Ensure deploy owner can traverse remote home root
-  ansible.builtin.shell:
-    cmd: |
-      set -eu
-      if command -v setfacl >/dev/null 2>&1; then
-        sudo -n setfacl -m u:{{ medusa_deploy_owner }}:x {{ medusa_home_root }}
-      else
-        sudo -n chmod o+x {{ medusa_home_root }}
-      fi
-  check_mode: false
-  changed_when: false
+- name: Reset connection so deployment group membership is active
+  ansible.builtin.meta: reset_connection
 
 - name: Ensure managed stacks root exists
   ansible.builtin.command:

@@ -16,14 +16,13 @@ medusa_generated_dir: "{{ lookup('env', 'MEDUSA_GENERATED_DIR') | default(medusa
 medusa_secrets_root: "{{ medusa_inventory_root }}"
 medusa_uv_cache_dir: /tmp/medusa-uv-cache
 
-# Keep deployed homelab-managed files under the remote user's home directory.
-# The manual stacks directory is intentionally left alone; generated Compose
-# stacks are deployed beneath medusa-stacks.
-medusa_remote_user: michelaguilera
-medusa_home_root: "/home/{{ medusa_remote_user }}"
+# Keep deployed Medusa-managed files under a dedicated deployment owner. The
+# manual stacks directory is intentionally left alone; generated Compose stacks
+# are deployed beneath medusa-stacks.
+medusa_home_root: /home/medusa
 medusa_deploy_root: "{{ medusa_home_root }}/medusa"
-medusa_deploy_group: homelab
-medusa_deploy_owner: ansible
+medusa_deploy_group: medusa
+medusa_deploy_owner: medusa
 medusa_managed_stacks_root: "{{ medusa_home_root }}/medusa-stacks"
 
 # Deployment destinations. These are intentionally centralized because homelab

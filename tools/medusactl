@@ -82,6 +82,7 @@ Usage:
     medusactl add-targets-from-file <path>
     medusactl prep-target <name>
     medusactl authorize-target <name>
+    medusactl migrate-deploy-root <name> --from-user <user> [--apply]
     medusactl finalize-dns [--resolver <ip>] [--check] [--force]
     medusactl undo [--dry-run]
     medusactl history [-n <N>]
@@ -2091,6 +2092,125 @@ REMOTE
     return 1
 }
 
+cmd_migrate_deploy_root() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl migrate-deploy-root — copy old operator-home deploy roots to /home/medusa.
+
+Usage:
+  medusactl migrate-deploy-root <name> --from-user <user> [--dry-run]
+  medusactl migrate-deploy-root <name> --from-user <user> --apply
+
+Dry-run is the default. It reports whether these old roots exist:
+
+  /home/<user>/medusa
+  /home/<user>/medusa-stacks
+
+With --apply, the command ensures the target has a locked-login medusa user and
+group, creates /home/medusa/{medusa,medusa-stacks}, then rsyncs existing old
+roots into the new locations and chowns the destination to medusa:medusa. The
+old roots are not deleted.
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "migrate-deploy-root: name argument is required"
+    shift || true
+
+    local from_user="" apply=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from-user)
+                from_user=${2:-}
+                [[ -n "$from_user" ]] || fail "migrate-deploy-root: --from-user requires a value"
+                shift 2
+                ;;
+            --apply)
+                apply=1
+                shift
+                ;;
+            --dry-run)
+                apply=0
+                shift
+                ;;
+            *)
+                fail "migrate-deploy-root: unknown argument: $1"
+                ;;
+        esac
+    done
+    [[ -n "$from_user" ]] || fail "migrate-deploy-root: --from-user is required"
+    if ! [[ "$from_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        fail "migrate-deploy-root: refusing unsafe username '$from_user' (must match ^[a-z_][a-z0-9_-]*\$)"
+    fi
+
+    local target ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    local remote
+    remote=$(cat <<REMOTE
+set -euo pipefail
+TARGET=$(printf %q "$name")
+OLD_USER=$(printf %q "$from_user")
+APPLY=$apply
+ssh_opts=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+
+echo "  target: \${TARGET}"
+echo "  old roots: /home/\${OLD_USER}/medusa, /home/\${OLD_USER}/medusa-stacks"
+echo "  new roots: /home/medusa/medusa, /home/medusa/medusa-stacks"
+
+if [[ "\$APPLY" == "0" ]]; then
+    ssh "\${ssh_opts[@]}" "\$TARGET" "set -eu
+for p in /home/\$OLD_USER/medusa /home/\$OLD_USER/medusa-stacks; do
+  if [ -e \\\$p ]; then
+    echo found: \\\$p
+  else
+    echo missing: \\\$p
+  fi
+done
+echo dry-run: rerun with --apply to copy existing roots with rsync"
+    exit 0
+fi
+
+ssh "\${ssh_opts[@]}" "\$TARGET" "set -eu
+sudo -n groupadd -f medusa
+if id -u medusa >/dev/null 2>&1; then
+  sudo -n usermod -g medusa -s /usr/sbin/nologin medusa
+else
+  sudo -n useradd --create-home --gid medusa --shell /usr/sbin/nologin medusa
+fi
+sudo -n passwd -l medusa >/dev/null || true
+command -v rsync >/dev/null || { echo 'rsync missing on target; install rsync first' >&2; exit 1; }
+sudo -n install -d -o medusa -g medusa -m 2750 /home/medusa
+sudo -n install -d -o medusa -g medusa -m 2775 /home/medusa/medusa /home/medusa/medusa-stacks
+if [ -d /home/\$OLD_USER/medusa ]; then
+  sudo -n rsync -a /home/\$OLD_USER/medusa/ /home/medusa/medusa/
+  sudo -n chown -R medusa:medusa /home/medusa/medusa
+fi
+if [ -d /home/\$OLD_USER/medusa-stacks ]; then
+  sudo -n rsync -a /home/\$OLD_USER/medusa-stacks/ /home/medusa/medusa-stacks/
+  sudo -n chown -R medusa:medusa /home/medusa/medusa-stacks
+fi
+echo migrated deploy roots for \$HOSTNAME"
+REMOTE
+)
+
+    local log install_rc=0
+    log=$(log_path "migrate-deploy-root-$name")
+    printf "%s==>%s migrate-deploy-root %s\n" "$color_blue" "$color_reset" "$name"
+    printf "log:    %s\n" "$log"
+    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    if [[ "$install_rc" -eq 0 ]]; then
+        printf "%s✓%s migrate-deploy-root %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+    printf "%s✗%s migrate-deploy-root %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+    return 1
+}
+
 cmd_add_targets_from_file() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
@@ -2278,7 +2398,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
+    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target migrate-deploy-root add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -2306,6 +2426,9 @@ _medusactl_complete() {
             ;;
         prep-target|authorize-target|seed-target|add-targets-from-file)
             COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+            ;;
+        migrate-deploy-root)
+            COMPREPLY=( $(compgen -W "--from-user --dry-run --apply --help" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish install" -- "$cur") )
@@ -2339,6 +2462,7 @@ _medusactl() {
         'prep-target:re-run prep-debian.sh against an existing target'
         'authorize-target:ssh-copy-id from controller to an existing target'
         'seed-target:non-destructive limited-mode onboarding (key + sudoers)'
+        'migrate-deploy-root:copy old operator-home deploy roots to /home/medusa'
         'add-targets-from-file:bulk-add targets from a file'
         'update:update the controller checkout'
         'self-update:update the local medusactl helper + medusa Python tool'
@@ -2425,6 +2549,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'list-targets' -d 'Print the
 complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d 'Re-run prep-debian.sh against an existing target'
 complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-copy-id from controller to an existing target'
 complete -c medusactl -n '__fish_use_subcommand' -a 'seed-target' -d 'Non-destructive limited-mode onboarding (key + sudoers)'
+complete -c medusactl -n '__fish_use_subcommand' -a 'migrate-deploy-root' -d 'Copy old operator-home deploy roots to /home/medusa'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-targets-from-file' -d 'Bulk-add targets from a file'
 complete -c medusactl -n '__fish_use_subcommand' -a 'update' -d 'Update the controller checkout'
 complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update local medusactl helper + medusa Python tool'
@@ -2461,6 +2586,9 @@ complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-m
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-exports -d 'Remove storage exports served by host'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-services -d 'Remove services hosted on host'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l cascade -d 'Imply all --remove-* flags'
+complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l from-user -d 'Old operator username'
+complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l dry-run -d 'Report planned migration only'
+complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l apply -d 'Copy old roots into /home/medusa'
 complete -c medusactl -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish install'
 EOF
 }
@@ -2842,6 +2970,10 @@ case "${1:-}" in
     seed-target)
         shift
         cmd_seed_target "$@"
+        ;;
+    migrate-deploy-root)
+        shift
+        cmd_migrate_deploy_root "$@"
         ;;
     add-targets-from-file)
         shift
