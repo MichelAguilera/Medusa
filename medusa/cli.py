@@ -126,6 +126,7 @@ def _paths(root: Path | None) -> ProjectPaths:
         inventory_dir_override=_env_path("MEDUSA_INVENTORY_DIR"),
         templates_dir_override=_env_path("MEDUSA_TEMPLATES_DIR"),
         generated_dir_override=_env_path("MEDUSA_GENERATED_DIR"),
+        secrets_dir_override=_env_path("MEDUSA_SECRETS_DIR"),
     )
 
 
@@ -181,13 +182,15 @@ def _validate_secret_sources(
         source for source in _secret_sources(inventory, paths) if not source.exists()
     )
     if missing:
-        formatted = ", ".join(str(path.relative_to(paths.root)) for path in missing)
+        formatted = ", ".join(
+            str(path.relative_to(paths.secrets_dir.parent)) for path in missing
+        )
         raise ValueError(f"secret sources are missing: {formatted}")
 
 
 def _secret_sources(inventory: ServicesInventory, paths: ProjectPaths) -> set[Path]:
     return {
-        paths.root / "secrets" / f"{setting.secret}.sops.yaml"
+        paths.secrets_dir / f"{setting.secret}.sops.yaml"
         for service in inventory.services
         for setting in service.settings.values()
         if setting.secret is not None

@@ -8,6 +8,7 @@ class ProjectPaths:
     inventory_dir_override: Path | None = None
     templates_dir_override: Path | None = None
     generated_dir_override: Path | None = None
+    secrets_dir_override: Path | None = None
 
     @property
     def inventory_dir(self) -> Path:
@@ -20,6 +21,10 @@ class ProjectPaths:
     @property
     def generated_dir(self) -> Path:
         return self.generated_dir_override or self.root / "generated"
+
+    @property
+    def secrets_dir(self) -> Path:
+        return self.secrets_dir_override or self.root / "secrets"
 
     @property
     def dns_inventory(self) -> Path:

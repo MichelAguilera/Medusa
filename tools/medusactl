@@ -241,9 +241,10 @@ remote_command() {
     # secrets lookup) and the inventory subdir (for the medusa CLI's
     # ProjectPaths override). MEDUSA_GENERATED_DIR is consumed by both
     # the medusa CLI and ansible's group_vars/all.yml.
-    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_GENERATED_DIR=%q; cd %q && %s' \
+    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; cd %q && %s' \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$command"
@@ -952,10 +953,11 @@ REMOTE
     printf "log:    %s\n" "$log"
 
     local env_prefix
-    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_GENERATED_DIR=%q RESOLVER=%q CHECK=%q FORCE=%q" \
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q RESOLVER=%q CHECK=%q FORCE=%q" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
         "$resolver" "$check" "$force")
 
@@ -1010,6 +1012,7 @@ export PATH="\$HOME/.local/bin:\$PATH"
 export MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH")
 export MEDUSA_INVENTORY_ROOT=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH")
 export MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory")
+export MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets")
 export MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH")
 cd "\$MEDUSA_CONTROLLER_PATH"
 ${pre_script}

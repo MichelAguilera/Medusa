@@ -496,6 +496,7 @@ smoke_phase() {
     # overrides pointing at the split inventory + generated locations.
     local -a env_overrides=(
         "MEDUSA_INVENTORY_DIR=$INVENTORY_CLONE_DIR/inventory"
+        "MEDUSA_SECRETS_DIR=$INVENTORY_CLONE_DIR/secrets"
         "MEDUSA_GENERATED_DIR=$GENERATED_DIR"
     )
 
