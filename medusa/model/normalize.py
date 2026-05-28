@@ -126,7 +126,8 @@ def normalize_storage(
     inventory: StorageInventory,
     dns_model: DnsModel,
 ) -> StorageModel:
-    known_hosts = {host.name for host in dns_model.hosts}
+    hosts_by_name = {host.name: host for host in dns_model.hosts}
+    known_hosts = set(hosts_by_name)
 
     unknown_servers = sorted(
         {
@@ -138,6 +139,16 @@ def normalize_storage(
     if unknown_servers:
         formatted = ", ".join(unknown_servers)
         raise ValueError(f"exports reference unknown hosts: {formatted}")
+    unaddressable_servers = sorted(
+        {
+            export.server
+            for export in inventory.exports
+            if not hosts_by_name[export.server].fqdns
+        }
+    )
+    if unaddressable_servers:
+        formatted = ", ".join(unaddressable_servers)
+        raise ValueError(f"exports reference hosts without FQDNs: {formatted}")
 
     unknown_clients = sorted(
         {
@@ -168,7 +179,10 @@ def normalize_storage(
                     mountpoint=mount.mountpoint,
                     type=mount.type,
                     options=tuple(mount.options),
-                    source=f"{exports[mount.export].server}:{exports[mount.export].path}",
+                    source=(
+                        f"{hosts_by_name[exports[mount.export].server].fqdns[0]}:"
+                        f"{exports[mount.export].path}"
+                    ),
                 )
                 for mount in inventory.mounts
                 for host in mount.host

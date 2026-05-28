@@ -22,6 +22,28 @@
   loop_control:
     label: "{{ item.mountpoint }}"
 
+- name: Check managed NFS source host resolution
+  ansible.builtin.command:
+    cmd: "getent hosts {{ item.source | regex_replace(':.*$', '') }}"
+  changed_when: false
+  failed_when: false
+  register: medusa_nfs_source_resolution
+  loop: "{{ medusa_host_mounts }}"
+  loop_control:
+    label: "{{ item.source | regex_replace(':.*$', '') }}"
+
+- name: Fail when managed NFS source host does not resolve
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} cannot resolve NFS source host
+      '{{ item.item.source | regex_replace(':.*$', '') }}' for mount
+      {{ item.item.mountpoint }} (source {{ item.item.source }}). Fix target-side
+      DNS/hosts resolution before mounting managed storage.
+  loop: "{{ medusa_nfs_source_resolution.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.mountpoint }}"
+  when: item.rc != 0
+
 - name: Mount and persist managed NFS mounts
   ansible.posix.mount:
     path: "{{ item.mountpoint }}"
