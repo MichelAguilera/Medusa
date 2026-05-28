@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.12.0"
+VERSION="0.13.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -44,14 +44,23 @@ Usage:
   Controller ops:
     medusactl install-controller
     medusactl authorize-controller
-    medusactl status
+    medusactl controller-status
     medusactl shell
     medusactl config
     medusactl update
     medusactl self-update
+    medusactl install-runtime
     medusactl ssh-disconnect
     medusactl clean
     medusactl uninstall
+
+  Local inventory (fdisk-style):
+    medusactl status
+    medusactl diff
+    medusactl commit "msg"
+    medusactl push
+    medusactl publish "msg"
+    medusactl discard
 
   Render / deploy:
     medusactl check
@@ -135,6 +144,7 @@ MEDUSA_CONTROLLER_PORT=$(quote_env "$MEDUSA_CONTROLLER_PORT")
 MEDUSA_CONTROLLER_PATH=$(quote_env "$MEDUSA_CONTROLLER_PATH")
 MEDUSA_CONTROLLER_INVENTORY_PATH=$(quote_env "$MEDUSA_CONTROLLER_INVENTORY_PATH")
 MEDUSA_CONTROLLER_GENERATED_PATH=$(quote_env "$MEDUSA_CONTROLLER_GENERATED_PATH")
+MEDUSACTL_INVENTORY_DIR=$(quote_env "${MEDUSACTL_INVENTORY_DIR:-}")
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -151,6 +161,22 @@ load_config() {
     : "${MEDUSA_CONTROLLER_PATH:?missing MEDUSA_CONTROLLER_PATH in $CONFIG_FILE}"
     : "${MEDUSA_CONTROLLER_INVENTORY_PATH:?missing MEDUSA_CONTROLLER_INVENTORY_PATH in $CONFIG_FILE; re-run install-controller}"
     : "${MEDUSA_CONTROLLER_GENERATED_PATH:?missing MEDUSA_CONTROLLER_GENERATED_PATH in $CONFIG_FILE; re-run install-controller}"
+    # MEDUSACTL_INVENTORY_DIR is optional at the config layer (controller-side
+    # commands work without it). Local mutation commands enforce it via
+    # require_local_inventory_dir.
+    MEDUSACTL_INVENTORY_DIR="${MEDUSACTL_INVENTORY_DIR:-}"
+}
+
+require_local_inventory_dir() {
+    # Used by local mutation commands (add/remove/promote-target,
+    # status, diff, commit, push, discard) that operate on the
+    # workstation's inventory clone rather than SSHing the controller.
+    [[ -n "${MEDUSACTL_INVENTORY_DIR:-}" ]] \
+        || fail "MEDUSACTL_INVENTORY_DIR is not set in $CONFIG_FILE; re-run 'medusactl install-controller' or edit the config to point at your local inventory clone"
+    [[ -d "$MEDUSACTL_INVENTORY_DIR" ]] \
+        || fail "MEDUSACTL_INVENTORY_DIR ($MEDUSACTL_INVENTORY_DIR) does not exist; clone the inventory repo there first"
+    [[ -d "$MEDUSACTL_INVENTORY_DIR/.git" ]] \
+        || fail "MEDUSACTL_INVENTORY_DIR ($MEDUSACTL_INVENTORY_DIR) is not a git checkout; clone the inventory repo there first"
 }
 
 ssh_target() {
@@ -469,7 +495,7 @@ cmd_install_controller() {
     check_workstation_dependencies
 
     local controller_host controller_user controller_port remote_script target bootstrap
-    local controller_path controller_inventory_path controller_generated_path log
+    local controller_path controller_inventory_path controller_generated_path local_inventory_dir log
     local -a ssh_opts scp_opts
 
     echo "Medusa controller install"
@@ -481,6 +507,7 @@ cmd_install_controller() {
     prompt controller_path "Controller code repo path after bootstrap" "/home/${controller_user}/Medusa"
     prompt controller_inventory_path "Controller inventory repo path" "/home/${controller_user}/medusa-inventory"
     prompt controller_generated_path "Controller generated artifacts path" "/home/${controller_user}/.local/state/medusa/generated"
+    prompt local_inventory_dir "Workstation inventory clone path (blank to skip; needed for local mutation commands)" ""
 
     [[ -n "$controller_host" ]] || fail "controller hostname or IP is required"
     [[ -n "$controller_user" ]] || fail "controller SSH user is required"
@@ -518,6 +545,7 @@ cmd_install_controller() {
     info "  Code path:     $controller_path"
     info "  Inventory:     $controller_inventory_path"
     info "  Generated:     $controller_generated_path"
+    info "  Local inv dir: ${local_inventory_dir:-(unset; local mutation commands disabled)}"
     echo ""
     confirm "Proceed" "y" || fail "aborted by user"
 
@@ -578,6 +606,7 @@ REMOTE_PREFLIGHT
     MEDUSA_CONTROLLER_PATH="$controller_path"
     MEDUSA_CONTROLLER_INVENTORY_PATH="$controller_inventory_path"
     MEDUSA_CONTROLLER_GENERATED_PATH="$controller_generated_path"
+    MEDUSACTL_INVENTORY_DIR="$local_inventory_dir"
     write_config
 
     echo ""
@@ -614,6 +643,54 @@ cmd_version() {
 }
 
 cmd_status() {
+    # T-037 stage C: fdisk-style local status. Shows the workstation
+    # inventory clone's pending changes, validates them, and reports
+    # ahead/behind vs origin/main. For the controller-side status
+    # (git HEAD on controller + medusa check there), see
+    # 'medusactl controller-status'.
+    load_config
+    require_local_inventory_dir
+    printf "%s==>%s status (local: %s)\n" "$color_blue" "$color_reset" "$MEDUSACTL_INVENTORY_DIR"
+
+    local branch ahead behind dirty
+    branch=$(git -C "$MEDUSACTL_INVENTORY_DIR" branch --show-current 2>/dev/null || true)
+    [[ -n "$branch" ]] || branch="(detached HEAD)"
+    printf "branch:    %s\n" "$branch"
+
+    # Fetch quietly so ahead/behind reflects the remote without
+    # interactive prompts. Soft-fail on no network.
+    git -C "$MEDUSACTL_INVENTORY_DIR" fetch --quiet origin 2>/dev/null || \
+        warn "could not fetch origin; ahead/behind may be stale"
+
+    if git -C "$MEDUSACTL_INVENTORY_DIR" rev-parse --verify --quiet origin/main >/dev/null; then
+        ahead=$(git -C "$MEDUSACTL_INVENTORY_DIR" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+        behind=$(git -C "$MEDUSACTL_INVENTORY_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+        printf "vs origin/main: ahead=%s behind=%s\n" "$ahead" "$behind"
+    else
+        printf "vs origin/main: (no upstream tracking)\n"
+    fi
+
+    local porcelain
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    if [[ -z "$porcelain" ]]; then
+        dirty=0
+        printf "working tree: clean\n"
+    else
+        dirty=1
+        printf "working tree:\n"
+        printf "%s\n" "$porcelain" | sed 's/^/  /'
+    fi
+
+    printf "\n%s==>%s medusa validate (local)\n" "$color_blue" "$color_reset"
+    ( cd "$MEDUSACTL_INVENTORY_DIR" \
+        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
+           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
+           medusa validate ) || return 1
+}
+
+cmd_controller_status() {
+    # The pre-T-037 'status' command: SSH to controller, print git HEAD
+    # and branch, run 'medusa check' there.
     load_config
     local target remote
     local -a ssh_opts
@@ -623,11 +700,79 @@ cmd_status() {
     if [[ ! -t 0 ]]; then
         ssh_opts+=(-o BatchMode=yes)
     fi
-    printf "%s==>%s status\n" "$color_blue" "$color_reset"
+    printf "%s==>%s controller-status\n" "$color_blue" "$color_reset"
     printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
     printf "workdir: %s\n" "$MEDUSA_CONTROLLER_PATH"
-    printf "command: status\n"
     ssh "${ssh_opts[@]}" "$target" "$remote"
+}
+
+cmd_diff() {
+    # T-037 stage C: colorized git diff of pending inventory changes.
+    load_config
+    require_local_inventory_dir
+    git -C "$MEDUSACTL_INVENTORY_DIR" diff --color=auto "$@"
+}
+
+cmd_commit() {
+    # T-037 stage C: show diff first, prompt Y/n, then commit. Refuses
+    # on empty working tree.
+    load_config
+    require_local_inventory_dir
+    local msg=${1:-}
+    [[ -n "$msg" ]] || fail "commit: message argument is required: medusactl commit \"...\""
+
+    local porcelain
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    [[ -n "$porcelain" ]] || fail "commit: working tree is clean; nothing to commit"
+
+    printf "%s==>%s pending diff in %s\n" "$color_blue" "$color_reset" "$MEDUSACTL_INVENTORY_DIR"
+    git -C "$MEDUSACTL_INVENTORY_DIR" diff --color=auto
+    git -C "$MEDUSACTL_INVENTORY_DIR" status --short
+
+    confirm "Commit with message \"$msg\"" "y" || fail "commit aborted by user"
+
+    git -C "$MEDUSACTL_INVENTORY_DIR" add -A \
+        || fail "commit: git add failed"
+    git -C "$MEDUSACTL_INVENTORY_DIR" commit -m "$msg" \
+        || fail "commit: git commit failed"
+    printf "%s✓%s commit\n" "$color_green" "$color_reset"
+}
+
+cmd_push() {
+    # T-037 stage C: push to origin/main. Refuses on dirty working tree.
+    load_config
+    require_local_inventory_dir
+    local porcelain
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    [[ -z "$porcelain" ]] \
+        || fail "push: working tree is dirty; commit or discard before pushing"
+    printf "%s==>%s git push origin main\n" "$color_blue" "$color_reset"
+    git -C "$MEDUSACTL_INVENTORY_DIR" push origin main \
+        || fail "push: git push failed"
+    printf "%s✓%s push\n" "$color_green" "$color_reset"
+}
+
+cmd_publish() {
+    # T-037 stage C: sugar for commit + push in one shot.
+    cmd_commit "$@" && cmd_push
+}
+
+cmd_discard() {
+    # T-037 stage C: 'git checkout -- .' against the inventory clone.
+    # Y/n confirmation. Aborts on empty working tree.
+    load_config
+    require_local_inventory_dir
+    local porcelain
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    [[ -n "$porcelain" ]] || fail "discard: working tree is clean; nothing to discard"
+    printf "%s==>%s pending changes in %s\n" "$color_blue" "$color_reset" "$MEDUSACTL_INVENTORY_DIR"
+    printf "%s\n" "$porcelain" | sed 's/^/  /'
+    confirm "Discard all pending changes" "n" || fail "discard aborted by user"
+    git -C "$MEDUSACTL_INVENTORY_DIR" checkout -- . \
+        || fail "discard: git checkout failed"
+    git -C "$MEDUSACTL_INVENTORY_DIR" clean -fd \
+        || fail "discard: git clean failed"
+    printf "%s✓%s discard\n" "$color_green" "$color_reset"
 }
 
 cmd_shell() {
@@ -645,19 +790,20 @@ cmd_shell() {
 cmd_config() {
     load_config
     cat <<EOF
-Config:    $CONFIG_FILE
-Host:      $MEDUSA_CONTROLLER_HOST
-User:      $MEDUSA_CONTROLLER_USER
-Port:      $MEDUSA_CONTROLLER_PORT
-Code:      $MEDUSA_CONTROLLER_PATH
-Inventory: $MEDUSA_CONTROLLER_INVENTORY_PATH
-Generated: $MEDUSA_CONTROLLER_GENERATED_PATH
+Config:        $CONFIG_FILE
+Host:          $MEDUSA_CONTROLLER_HOST
+User:          $MEDUSA_CONTROLLER_USER
+Port:          $MEDUSA_CONTROLLER_PORT
+Code:          $MEDUSA_CONTROLLER_PATH
+Inventory:     $MEDUSA_CONTROLLER_INVENTORY_PATH
+Generated:     $MEDUSA_CONTROLLER_GENERATED_PATH
+Local inv dir: ${MEDUSACTL_INVENTORY_DIR:-(unset)}
 EOF
 }
 
 cmd_check() {
     load_config
-    run_logged check 'uv run medusa check'
+    run_logged check "$(inventory_pull_cmd)uv run medusa check"
     cmd_audit_targets || true
 }
 
@@ -794,17 +940,54 @@ REMOTE
     fi
 }
 
+inventory_pull_cmd() {
+    # T-037 stage D: prepended to every controller-side workflow so the
+    # controller's inventory clone fast-forwards to whatever the
+    # workstation has just pushed. Operator runs 'medusactl push' before
+    # 'medusactl deploy'; the deploy guards verify the push happened.
+    printf 'git -C %q pull --ff-only && ' "$MEDUSA_CONTROLLER_INVENTORY_PATH"
+}
+
+require_clean_for_deploy() {
+    # T-037 stage D: deploy refuses if the workstation inventory clone
+    # is dirty, ahead of origin/main (forgot to push), or behind
+    # origin/main (forgot to pull a co-worker's commit). The git remote
+    # is the authoritative source of truth; this guard makes the local
+    # clone tell us when it isn't synchronized.
+    require_local_inventory_dir
+    local porcelain ahead behind
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    [[ -z "$porcelain" ]] \
+        || fail "deploy: workstation inventory has uncommitted changes; commit/push or discard before deploying"
+    git -C "$MEDUSACTL_INVENTORY_DIR" fetch --quiet origin 2>/dev/null || true
+    if git -C "$MEDUSACTL_INVENTORY_DIR" rev-parse --verify --quiet origin/main >/dev/null; then
+        ahead=$(git -C "$MEDUSACTL_INVENTORY_DIR" rev-list --count origin/main..HEAD 2>/dev/null || echo 0)
+        behind=$(git -C "$MEDUSACTL_INVENTORY_DIR" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+        [[ "$ahead" -eq 0 ]] \
+            || fail "deploy: workstation is $ahead commit(s) ahead of origin/main; run 'medusactl push' first"
+        [[ "$behind" -eq 0 ]] \
+            || fail "deploy: workstation is $behind commit(s) behind origin/main; run 'git -C \"$MEDUSACTL_INVENTORY_DIR\" pull --ff-only' first"
+    else
+        warn "no origin/main upstream; deploy guard cannot verify push status"
+    fi
+}
+
 cmd_render() {
     load_config
-    run_logged render 'uv run medusa render'
+    run_logged render "$(inventory_pull_cmd)uv run medusa render"
 }
 
 cmd_deploy() {
     load_config
+    require_clean_for_deploy
     if [[ "${1:-}" == "--check" ]]; then
-        run_logged deploy-check 'cd ansible && uv run ansible-playbook playbooks/deploy.yml --check --diff'
+        run_logged deploy-check \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/deploy.yml --check --diff"
     else
-        run_logged deploy 'cd ansible && uv run ansible-playbook playbooks/deploy.yml'
+        require_controller_apply_prereqs deploy \
+            || fail "deploy prerequisites failed"
+        run_logged deploy \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/deploy.yml && uv run ansible-playbook playbooks/controller-apply.yml"
     fi
 }
 
@@ -828,12 +1011,12 @@ EOF
         [[ $# -eq 0 ]] || fail "unknown argument to controller-apply: $1"
         require_controller_apply_prereqs controller-apply-check \
             || fail "controller-apply check prerequisites failed"
-        run_logged controller-apply-check 'cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff'
+        run_logged controller-apply-check "$(inventory_pull_cmd)cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff"
     else
         [[ $# -eq 0 ]] || fail "unknown argument to controller-apply: $1"
         require_controller_apply_prereqs controller-apply \
             || fail "controller-apply prerequisites failed"
-        run_logged controller-apply 'cd ansible && uv run ansible-playbook playbooks/controller-apply.yml'
+        run_logged controller-apply "$(inventory_pull_cmd)cd ansible && uv run ansible-playbook playbooks/controller-apply.yml"
     fi
 }
 
@@ -874,6 +1057,9 @@ cmd_finalize_dns() {
     remote=$(cat <<'REMOTE'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
+# T-037 stage D: fast-forward the inventory clone first so renders +
+# applies use whatever the workstation has just pushed.
+git -C "$MEDUSA_INVENTORY_ROOT" pull --ff-only
 cd "$MEDUSA_CONTROLLER_PATH"
 RESOLVER=${RESOLVER:-}
 CHECK=${CHECK:-0}
@@ -984,6 +1170,47 @@ REMOTE
 # controller (single source of truth for inventory edits) and, when the edit
 # changed state, apply the regenerated bootstrap blocks through the
 # controller_bootstrap Ansible role.
+
+_run_local_mutation() {
+    # T-037 stage B: run a medusa inventory mutation (add-host,
+    # remove-host, promote-host) on the workstation against
+    # MEDUSACTL_INVENTORY_DIR. No SSH, no auto-render, no auto-apply —
+    # the operator reviews via status/diff and commits/pushes/deploys
+    # explicitly afterward.
+    local pre_script=$1 name=$2 mode=${3:-apply} log rc=0
+    require_local_inventory_dir
+    log=$(log_path "$name")
+
+    printf "%s==>%s %s (local)\n" "$color_blue" "$color_reset" "$name"
+    printf "inventory: %s\n" "$MEDUSACTL_INVENTORY_DIR"
+    printf "log:       %s\n" "$log"
+
+    (
+        cd "$MEDUSACTL_INVENTORY_DIR"
+        export MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory"
+        export MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets"
+        eval "$pre_script"
+    ) 2>&1 | tee "$log" || rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+
+    if [[ "$rc" -ne 0 ]]; then
+        printf "%s✗%s %s (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+        return 1
+    fi
+    printf "%s✓%s %s\n" "$color_green" "$color_reset" "$name"
+    if [[ "$mode" != "dry-run" ]]; then
+        cat <<EOF >&2
+
+next steps:
+  medusactl status        # review pending changes
+  medusactl diff          # see exact YAML diff
+  medusactl commit "msg"  # commit the change locally
+  medusactl push          # publish to origin/main
+  medusactl deploy        # apply on the controller
+EOF
+    fi
+    return 0
+}
 
 _run_remote_with_render_and_apply() {
     # Compose: <pre-block bash> + medusa render + apply blocks.
@@ -1169,10 +1396,10 @@ EOF
     [[ "$force" -eq 1 ]] && args+="--force "
     [[ "$dry_run" -eq 1 ]] && args+="--dry-run "
 
-    local pre="uv run medusa ${args}"
+    local pre="medusa ${args}"
     local run_mode="apply"
     [[ "$dry_run" -eq 1 ]] && run_mode="dry-run"
-    _run_remote_with_render_and_apply "$pre" "add-target-$name" "$run_mode" \
+    _run_local_mutation "$pre" "add-target-$name" "$run_mode" \
         || fail "add-target failed"
 
     if [[ "$dry_run" -eq 1 ]]; then
@@ -1244,12 +1471,12 @@ EOF
         extra+=$(printf " %q" "$flag")
     done
     if [[ "$dry_run" -eq 1 ]]; then
-        pre=$(printf "uv run medusa remove-host %q --dry-run" "$name")${extra}
+        pre=$(printf "medusa remove-host %q --dry-run" "$name")${extra}
         run_mode="dry-run"
     else
-        pre=$(printf "uv run medusa remove-host %q" "$name")${extra}
+        pre=$(printf "medusa remove-host %q" "$name")${extra}
     fi
-    _run_remote_with_render_and_apply "$pre" "remove-target-$name" "$run_mode" \
+    _run_local_mutation "$pre" "remove-target-$name" "$run_mode" \
         || fail "remove-target failed"
 }
 
@@ -1289,12 +1516,12 @@ EOF
     done
     local pre run_mode="apply"
     if [[ "$dry_run" -eq 1 ]]; then
-        pre=$(printf "uv run medusa promote-host %q --dry-run" "$name")
+        pre=$(printf "medusa promote-host %q --dry-run" "$name")
         run_mode="dry-run"
     else
-        pre=$(printf "uv run medusa promote-host %q" "$name")
+        pre=$(printf "medusa promote-host %q" "$name")
     fi
-    _run_remote_with_render_and_apply "$pre" "promote-target-$name" "$run_mode" \
+    _run_local_mutation "$pre" "promote-target-$name" "$run_mode" \
         || fail "promote-target failed"
 }
 
@@ -1325,18 +1552,14 @@ EOF
         *)              fail "list-targets: unknown flag '${1:-}'" ;;
     esac
 
-    # list-hosts is a read-only inspector; stream output straight to the
-    # user's terminal instead of capturing into a log (run_logged hides
-    # the output, which is the whole point of this command).
-    local target remote
-    local -a ssh_opts
-    target=$(ssh_target)
-    remote=$(remote_command "uv run --quiet medusa list-hosts $extra")
-    mapfile -t ssh_opts < <(ssh_base_opts)
-    if [[ ! -t 0 ]]; then
-        ssh_opts+=(-o BatchMode=yes)
-    fi
-    ssh "${ssh_opts[@]}" "$target" "$remote"
+    # T-037 stage B: list-hosts is a read-only inspector against the
+    # workstation's inventory clone (source of truth post-T-037), not
+    # the controller. Stream straight to the user's terminal.
+    require_local_inventory_dir
+    ( cd "$MEDUSACTL_INVENTORY_DIR" \
+        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
+           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
+           medusa list-hosts $extra )
 }
 
 cmd_prep_target() {
@@ -1377,8 +1600,15 @@ EOF
     mapfile -t ssh_opts < <(ssh_base_opts)
 
     local lookup
-    lookup=$(ssh "${ssh_opts[@]}" "$target" "$(remote_command 'uv run medusa list-hosts --managed-only')" \
-        2>&1) || fail "prep-target: could not list managed hosts on controller"
+    # T-037 stage B: look up against LOCAL inventory (not controller),
+    # so a freshly-added host visible only on the workstation can still
+    # be prepped before the operator pushes + deploys.
+    require_local_inventory_dir
+    lookup=$( cd "$MEDUSACTL_INVENTORY_DIR" \
+        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
+           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
+           medusa list-hosts --managed-only 2>&1 ) \
+        || fail "prep-target: could not list managed hosts locally"
 
     local line mode ip user
     line=$(grep -E "^[FL][[:space:]]+${name}[[:space:]]" <<< "$lookup" | head -n1) \
@@ -1579,6 +1809,20 @@ EOF
 )"
 }
 
+cmd_install_runtime() {
+    # T-037 stage A: install the workstation-local medusa runtime via
+    # `uv tool install`. Required for local mutation commands
+    # (add-target, remove-target, promote-target, status, diff, etc).
+    command -v uv >/dev/null 2>&1 \
+        || fail "uv is not installed; see https://docs.astral.sh/uv/ first"
+    local source_url="git+https://github.com/${MEDUSA_GITHUB_REPO}.git@${MEDUSA_INSTALL_REF}"
+    info "Installing medusa runtime from $source_url"
+    uv tool install --force "$source_url" \
+        || fail "uv tool install failed"
+    printf "%s✓%s medusa runtime installed; check: medusa --help\n" \
+        "$color_green" "$color_reset"
+}
+
 cmd_self_update() {
     local source destination destination_dir installed tmp_destination
 
@@ -1615,7 +1859,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update completion ssh-disconnect undo list-backups clean uninstall config version"
+    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo list-backups clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -1948,26 +2192,26 @@ cmd_clean() {
 }
 
 cmd_undo() {
+    # T-037 stage E: 'undo' is reimplemented as 'git revert HEAD' against
+    # the workstation inventory clone. The pre-T-037 XDG snapshot store
+    # is on the way out (T-038); git history is now the source of
+    # undo-able state.
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
-medusactl undo — restore inventory from the most recent snapshot, then
-                 re-render and re-apply controller-side blocks.
+medusactl undo — revert the most recent inventory commit (git revert HEAD).
 
 Usage:
   medusactl undo [--dry-run]
 
-Each mutating medusa command (add-host, remove-host, promote-host)
-auto-snapshots inventory before writing. 'undo' rewinds to the most
-recent snapshot. The restore is itself snapshotted so it can be undone
-in turn.
-
-With --dry-run, prints which files would be restored without writing.
-
-Exit codes: 0 success, non-zero on failure or if no snapshot exists.
+Operates on MEDUSACTL_INVENTORY_DIR. With --dry-run, shows the would-be
+revert commit (git show HEAD) without writing. Without --dry-run, creates
+a new revert commit; review with 'medusactl diff' / 'status', then
+'push' + 'deploy' to propagate.
 EOF
         return 0
     fi
     load_config
+    require_local_inventory_dir
     local dry_run=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1976,15 +2220,24 @@ EOF
         esac
         shift
     done
-    local pre run_mode="apply"
+
+    local porcelain
+    porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
+    [[ -z "$porcelain" ]] \
+        || fail "undo: working tree is dirty; commit or discard before reverting"
+
     if [[ "$dry_run" -eq 1 ]]; then
-        pre="uv run medusa undo-last --dry-run"
-        run_mode="dry-run"
-    else
-        pre="uv run medusa undo-last"
+        printf "%s==>%s undo --dry-run: HEAD commit that would be reverted\n" \
+            "$color_blue" "$color_reset"
+        git -C "$MEDUSACTL_INVENTORY_DIR" show --stat HEAD
+        return 0
     fi
-    _run_remote_with_render_and_apply "$pre" "undo" "$run_mode" \
-        || fail "undo failed"
+    printf "%s==>%s git revert HEAD in %s\n" \
+        "$color_blue" "$color_reset" "$MEDUSACTL_INVENTORY_DIR"
+    git -C "$MEDUSACTL_INVENTORY_DIR" revert --no-edit HEAD \
+        || fail "undo: git revert failed"
+    printf "%s✓%s undo (revert committed locally; push + deploy to propagate)\n" \
+        "$color_green" "$color_reset"
 }
 
 cmd_list_backups() {
@@ -2091,6 +2344,30 @@ case "${1:-}" in
         shift
         cmd_status "$@"
         ;;
+    controller-status)
+        shift
+        cmd_controller_status "$@"
+        ;;
+    diff)
+        shift
+        cmd_diff "$@"
+        ;;
+    commit)
+        shift
+        cmd_commit "$@"
+        ;;
+    push)
+        shift
+        cmd_push "$@"
+        ;;
+    publish)
+        shift
+        cmd_publish "$@"
+        ;;
+    discard)
+        shift
+        cmd_discard "$@"
+        ;;
     shell)
         shift
         cmd_shell "$@"
@@ -2154,6 +2431,10 @@ case "${1:-}" in
     self-update)
         shift
         cmd_self_update "$@"
+        ;;
+    install-runtime)
+        shift
+        cmd_install_runtime "$@"
         ;;
     completion)
         shift

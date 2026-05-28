@@ -294,6 +294,26 @@ install_controller_cli() {
     esac
 }
 
+install_medusa_runtime() {
+    # T-037: workstation gains a local medusa runtime so mutation commands
+    # (add-target, remove-target, promote-target) can run locally against
+    # the operator's inventory clone instead of SSHing the controller.
+    # `uv tool install` is the documented path; the binary lands at
+    # ~/.local/share/uv/tools/medusa and a shim at ~/.local/bin/medusa.
+    local source_url="git+https://github.com/${MEDUSA_GITHUB_REPO}.git@${MEDUSA_INSTALL_REF}"
+    if ! command -v uv >/dev/null 2>&1; then
+        warn "uv is not installed on this workstation; skipping medusa runtime install"
+        warn "  install uv first (https://docs.astral.sh/uv/) then re-run 'medusactl install-runtime'"
+        return 0
+    fi
+    info "Installing medusa runtime via 'uv tool install $source_url'"
+    if uv tool install --force "$source_url"; then
+        info "medusa runtime installed; check: medusa --help"
+    else
+        warn "uv tool install failed; you can retry later with 'medusactl install-runtime'"
+    fi
+}
+
 cleanup() {
     local file
     for file in "${TEMP_FILES[@]:-}"; do
@@ -328,6 +348,9 @@ echo ""
 if confirm "Install optional medusactl CLI locally" "n"; then
     CLI_SOURCE=$(cli_source)
     install_controller_cli "$CLI_SOURCE" "$MEDUSACTL_CLI_PATH"
+    if confirm "Install medusa runtime locally (needed for local inventory mutations)" "y"; then
+        install_medusa_runtime
+    fi
     exec "$MEDUSACTL_CLI_PATH" install-controller
 fi
 
