@@ -1281,8 +1281,20 @@ Usage:
   medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
                        [--zone <zone>] [--user <user>]
                        [--alias <alias> ...] [--group <group> ...]
-                       [--prep] [--authorize] [--no-seed-hosts] [--force]
-                       [--dry-run]
+                       [--prep] [--seed] [--authorize] [--no-seed-hosts]
+                       [--force] [--dry-run] [--interactive]
+
+Interactive mode:
+  Invoking 'medusactl add-target <name>' with no other flags on a TTY,
+  or passing '--interactive' explicitly, drops into a prompt session
+  that collects --ip, --bootstrap-ip, --user, --zone, mode, the
+  post-add side-effect flags (--prep if full, --seed if limited,
+  --authorize), and --no-seed-hosts. Each prompt shows a default in
+  [brackets] and accepts the default on bare Enter. A summary block
+  with Y/n confirmation is printed before any write. Non-TTY callers
+  still fail fast on missing --ip — scripted contracts are preserved.
+  --alias and --group are flag-only; pass them on the command line
+  alongside the host name to seed interactive mode.
 
 Flags:
   --ip <ip>              Required. IPv4 (or IPv6) address.
@@ -1302,10 +1314,23 @@ Flags:
                          exclusive with --limited.
   --prep                 After add, run prep-debian.sh against the target
                          via root SSH (prompts for shared root password).
-                         Implies --full.
-  --authorize            After add (and prep, if requested), run
+                         Mode-aware: on --full hosts runs general prep
+                         + hardening (sshd clamp + root lock); on
+                         --limited hosts runs general prep only (no
+                         destructive sshd or root edits). Defaults to
+                         --full when --limited is not also passed.
+  --seed                 After add, run seed-target against the target
+                         (limited mode only): minimal ssh-copy-id +
+                         /etc/sudoers.d/<user> NOPASSWD fragment, no
+                         apt install. Use when the ansible user
+                         already exists on the target. For hosts where
+                         the ansible user does not exist yet, use
+                         --prep --limited instead. Mutually exclusive
+                         with --prep / --full.
+  --authorize            After add (and prep/seed, if requested), run
                          ssh-copy-id from controller to target (prompts
-                         for target user's SSH password).
+                         for target user's SSH password). Redundant
+                         with --seed, which already authorizes the key.
   --no-seed-hosts        Skip applying the /etc/hosts bootstrap block.
                          Use when local DNS already serves the name.
   --force                Replace an existing host of the same name.
@@ -1340,7 +1365,9 @@ EOF
     fi
     shift
 
+    local original_flag_count=$#
     local ip="" bootstrap_ip="" user="ansible" force=0 prep=0 authorize=0 dry_run=0
+    local interactive=0 no_seed_hosts=0 seed=0
     local mode=""  # "", "full", or "limited"
     local -a zones=() aliases=() groups=()
     while [[ $# -gt 0 ]]; do
@@ -1356,12 +1383,84 @@ EOF
             --force) force=1 ;;
             --prep) prep=1 ;;
             --authorize) authorize=1 ;;
+            --seed) seed=1 ;;
             --dry-run) dry_run=1 ;;
-            --no-seed-hosts) : ;; # accepted for future toggling; render always emits
+            --interactive) interactive=1 ;;
+            --no-seed-hosts) no_seed_hosts=1 ;; # accepted for future toggling; render always emits
             *) fail "add-target: unknown flag '$1'" ;;
         esac
         shift
     done
+
+    if [[ "$seed" -eq 1 && "$prep" -eq 1 ]]; then
+        fail "add-target: --seed and --prep are mutually exclusive (seed is limited-mode, prep is full-mode)"
+    fi
+    if [[ "$seed" -eq 1 && "$mode" == "full" ]]; then
+        fail "add-target: --seed cannot be combined with --full (seed is for limited-mode hosts only)"
+    fi
+
+    # Interactive mode: explicit --interactive, or bare 'add-target <name>'
+    # on a TTY. Non-TTY callers fall through to the existing fail-fast on
+    # missing --ip so scripted contracts stay intact.
+    if [[ "$interactive" -eq 1 || "$original_flag_count" -eq 0 ]] && [[ -t 0 ]]; then
+        info ""
+        info "Interactive add-target for '$name'. Enter accepts the [default]."
+        info ""
+        [[ -z "$ip" ]] && prompt ip "IPv4 address"
+        [[ -z "$ip" ]] && fail "add-target: --ip is required"
+        [[ -z "$bootstrap_ip" ]] && prompt bootstrap_ip "Bootstrap IP (controller /etc/hosts cutover, blank to skip)" ""
+        prompt user "ansible user" "$user"
+        if [[ ${#zones[@]} -eq 0 ]]; then
+            local zone_input
+            prompt zone_input "DNS zone" "lan"
+            zones=("$zone_input")
+        fi
+        if [[ -z "$mode" ]]; then
+            local mode_input
+            prompt mode_input "Managed mode (limited/full)" "limited"
+            case "$mode_input" in
+                limited|full) mode=$mode_input ;;
+                *) fail "add-target: invalid mode '$mode_input' (expected 'limited' or 'full')" ;;
+            esac
+        fi
+        if [[ "$prep" -eq 0 && "$seed" -eq 0 ]]; then
+            local prep_q
+            if [[ "$mode" == "full" ]]; then
+                prep_q="Run prep-target after add (general prep + hardening: sshd clamp + root lock)"
+            else
+                prep_q="Run prep-target after add (general prep only on limited mode; no sshd or root touch)"
+            fi
+            confirm "$prep_q" "n" && prep=1
+        fi
+        if [[ "$mode" == "limited" && "$prep" -eq 0 && "$seed" -eq 0 ]]; then
+            confirm "Or run seed-target instead (minimal: key + sudoers only, no apt; requires user to already exist)" "n" && seed=1
+        fi
+        if [[ "$authorize" -eq 0 && "$prep" -eq 0 && "$seed" -eq 0 ]]; then
+            confirm "Run authorize-target after add (ssh-copy-id only)" "n" && authorize=1
+        fi
+        if [[ "$no_seed_hosts" -eq 0 ]]; then
+            confirm "Skip /etc/hosts bootstrap block (--no-seed-hosts)" "n" && no_seed_hosts=1
+        fi
+
+        info ""
+        info "About to add target:"
+        info "  name:         $name"
+        info "  ip:           $ip"
+        info "  bootstrap-ip: ${bootstrap_ip:-<none>}"
+        info "  user:         $user"
+        info "  zones:        ${zones[*]}"
+        [[ ${#aliases[@]} -gt 0 ]] && info "  aliases:      ${aliases[*]}"
+        [[ ${#groups[@]}  -gt 0 ]] && info "  groups:       ${groups[*]}"
+        info "  mode:         $mode"
+        info "  prep:         $([[ $prep -eq 1 ]] && echo yes || echo no)"
+        info "  seed:         $([[ $seed -eq 1 ]] && echo yes || echo no)"
+        info "  authorize:    $([[ $authorize -eq 1 ]] && echo yes || echo no)"
+        info "  no-seed-hosts:$([[ $no_seed_hosts -eq 1 ]] && echo " yes" || echo " no")"
+        info "  force:        $([[ $force -eq 1 ]] && echo yes || echo no)"
+        info "  dry-run:      $([[ $dry_run -eq 1 ]] && echo yes || echo no)"
+        info ""
+        confirm "Proceed" "y" || fail "add-target: aborted by user"
+    fi
 
     if [[ "$dry_run" -eq 1 ]]; then
         if [[ "$prep" -eq 1 || "$authorize" -eq 1 ]]; then
@@ -1374,14 +1473,13 @@ EOF
         zones=(lan)
     fi
 
-    # --prep runs the destructive root-SSH template prep flow; it only
-    # makes sense for hosts in full mode. Either upgrade an implicit
-    # default to full, or refuse if the operator explicitly asked for
-    # --limited (mixed signals should be loud, not silent).
-    if [[ "$prep" -eq 1 ]]; then
-        if [[ "$mode" == "limited" ]]; then
-            fail "add-target: --prep and --limited are mutually exclusive (prep cannot run on a limited host)"
-        fi
+    # T-043: --prep now works on both modes. On 'full' hosts (default
+    # when --prep is passed without --limited) prep-debian runs with
+    # MEDUSA_PREP_HARDEN=1 (sshd clamp + root-password lock). On
+    # 'limited' hosts prep-debian runs with MEDUSA_PREP_HARDEN=0 —
+    # general prep only, no destructive sshd or root edits. Picking
+    # the mode is the operator's call; --prep no longer flips it.
+    if [[ "$prep" -eq 1 && -z "$mode" ]]; then
         mode="full"
     fi
 
@@ -1408,6 +1506,9 @@ EOF
 
     if [[ "$prep" -eq 1 ]]; then
         cmd_prep_target "$name" || fail "add-target: prep-target failed"
+    fi
+    if [[ "$seed" -eq 1 ]]; then
+        cmd_seed_target "$name" || fail "add-target: seed-target failed"
     fi
     if [[ "$authorize" -eq 1 ]]; then
         cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
@@ -1571,15 +1672,22 @@ Usage:
   medusactl prep-target <name>
 
 Prompts for the shared root SSH password on the target. Runs the same
-prep script bootstrap uses: installs sudo/openssh-server/python3,
-creates the ansible user, NOPASSWD sudo, authorizes the controller's
-SSH key, and clamps sshd (PermitRootLogin prohibit-password +
-passwd -l root). Idempotent: re-running on an already-prepped host is
-safe and re-applies hardening.
+prep script bootstrap uses, with mode-aware behavior:
 
-Refuses to run if the target is in 'limited' managed mode (baremetal /
-pre-existing hosts). For those, authorize the controller key by hand
-(or with 'medusactl authorize-target') — see docs/site-management.md.
+  full hosts (medusa-built templates): general prep + hardening.
+    Installs sudo/openssh-server/python3, creates the ansible user
+    with NOPASSWD sudo, authorizes the controller's SSH key, clamps
+    sshd (PermitRootLogin prohibit-password), and locks the root
+    password.
+
+  limited hosts (pre-existing baremetal: Proxmox, NFS, etc.):
+    general prep ONLY (MEDUSA_PREP_HARDEN=0). Same package install +
+    user + sudoers + key push, but skips the sshd clamp and the
+    root-password lock so cluster operations + operator root-SSH
+    escape hatch are preserved.
+
+Idempotent on both modes: re-running on an already-prepped host is
+safe and skips anything already in place.
 EOF
         return 0
     fi
@@ -1617,8 +1725,13 @@ EOF
         fail "prep-target: $name is not in the managed host list; add it first with 'medusactl add-target'"
     fi
     mode=$(awk '{print $1}' <<< "$line")
+    # T-043: prep-debian now has a harden gate. Full hosts get the
+    # destructive hardening tail; limited hosts get general prep only
+    # (no sshd clamp, no root-password lock), making prep-target the
+    # plug-and-play onboarding path for pre-existing baremetal too.
+    local harden=1
     if [[ "$mode" == "L" ]]; then
-        fail "prep-target: $name is in 'limited' managed mode and cannot be prepped via this command. Use 'medusactl authorize-target $name' to authorize the controller key, or onboard manually (docs/site-management.md)."
+        harden=0
     fi
     ip=$(awk '{print $3}' <<< "$line")
     user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
@@ -1648,7 +1761,7 @@ SSHPASS=$(printf %q "$password") sshpass -e ssh \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
     root@${ip} \\
-    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY=\$(printf %q \"\$pubkey\") bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
+    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY=\$(printf %q \"\$pubkey\") MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
 REMOTE
 )
 
@@ -1737,6 +1850,150 @@ REMOTE
         return 0
     fi
     printf "%s✗%s authorize-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+    return 1
+}
+
+cmd_seed_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl seed-target — non-destructive limited-mode onboarding.
+
+Usage:
+  medusactl seed-target <name>
+
+Pushes the controller's SSH key to the target user and drops a
+/etc/sudoers.d/<user> NOPASSWD fragment, so ansible plays can run
+against a pre-existing host without manual sudoers/sshd tinkering.
+
+Pre-condition (operator-owned):
+  The target user (the host's 'ansible_user') already exists on the
+  target and is in a sudo-capable group. seed-target does NOT create
+  users.
+
+What it does:
+  - ssh-copy-id controller pubkey → <user>@<target> (sshpass-driven
+    one-shot password auth, then key auth from this point on).
+  - Install /etc/sudoers.d/<user> with '<user> ALL=(ALL) NOPASSWD: ALL',
+    mode 0440, validated via 'visudo -cf'.
+  - Verify 'sudo -n true' succeeds afterwards.
+
+What it does NOT do:
+  - No apt installs. No sshd edits. No PermitRootLogin clamp. No
+    'passwd -l root'. No user creation. Those are owned by the
+    operator or by 'prep-target' (full mode only).
+
+Modes:
+  - LIMITED hosts only. Refuses FULL (use 'prep-target') and refuses
+    DNS-only hosts (no ansible_user).
+
+Prompts once for the target user's SSH password. The same password
+is used for the initial 'sudo -S' to install the sudoers fragment;
+in standard Debian/Ubuntu setups these are identical. Re-running
+seed-target on an already-seeded host is a safe no-op.
+
+Refuses to run against a full-mode host — that path belongs to
+'prep-target'.
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "seed-target: name argument is required"
+
+    local password
+    read -r -s -p "SSH password for ${name} target user (also used for first sudo): " password </dev/tty
+    printf "\n" >&2
+
+    local target ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    # Resolve mode + ip + user from LOCAL inventory (T-037 pattern):
+    # a freshly-added limited host visible only on the workstation can
+    # still be seeded before the operator pushes + deploys.
+    require_local_inventory_dir
+    local lookup
+    lookup=$( cd "$MEDUSACTL_INVENTORY_DIR" \
+        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
+           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
+           medusa list-hosts --managed-only 2>&1 ) \
+        || fail "seed-target: could not list managed hosts locally"
+
+    local line mode ip user
+    line=$(grep -E "^[FL][[:space:]]+${name}[[:space:]]" <<< "$lookup" | head -n1) || true
+    if [[ -z "$line" ]]; then
+        fail "seed-target: $name is not in the managed host list. DNS-only hosts have no ansible_user — set one with 'medusactl add-target' first."
+    fi
+    mode=$(awk '{print $1}' <<< "$line")
+    if [[ "$mode" == "F" ]]; then
+        fail "seed-target: $name is in 'full' managed mode; use 'medusactl prep-target $name' instead. seed-target is for pre-existing (limited) hosts only."
+    fi
+    ip=$(awk '{print $3}' <<< "$line")
+    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
+    [[ -z "$user" ]] && user="ansible"
+    [[ -n "$ip" ]] || fail "seed-target: could not determine IP for $name"
+
+    # Validate username early — it's interpolated into the sudoers
+    # filename and the fragment content. Refuse anything sudoers
+    # would choke on.
+    if ! [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        fail "seed-target: refusing unsafe username '$user' (must match ^[a-z_][a-z0-9_-]*\$)"
+    fi
+
+    local remote
+    remote=$(cat <<REMOTE
+set -euo pipefail
+cd "\$HOME"
+if ! command -v sshpass >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass
+fi
+
+USER_NAME=$(printf %q "$user")
+TARGET_IP=$(printf %q "$ip")
+PASSWORD=$(printf %q "$password")
+
+echo "  authorizing controller key on \${USER_NAME}@\${TARGET_IP}"
+SSHPASS="\$PASSWORD" sshpass -e ssh-copy-id \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o ConnectTimeout=10 \\
+    -o PreferredAuthentications=password \\
+    -o PubkeyAuthentication=no \\
+    -i ~/.ssh/id_ed25519.pub "\${USER_NAME}@\${TARGET_IP}"
+
+echo "  staging sudoers fragment (key auth)"
+printf '%s ALL=(ALL) NOPASSWD: ALL\n' "\$USER_NAME" \\
+    | ssh -o StrictHostKeyChecking=accept-new \\
+          -o ConnectTimeout=10 \\
+          "\${USER_NAME}@\${TARGET_IP}" \\
+          'cat > /tmp/medusa-sudoers.frag'
+
+echo "  installing /etc/sudoers.d/\${USER_NAME} via sudo -S"
+printf '%s\n' "\$PASSWORD" \\
+    | ssh -o StrictHostKeyChecking=accept-new \\
+          -o ConnectTimeout=10 \\
+          "\${USER_NAME}@\${TARGET_IP}" \\
+          "sudo -S -p '' install -m 0440 -o root -g root /tmp/medusa-sudoers.frag /etc/sudoers.d/\${USER_NAME} && sudo -n visudo -cf /etc/sudoers.d/\${USER_NAME} && rm -f /tmp/medusa-sudoers.frag"
+
+echo "  verifying passwordless sudo"
+ssh -o BatchMode=yes -o ConnectTimeout=5 "\${USER_NAME}@\${TARGET_IP}" 'sudo -n true' \\
+    && echo "  ok: 'sudo -n true' succeeded on \${USER_NAME}@\${TARGET_IP}"
+REMOTE
+)
+
+    local log install_rc=0
+    log=$(log_path "seed-target-$name")
+    printf "%s==>%s seed-target %s (%s)\n" "$color_blue" "$color_reset" "$name" "$ip"
+    printf "log:    %s\n" "$log"
+    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    stty sane 2>/dev/null || true
+    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
+    if [[ "$install_rc" -eq 0 ]]; then
+        printf "%s✓%s seed-target %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+    printf "%s✗%s seed-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
     return 1
 }
 
@@ -1859,7 +2116,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
+    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -1874,7 +2131,7 @@ _medusactl_complete() {
             COMPREPLY=( $(compgen -W "--check --force --resolver" -- "$cur") )
             ;;
         add-target)
-            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --group --full --limited --prep --authorize --no-seed-hosts --force --dry-run --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --group --full --limited --prep --seed --authorize --no-seed-hosts --force --dry-run --interactive --help" -- "$cur") )
             ;;
         list-targets)
             COMPREPLY=( $(compgen -W "--managed-only --full --limited --help" -- "$cur") )
@@ -1885,7 +2142,7 @@ _medusactl_complete() {
         promote-target)
             COMPREPLY=( $(compgen -W "--dry-run --help" -- "$cur") )
             ;;
-        prep-target|authorize-target|add-targets-from-file)
+        prep-target|authorize-target|seed-target|add-targets-from-file)
             COMPREPLY=( $(compgen -W "--help" -- "$cur") )
             ;;
         completion)
@@ -1919,6 +2176,7 @@ _medusactl() {
         'list-targets:print the host inventory'
         'prep-target:re-run prep-debian.sh against an existing target'
         'authorize-target:ssh-copy-id from controller to an existing target'
+        'seed-target:non-destructive limited-mode onboarding (key + sudoers)'
         'add-targets-from-file:bulk-add targets from a file'
         'update:update the controller checkout'
         'self-update:update the local medusactl helper'
@@ -1956,7 +2214,8 @@ _medusactl() {
                 '--group[ansible group]:group:' \
                 '--full[mark as full managed mode]' \
                 '--limited[mark as limited managed mode]' \
-                '--prep[also run prep-debian.sh; implies --full]' \
+                '--prep[also run prep-debian.sh; mode-aware harden gate]' \
+                '--seed[also run seed-target; limited mode only]' \
                 '--authorize[also run ssh-copy-id]' \
                 '--no-seed-hosts[skip /etc/hosts seed]' \
                 '--force[replace existing entry]'
@@ -2003,6 +2262,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'promote-target' -d 'Clear b
 complete -c medusactl -n '__fish_use_subcommand' -a 'list-targets' -d 'Print the host inventory'
 complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d 'Re-run prep-debian.sh against an existing target'
 complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-copy-id from controller to an existing target'
+complete -c medusactl -n '__fish_use_subcommand' -a 'seed-target' -d 'Non-destructive limited-mode onboarding (key + sudoers)'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-targets-from-file' -d 'Bulk-add targets from a file'
 complete -c medusactl -n '__fish_use_subcommand' -a 'update' -d 'Update the controller checkout'
 complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update the local helper'
@@ -2026,7 +2286,8 @@ complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l alias -d 'D
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l group -d 'ansible group'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l full -d 'Mark as full managed mode'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l limited -d 'Mark as limited managed mode'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run prep-debian.sh (implies --full)'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run prep-debian.sh (mode-aware harden gate)'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l seed -d 'Also run seed-target (limited mode only)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l authorize -d 'Also run ssh-copy-id'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l no-seed-hosts -d 'Skip /etc/hosts seed'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l force -d 'Replace existing entry'
@@ -2415,6 +2676,10 @@ case "${1:-}" in
     authorize-target)
         shift
         cmd_authorize_target "$@"
+        ;;
+    seed-target)
+        shift
+        cmd_seed_target "$@"
         ;;
     add-targets-from-file)
         shift

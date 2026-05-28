@@ -1,29 +1,52 @@
 #!/usr/bin/env bash
 # Medusa Debian root-stage prep.
 #
-# Runs as root on a fresh Debian 12 host (VM or LXC) to make it usable by
-# the user-stage controller bootstrap. Creates a sudo user, installs the
-# minimum prereqs, and authorizes an SSH public key for that user.
+# Runs as root on a Debian host to make it ansible-reachable for medusa.
+# Two phases:
 #
-# Idempotent: re-running on an already-prepped host is safe and skips
-# anything already in place.
+#   1. General prep (always runs, non-breaking on pre-existing infra).
+#      Installs base packages, creates the ansible user with NOPASSWD
+#      sudo, authorizes an SSH public key. Each step is idempotent and
+#      safe to run on hosts the operator already manages (Proxmox node,
+#      NFS server, hand-built baremetal): apt installs no-op when the
+#      packages are already present, adduser is skipped when the user
+#      exists, sudoers and authorized_keys writes overwrite/append with
+#      the same content.
+#
+#   2. Hardening (opt-in, BREAKS pre-existing infra). Drops in
+#      'PermitRootLogin prohibit-password' and locks the root password.
+#      This is correct for medusa-built greenfield templates (full
+#      managed mode) but breaks pre-existing hosts: Proxmox loses
+#      cluster + web-console root login, hand-tuned admin workflows
+#      lose root SSH. Gate via MEDUSA_PREP_HARDEN.
+#
+# Idempotent: re-running on an already-prepped host is safe.
 #
 # Inputs (env vars, or interactive prompts when missing):
 #   MEDUSA_PREP_USER     Username to create or reuse. Default: ansible
 #   MEDUSA_PREP_PUBKEY   SSH public key content to authorize for that user.
 #                        Required when not interactive.
+#   MEDUSA_PREP_HARDEN   '1' to run the hardening phase, '0' to skip it.
+#                        Default: 1 (preserves greenfield behavior).
+#                        medusactl passes 0 for limited-mode hosts.
 #
 # Typical invocations:
+#   # Greenfield (medusa-built VM / LXC): full prep + hardening.
 #   sudo MEDUSA_PREP_USER=ansible MEDUSA_PREP_PUBKEY="ssh-ed25519 AAAA..." \
 #       bash prep-debian.sh
-#   # or from Proxmox host:
+#
+#   # Pre-existing limited host (Proxmox, NFS server, etc.): skip harden.
+#   sudo MEDUSA_PREP_HARDEN=0 MEDUSA_PREP_USER=ansible \
+#       MEDUSA_PREP_PUBKEY="ssh-ed25519 AAAA..." bash prep-debian.sh
+#
+#   # Or from Proxmox host pushing into a guest:
 #   pct push <vmid> prep-debian.sh /root/prep-debian.sh
 #   pct exec <vmid> -- env MEDUSA_PREP_PUBKEY="ssh-ed25519 AAAA..." \
 #       bash /root/prep-debian.sh
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 
 color_red=$'\033[31m'
 color_green=$'\033[32m'
@@ -55,6 +78,8 @@ prompt() {
 
 echo "Medusa Debian prep v$SCRIPT_VERSION"
 
+# === Preflight ==============================================================
+
 if [[ $EUID -ne 0 ]]; then
     phase_fail "preflight" "must run as root (got uid $EUID)"
 fi
@@ -65,6 +90,11 @@ fi
 
 USERNAME="${MEDUSA_PREP_USER:-}"
 PUBKEY="${MEDUSA_PREP_PUBKEY:-}"
+HARDEN="${MEDUSA_PREP_HARDEN:-1}"
+case "$HARDEN" in
+    0|1) ;;
+    *) phase_fail "preflight" "MEDUSA_PREP_HARDEN must be '0' or '1' (got '$HARDEN')" ;;
+esac
 
 if [[ -z "$USERNAME" ]]; then
     if [[ -t 0 ]]; then
@@ -93,6 +123,12 @@ if ! [[ "$PUBKEY" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp[0-9]+|ssh-dss)[[:spa
 fi
 
 phase_ok "preflight"
+
+# === General prep (non-breaking on pre-existing infra) =====================
+# Everything below this banner is idempotent and safe to run on a host the
+# operator already manages: apt installs no-op when packages exist, adduser
+# skips when the user exists, sudoers + authorized_keys writes use guarded
+# overwrites/appends. No sshd_config edits, no root account changes.
 
 info "Installing base packages (sudo openssh-server python3 ca-certificates curl)..."
 export DEBIAN_FRONTEND=noninteractive
@@ -144,13 +180,21 @@ systemctl enable --now ssh >/dev/null 2>&1 \
     || phase_fail "ssh" "could not enable ssh service"
 phase_ok "ssh"
 
-info "Hardening sshd (PermitRootLogin prohibit-password) and locking root password..."
-# Use a drop-in file under sshd_config.d to avoid editing the main config.
-# Modern Debian (12+) ships with 'Include /etc/ssh/sshd_config.d/*.conf' in
-# the default sshd_config so this is picked up automatically.
-sshd_drop="/etc/ssh/sshd_config.d/00-medusa-hardening.conf"
-install -m 0644 /dev/null "$sshd_drop"
-cat > "$sshd_drop" <<'SSHD_EOF'
+# === Hardening (opt-in, BREAKS pre-existing infra) =========================
+# Skipped when MEDUSA_PREP_HARDEN=0 (limited mode). Clamping
+# PermitRootLogin and locking the root password breaks Proxmox cluster
+# operations + web-console root login and removes the operator's root SSH
+# escape hatch on hand-tuned hosts. Only run this against medusa-built
+# greenfield templates where root is not expected to be used post-bootstrap.
+
+run_hardening() {
+    info "Hardening sshd (PermitRootLogin prohibit-password) and locking root password..."
+    # Use a drop-in file under sshd_config.d to avoid editing the main config.
+    # Modern Debian (12+) ships with 'Include /etc/ssh/sshd_config.d/*.conf' in
+    # the default sshd_config so this is picked up automatically.
+    local sshd_drop="/etc/ssh/sshd_config.d/00-medusa-hardening.conf"
+    install -m 0644 /dev/null "$sshd_drop"
+    cat > "$sshd_drop" <<'SSHD_EOF'
 # Managed by medusa prep-debian.sh. Do not edit by hand.
 # - root password login is blocked; root key login still works for emergency
 #   recovery if you have an authorized key.
@@ -159,26 +203,33 @@ cat > "$sshd_drop" <<'SSHD_EOF'
 PermitRootLogin prohibit-password
 SSHD_EOF
 
-# Verify sshd accepts the new config before restarting, so a typo here can't
-# lock everyone out.
-if ! sshd -t 2>/dev/null; then
-    rm -f "$sshd_drop"
-    phase_fail "harden" "sshd config validation failed; reverted hardening drop-in"
+    # Verify sshd accepts the new config before restarting, so a typo here can't
+    # lock everyone out.
+    if ! sshd -t 2>/dev/null; then
+        rm -f "$sshd_drop"
+        phase_fail "harden" "sshd config validation failed; reverted hardening drop-in"
+    fi
+
+    # Lock the root account password so password SSH/login cannot succeed via
+    # root regardless of sshd settings. Key-based root login (if a key was
+    # authorized) keeps working.
+    passwd -l root >/dev/null \
+        || phase_fail "harden" "passwd -l root failed"
+
+    # Reload (not restart) to minimize the chance of dropping in-flight sessions.
+    systemctl reload ssh >/dev/null 2>&1 \
+        || systemctl reload sshd >/dev/null 2>&1 \
+        || systemctl restart ssh >/dev/null 2>&1 \
+        || systemctl restart sshd >/dev/null 2>&1 \
+        || phase_fail "harden" "could not reload sshd"
+    phase_ok "harden"
+}
+
+if [[ "$HARDEN" == "1" ]]; then
+    run_hardening
+else
+    info "harden: skipped (MEDUSA_PREP_HARDEN=0; limited mode — pre-existing host)"
 fi
-
-# Lock the root account password so password SSH/login cannot succeed via
-# root regardless of sshd settings. Key-based root login (if a key was
-# authorized) keeps working.
-passwd -l root >/dev/null \
-    || phase_fail "harden" "passwd -l root failed"
-
-# Reload (not restart) to minimize the chance of dropping in-flight sessions.
-systemctl reload ssh >/dev/null 2>&1 \
-    || systemctl reload sshd >/dev/null 2>&1 \
-    || systemctl restart ssh >/dev/null 2>&1 \
-    || systemctl restart sshd >/dev/null 2>&1 \
-    || phase_fail "harden" "could not reload sshd"
-phase_ok "harden"
 
 echo ""
 phase_ok "prep: host ready for user-stage bootstrap as $USERNAME"
