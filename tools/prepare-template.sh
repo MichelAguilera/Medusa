@@ -47,7 +47,13 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.2.0"
+# Ensure /usr/sbin + /sbin are reachable. Debian 13 + non-login root
+# shells (su without '-', some sudo configs) can strip these, leaving
+# chpasswd / usermod / sshd / ssh-keygen findable only by absolute path.
+# Prepend so the script works regardless of how the operator invoked it.
+export PATH="/usr/sbin:/sbin:/usr/local/sbin:$PATH"
+
+SCRIPT_VERSION="0.2.1"
 
 color_red=$'\033[31m'
 color_green=$'\033[32m'
