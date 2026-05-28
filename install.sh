@@ -8,7 +8,7 @@
 set -euo pipefail
 
 INSTALL_VERSION="0.3.0"
-MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-master}"
+MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
 MEDUSA_PREP_URL="${MEDUSA_PREP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/prep-debian.sh}"
@@ -33,11 +33,11 @@ Medusa controller installer v${INSTALL_VERSION}
 
 Usage:
   ./install.sh
-  curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/master/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/main/install.sh | bash
 
 Environment:
   MEDUSA_INSTALL_REF       Git ref used when downloading the controller
-                           bootstrap script. Default: master
+                           bootstrap script. Default: main
   MEDUSA_GITHUB_REPO       GitHub repo used for authenticated gh fallback.
                            Default: MichelAguilera/Medusa
   MEDUSA_BOOTSTRAP_URL     Full URL to tools/bootstrap-controller.sh.

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 VERSION="0.12.0"
-MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-master}"
+MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
 MEDUSACTL_SOURCE_URL="${MEDUSACTL_SOURCE_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/medusactl}"
