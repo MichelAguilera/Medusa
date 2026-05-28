@@ -267,11 +267,19 @@ remote_command() {
     # secrets lookup) and the inventory subdir (for the medusa CLI's
     # ProjectPaths override). MEDUSA_GENERATED_DIR is consumed by both
     # the medusa CLI and ansible's group_vars/all.yml.
-    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; cd %q && %s' \
+    #
+    # ANSIBLE_INVENTORY overrides ansible.cfg's hardcoded relative
+    # path ('../generated/ansible/inventory/...') which became wrong
+    # after T-038 moved generated/ out of the code repo and into the
+    # XDG state dir. ansible.cfg can't expand env vars, so the only
+    # robust knob is ANSIBLE_INVENTORY (which ansible reads first).
+    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; export ANSIBLE_INVENTORY=%q,%q; cd %q && %s' \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH/ansible/inventory/hosts.ini" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH/ansible/inventory/medusa-groups.yml" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$command"
 }
