@@ -46,7 +46,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.2.0"
+SCRIPT_VERSION="0.2.1"
 
 color_red=$'\033[31m'
 color_green=$'\033[32m'
@@ -90,6 +90,14 @@ fi
 
 USERNAME="${MEDUSA_PREP_USER:-}"
 PUBKEY="${MEDUSA_PREP_PUBKEY:-}"
+# T-043 follow-up: also accept the pubkey as base64 to dodge nested
+# shell-quoting hell when medusactl chains workstation -> controller
+# -> target ssh. base64 -w0 output is [A-Za-z0-9+/=] only, no spaces.
+PUBKEY_B64="${MEDUSA_PREP_PUBKEY_B64:-}"
+if [[ -z "$PUBKEY" && -n "$PUBKEY_B64" ]]; then
+    PUBKEY=$(printf '%s' "$PUBKEY_B64" | base64 -d 2>/dev/null) \
+        || phase_fail "preflight" "MEDUSA_PREP_PUBKEY_B64 failed to decode"
+fi
 HARDEN="${MEDUSA_PREP_HARDEN:-1}"
 case "$HARDEN" in
     0|1) ;;
