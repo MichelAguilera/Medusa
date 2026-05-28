@@ -676,6 +676,11 @@ cmd_audit_targets() {
     local remote
     remote=$(cat <<REMOTE
 set -uo pipefail
+export PATH="\$HOME/.local/bin:\$PATH"
+export MEDUSA_INVENTORY_ROOT=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH")
+export MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory")
+export MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets")
+export MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH")
 cd "$MEDUSA_CONTROLLER_PATH"
 hosts=\$(uv run --quiet medusa list-hosts --managed-only) || {
     echo "audit: medusa list-hosts --managed-only failed on controller" >&2
