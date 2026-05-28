@@ -1,7 +1,8 @@
 ---
 - name: Check exportfs is available
-  ansible.builtin.shell:
-    cmd: command -v exportfs
+  ansible.builtin.command:
+    cmd: /usr/sbin/exportfs -v
+  become: true
   changed_when: false
   failed_when: false
   register: medusa_exportfs
@@ -10,8 +11,9 @@
   ansible.builtin.fail:
     msg: >-
       {{ inventory_hostname }} is listed as a Medusa NFS export server, but
-      exportfs is not available. Install or configure the host's NFS server
-      stack first; Medusa does not blindly install nfs-kernel-server.
+      /usr/sbin/exportfs is not available via sudo. Install or configure the
+      host's NFS server stack first; Medusa does not blindly install
+      nfs-kernel-server.
   when: medusa_exportfs.rc != 0
 
 - name: Ensure exports.d directory exists
