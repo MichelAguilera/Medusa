@@ -35,5 +35,4 @@ inventory YAML → validated model → normalized model → renderers → genera
 
 ## Status
 
-Early. Public surface is the post-T-035 cutover; history starts at
-`initial public release`. Issue tracker lives on this repo.
+This project is at an early stage and things may break. I do not recommend using it until a stable branch is released.
