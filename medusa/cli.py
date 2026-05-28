@@ -887,6 +887,8 @@ def list_hosts_cmd(
         _succeed("(no hosts)")
         return
 
+    hosts = _sort_hosts_by_ip(hosts)
+
     for host in hosts:
         letter = _host_mode_letter(host)
         zones = ",".join(host.get("zones") or [])
@@ -896,6 +898,34 @@ def list_hosts_cmd(
             f"{letter} {host.get('name'):<20} {str(host.get('ip')):<18} "
             f"zones={zones:<12} user={user:<10} groups={groups}"
         )
+
+
+def _sort_hosts_by_ip(hosts: Any) -> tuple[dict[str, Any], ...]:
+    """Sort hosts by numeric IP, then name. Malformed IPs sort last
+    (warned to stderr) so a mid-edit inventory still prints.
+    """
+    import ipaddress
+
+    def key(host: dict[str, Any]) -> tuple[int, Any, str]:
+        ip_str = str(host.get("ip") or "")
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            # IPv4 sorts before IPv6 (bucket 0 vs 1). Within a bucket,
+            # ipaddress objects compare numerically.
+            bucket = 0 if isinstance(addr, ipaddress.IPv4Address) else 1
+            return (bucket, addr, str(host.get("name") or ""))
+        except ValueError:
+            typer.echo(
+                f"WARNING  host {host.get('name')!r} has malformed ip "
+                f"{ip_str!r}; sorting last",
+                err=True,
+            )
+            # Bucket 2 keeps malformed entries after both v4 and v6.
+            # ipaddress.IPv6Address(0) is just a sentinel so the tuple
+            # element types match the other branch.
+            return (2, ipaddress.IPv6Address(0), str(host.get("name") or ""))
+
+    return tuple(sorted(hosts, key=key))
 
 
 def _host_mode_letter(host: dict[str, Any]) -> str:
