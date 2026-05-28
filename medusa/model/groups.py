@@ -6,6 +6,7 @@ class AnsibleGroupsModel(BaseModel):
 
     docker_hosts: tuple[str, ...]
     storage_hosts: tuple[str, ...]
+    nfs_export_hosts: tuple[str, ...]
     coredns_hosts: tuple[str, ...]
     traefik_hosts: tuple[str, ...]
     homepage_hosts: tuple[str, ...]

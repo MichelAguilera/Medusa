@@ -9,6 +9,9 @@ class NfsExportInventory(BaseModel):
     id: str
     server: str
     path: str
+    options: list[str] = Field(
+        default_factory=lambda: ["rw", "sync", "no_subtree_check", "no_root_squash"]
+    )
 
     @field_validator("id", "server")
     @classmethod
@@ -27,6 +30,16 @@ class NfsExportInventory(BaseModel):
         if not normalized.startswith("/"):
             raise ValueError("export path must be absolute")
         return normalized.rstrip("/") or "/"
+
+    @field_validator("options")
+    @classmethod
+    def normalize_options(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("export options cannot contain empty values")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("export options cannot contain duplicates")
+        return normalized
 
 
 class NfsMountInventory(BaseModel):

@@ -17,6 +17,12 @@
   roles:
     - deploy_root
 
+- name: Deploy managed NFS exports
+  hosts: nfs_export_hosts
+  gather_facts: false
+  roles:
+    - nfs_exports
+
 - name: Mount managed shared storage
   hosts: storage_hosts
   gather_facts: false

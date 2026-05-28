@@ -7,6 +7,23 @@ class NfsExport(BaseModel):
     id: str
     server: str
     path: str
+    options: tuple[str, ...]
+
+
+class NfsExportClient(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    host: str
+    fqdn: str
+    options: tuple[str, ...]
+
+
+class NfsServerExport(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    path: str
+    clients: tuple[NfsExportClient, ...]
 
 
 class NfsMount(BaseModel):
@@ -27,5 +44,6 @@ class StorageModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     exports: tuple[NfsExport, ...]
+    exports_by_server: tuple[tuple[str, tuple[NfsServerExport, ...]], ...]
     mounts: tuple[NfsMount, ...]
     mounts_by_host: tuple[tuple[str, tuple[NfsMount, ...]], ...]

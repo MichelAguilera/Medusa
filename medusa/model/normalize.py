@@ -15,7 +15,13 @@ from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
 from medusa.model.services import ServiceRecord, ServicesModel, TraefikRoute
 from medusa.model.settings import generated_env_files, secret_sources
-from medusa.model.storage import NfsExport, NfsMount, StorageModel
+from medusa.model.storage import (
+    NfsExport,
+    NfsExportClient,
+    NfsMount,
+    NfsServerExport,
+    StorageModel,
+)
 
 
 def _derive_managed_mode(
@@ -163,7 +169,12 @@ def normalize_storage(
         raise ValueError(f"mounts reference unknown hosts: {formatted}")
 
     exports = {
-        export.id: NfsExport(id=export.id, server=export.server, path=export.path)
+        export.id: NfsExport(
+            id=export.id,
+            server=export.server,
+            path=export.path,
+            options=tuple(export.options),
+        )
         for export in inventory.exports
     }
 
@@ -201,9 +212,40 @@ def normalize_storage(
         )
         for host in sorted(mounts_by_host)
     )
+    exports_by_server: dict[str, list[NfsServerExport]] = {}
+    for export in exports.values():
+        export_mounts = sorted(
+            (mount for mount in inventory.mounts if mount.export == export.id),
+            key=lambda item: item.id,
+        )
+        clients = tuple(
+            sorted(
+                (
+                    NfsExportClient(
+                        host=host,
+                        fqdn=hosts_by_name[host].fqdns[0],
+                        options=export.options,
+                    )
+                    for mount in export_mounts
+                    for host in mount.host
+                ),
+                key=lambda item: item.host,
+            )
+        )
+        exports_by_server.setdefault(export.server, []).append(
+            NfsServerExport(id=export.id, path=export.path, clients=clients)
+        )
+    exports_by_server_tuple = tuple(
+        (
+            server,
+            tuple(sorted(exports_by_server[server], key=lambda item: item.path)),
+        )
+        for server in sorted(exports_by_server)
+    )
 
     return StorageModel(
         exports=tuple(sorted(exports.values(), key=lambda item: item.id)),
+        exports_by_server=exports_by_server_tuple,
         mounts=mounts,
         mounts_by_host=mounts_by_host_tuple,
     )
@@ -516,6 +558,7 @@ def normalize_ansible_groups(
         sorted({compose.host for compose in services_model.compose})
     )
     storage_hosts = tuple(sorted({mount.host for mount in storage_model.mounts}))
+    nfs_export_hosts = tuple(server for server, _ in storage_model.exports_by_server)
     coredns_hosts = _platform_hosts(services_model, {"coredns"})
     if not coredns_hosts:
         coredns_hosts = tuple(
@@ -527,6 +570,7 @@ def normalize_ansible_groups(
         ("docker_hosts", docker_hosts),
         ("homepage_hosts", homepage_model.hosts),
         ("monitoring_hosts", monitoring_model.hosts),
+        ("nfs_export_hosts", nfs_export_hosts),
         ("storage_hosts", storage_hosts),
         ("traefik_hosts", _platform_hosts(services_model, {"traefik"})),
     )
@@ -534,6 +578,7 @@ def normalize_ansible_groups(
     return AnsibleGroupsModel(
         docker_hosts=docker_hosts,
         storage_hosts=storage_hosts,
+        nfs_export_hosts=nfs_export_hosts,
         coredns_hosts=tuple(sorted(coredns_hosts)),
         traefik_hosts=_platform_hosts(services_model, {"traefik"}),
         homepage_hosts=homepage_model.hosts,

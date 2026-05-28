@@ -14,4 +14,13 @@ def render_storage_manifest(
         "storage/storage-manifest.yaml.j2",
         {"storage": model},
     )
-    return {generated_dir / "storage-manifest.yaml": content}
+    files = {generated_dir / "storage-manifest.yaml": content}
+    for server, exports in model.exports_by_server:
+        files[
+            generated_dir / "storage" / "exports" / server / "medusa.exports"
+        ] = render_template(
+            templates_dir,
+            "storage/medusa.exports.j2",
+            {"server": server, "exports": exports},
+        )
+    return files

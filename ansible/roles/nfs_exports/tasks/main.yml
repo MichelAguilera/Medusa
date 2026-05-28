@@ -1,0 +1,32 @@
+---
+- name: Check exportfs is available
+  ansible.builtin.shell:
+    cmd: command -v exportfs
+  changed_when: false
+  failed_when: false
+  register: medusa_exportfs
+
+- name: Fail when exportfs is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} is listed as a Medusa NFS export server, but
+      exportfs is not available. Install or configure the host's NFS server
+      stack first; Medusa does not blindly install nfs-kernel-server.
+  when: medusa_exportfs.rc != 0
+
+- name: Ensure exports.d directory exists
+  ansible.builtin.file:
+    path: /etc/exports.d
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Deploy managed NFS exports
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/storage/exports/{{ inventory_hostname }}/medusa.exports"
+    dest: /etc/exports.d/medusa.exports
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Reload NFS exports
