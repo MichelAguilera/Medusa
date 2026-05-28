@@ -855,8 +855,15 @@ while IFS= read -r line; do
     if [[ "$mode" == "L" ]]; then
         # Limited mode: reachability + sudo only. Hardening checks belong
         # to the operator, not medusa.
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+        # -n: don't read from stdin, otherwise ssh swallows the outer
+        # 'read -r line' loop's heredoc and the loop exits after the
+        # first iteration.
+        # Use hostname (not ip) so the controller's /etc/hosts
+        # bootstrap block (bootstrap_ip override) routes the
+        # connection during the cutover phase. /etc/hosts -> DNS
+        # fallback keeps this correct when bootstrap_ip is unset.
+        if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=accept-new "${user}@${name}" \
                 'sudo -n true' >/dev/null 2>&1; then
             printf "  ✓ %s (%s@%s): reachable + sudo ok (limited; hardening checks skipped)\n" \
                 "$name" "$user" "$ip"
@@ -869,8 +876,9 @@ while IFS= read -r line; do
     fi
 
     # Full mode: existing sshd + root-account probe.
-    sshd_out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+    # -n: see L-mode comment above. Hostname target: same reason.
+    sshd_out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=accept-new "${user}@${name}" \
         'sudo -n sshd -T 2>/dev/null; echo "---"; sudo -n passwd -S root 2>/dev/null' \
         2>/dev/null) || {
         printf "  ! %s (%s@%s): unreachable or sudo -n unavailable\n" \
@@ -1671,8 +1679,17 @@ medusactl prep-target — re-run prep-debian.sh against an existing target.
 Usage:
   medusactl prep-target <name>
 
-Prompts for the shared root SSH password on the target. Runs the same
-prep script bootstrap uses, with mode-aware behavior:
+Auth strategy: probes whether the controller can already reach the
+target as <ansible_user> with NOPASSWD sudo. If yes, runs prep over
+key auth as that user (sudo on the target) — no password prompt
+needed. If no, falls back to root SSH password (prompts on the
+workstation), the bootstrap path used on a clean host.
+
+This makes re-prep safe on already-hardened full hosts where
+PermitRootLogin=prohibit-password blocks the root password path:
+key auth to the ansible user still works.
+
+Runs the same prep script bootstrap uses, with mode-aware behavior:
 
   full hosts (medusa-built templates): general prep + hardening.
     Installs sudo/openssh-server/python3, creates the ansible user
@@ -1694,10 +1711,6 @@ EOF
     load_config
     local name=${1:-}
     [[ -n "$name" ]] || fail "prep-target: name argument is required"
-
-    local password
-    read -r -s -p "Root SSH password for $name: " password </dev/tty
-    printf "\n" >&2
 
     # Resolve the target's mode, IP, and ansible user via
     # 'medusa list-hosts --managed-only'. The mode prefix (F/L/-) is a
@@ -1738,10 +1751,51 @@ EOF
     [[ -z "$user" ]] && user="ansible"
     [[ -z "$ip" ]] && fail "prep-target: could not determine IP for $name"
 
-    # Run the prep script from the controller's tools/prep-debian.sh via
-    # the same root SSH + sshpass approach bootstrap uses, but invoked here.
+    # T-043 follow-up: probe controller -> target key auth first. If the
+    # ansible user is already authorized + NOPASSWD sudo works, use that
+    # path (no password prompt). Otherwise fall back to root SSH password
+    # for first-time bootstrap. This is what makes re-prep on an already
+    # hardened full host work — PermitRootLogin=prohibit-password blocks
+    # the root password path, but key auth to the ansible user still
+    # works.
+    local auth_mode="key"
+    # Hostname target (not ip) so the controller's /etc/hosts
+    # bootstrap_ip override routes the probe through the cutover IP
+    # when set. Falls through to DNS when bootstrap_ip is unset.
+    local probe_script="ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new $(printf %q "${user}@${name}") 'sudo -n true' >/dev/null 2>&1"
+    if ! ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$probe_script")" >/dev/null 2>&1; then
+        auth_mode="root-password"
+    fi
+
+    local password=""
+    if [[ "$auth_mode" == "key" ]]; then
+        printf "  controller key auth available for %s@%s; no password prompt needed\n" "$user" "$name" >&2
+    else
+        printf "  controller key auth unavailable for %s@%s; falling back to root SSH password\n" "$user" "$name" >&2
+        read -r -s -p "Root SSH password for $name: " password </dev/tty
+        printf "\n" >&2
+    fi
+
+    # Build the remote prep script. Two variants: key path (no sshpass,
+    # ssh as ansible user, sudo on target) and root-password path
+    # (existing sshpass + scp + ssh as root flow).
     local remote
-    remote=$(cat <<REMOTE
+    if [[ "$auth_mode" == "key" ]]; then
+        remote=$(cat <<REMOTE
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+pubkey_b64=\$(base64 -w0 < ~/.ssh/id_ed25519.pub) \\
+    || { echo "controller pubkey base64 encode failed" >&2; exit 1; }
+remote_tmp=/tmp/medusa-prep.\$\$
+scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
+    tools/prep-debian.sh ${user}@${name}:\${remote_tmp}
+ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
+    ${user}@${name} \\
+    "sudo -- env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
+REMOTE
+)
+    else
+        remote=$(cat <<REMOTE
 set -euo pipefail
 cd "$MEDUSA_CONTROLLER_PATH"
 if ! command -v sshpass >/dev/null 2>&1; then
@@ -1755,16 +1809,17 @@ SSHPASS=$(printf %q "$password") sshpass -e scp \\
     -o ConnectTimeout=10 \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
-    tools/prep-debian.sh root@${ip}:\${remote_tmp}
+    tools/prep-debian.sh root@${name}:\${remote_tmp}
 SSHPASS=$(printf %q "$password") sshpass -e ssh \\
     -o StrictHostKeyChecking=accept-new \\
     -o ConnectTimeout=10 \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
-    root@${ip} \\
+    root@${name} \\
     "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
 REMOTE
 )
+    fi
 
     local log install_rc=0
     log=$(log_path "prep-target-$name")
@@ -1950,34 +2005,37 @@ if ! command -v sshpass >/dev/null 2>&1; then
 fi
 
 USER_NAME=$(printf %q "$user")
-TARGET_IP=$(printf %q "$ip")
+# Hostname target (not ip) so controller /etc/hosts bootstrap_ip
+# override routes the connection when in cutover phase. Falls
+# through to DNS when bootstrap_ip is unset.
+TARGET_HOST=$(printf %q "$name")
 PASSWORD=$(printf %q "$password")
 
-echo "  authorizing controller key on \${USER_NAME}@\${TARGET_IP}"
+echo "  authorizing controller key on \${USER_NAME}@\${TARGET_HOST}"
 SSHPASS="\$PASSWORD" sshpass -e ssh-copy-id \\
     -o StrictHostKeyChecking=accept-new \\
     -o ConnectTimeout=10 \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
-    -i ~/.ssh/id_ed25519.pub "\${USER_NAME}@\${TARGET_IP}"
+    -i ~/.ssh/id_ed25519.pub "\${USER_NAME}@\${TARGET_HOST}"
 
 echo "  staging sudoers fragment (key auth)"
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "\$USER_NAME" \\
     | ssh -o StrictHostKeyChecking=accept-new \\
           -o ConnectTimeout=10 \\
-          "\${USER_NAME}@\${TARGET_IP}" \\
+          "\${USER_NAME}@\${TARGET_HOST}" \\
           'cat > /tmp/medusa-sudoers.frag'
 
 echo "  installing /etc/sudoers.d/\${USER_NAME} via sudo -S"
 printf '%s\n' "\$PASSWORD" \\
     | ssh -o StrictHostKeyChecking=accept-new \\
           -o ConnectTimeout=10 \\
-          "\${USER_NAME}@\${TARGET_IP}" \\
+          "\${USER_NAME}@\${TARGET_HOST}" \\
           "sudo -S -p '' install -m 0440 -o root -g root /tmp/medusa-sudoers.frag /etc/sudoers.d/\${USER_NAME} && sudo -n visudo -cf /etc/sudoers.d/\${USER_NAME} && rm -f /tmp/medusa-sudoers.frag"
 
 echo "  verifying passwordless sudo"
-ssh -o BatchMode=yes -o ConnectTimeout=5 "\${USER_NAME}@\${TARGET_IP}" 'sudo -n true' \\
-    && echo "  ok: 'sudo -n true' succeeded on \${USER_NAME}@\${TARGET_IP}"
+ssh -o BatchMode=yes -o ConnectTimeout=5 "\${USER_NAME}@\${TARGET_HOST}" 'sudo -n true' \\
+    && echo "  ok: 'sudo -n true' succeeded on \${USER_NAME}@\${TARGET_HOST}"
 REMOTE
 )
 
