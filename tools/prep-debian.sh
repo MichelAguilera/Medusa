@@ -46,7 +46,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.2.1"
+SCRIPT_VERSION="0.2.2"
 
 color_red=$'\033[31m'
 color_green=$'\033[32m'
@@ -200,6 +200,10 @@ run_hardening() {
     # Use a drop-in file under sshd_config.d to avoid editing the main config.
     # Modern Debian (12+) ships with 'Include /etc/ssh/sshd_config.d/*.conf' in
     # the default sshd_config so this is picked up automatically.
+    # Remove the bootstrap drop-in installed by prepare-template.sh
+    # (PermitRootLogin yes) so the hardening directive isn't shadowed by
+    # a leftover file. Idempotent: rm -f is fine when the file is absent.
+    rm -f /etc/ssh/sshd_config.d/00-medusa-bootstrap.conf
     local sshd_drop="/etc/ssh/sshd_config.d/00-medusa-hardening.conf"
     install -m 0644 /dev/null "$sshd_drop"
     cat > "$sshd_drop" <<'SSHD_EOF'

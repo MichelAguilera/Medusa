@@ -23,19 +23,31 @@
 #     first boot. NEVER do this on a long-lived bare-metal install.
 #
 # Flags:
-#   --no-upgrade      skip apt full-upgrade
-#   --no-extra        skip ops-friendly extras
-#   --as-template     force clone-prep even on bare metal (rare; you must
-#                     plan to image and clone this disk)
-#   --no-clone-prep   skip clone-prep even on a detected VM/LXC (useful
-#                     when reusing a VM as a long-lived host, not a
-#                     template source)
+#   --no-upgrade            skip apt full-upgrade
+#   --no-extra              skip ops-friendly extras
+#   --as-template           force clone-prep even on bare metal (rare; you
+#                           must plan to image and clone this disk)
+#   --no-clone-prep         skip clone-prep even on a detected VM/LXC
+#                           (useful when reusing a VM as a long-lived host,
+#                           not a template source)
+#   --root-password=<pw>    bake a root password into the template AND
+#                           enable temporary root SSH password auth via
+#                           /etc/ssh/sshd_config.d/00-medusa-bootstrap.conf.
+#                           Required so 'medusactl prep-target' can do its
+#                           first-run root-SSH bootstrap on clones. The
+#                           prep-debian harden block replaces this drop-in
+#                           and locks the root password on full-mode hosts.
+#                           Also readable from env MEDUSA_TEMPLATE_ROOT_PASSWORD.
+#   --no-root-bootstrap     skip the root password + sshd drop-in step
+#                           (use when the operator provisions root access
+#                           some other way: pre-baked SSH key, cloud-init,
+#                           etc).
 #
 # Idempotent. Re-running on an already-prepped host is safe.
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.1.0"
+SCRIPT_VERSION="0.2.0"
 
 color_red=$'\033[31m'
 color_green=$'\033[32m'
@@ -57,12 +69,16 @@ DO_EXTRA=1
 # CLONE_PREP_OVERRIDE: "" = auto (skip on baremetal, run on VM/LXC),
 #                     "force" = always run, "skip" = always skip.
 CLONE_PREP_OVERRIDE=""
+ROOT_PASSWORD="${MEDUSA_TEMPLATE_ROOT_PASSWORD:-}"
+DO_ROOT_BOOTSTRAP=1
 for arg in "$@"; do
     case "$arg" in
-        --no-upgrade)     DO_UPGRADE=0 ;;
-        --no-extra)       DO_EXTRA=0 ;;
-        --as-template)    CLONE_PREP_OVERRIDE="force" ;;
-        --no-clone-prep)  CLONE_PREP_OVERRIDE="skip" ;;
+        --no-upgrade)         DO_UPGRADE=0 ;;
+        --no-extra)           DO_EXTRA=0 ;;
+        --as-template)        CLONE_PREP_OVERRIDE="force" ;;
+        --no-clone-prep)      CLONE_PREP_OVERRIDE="skip" ;;
+        --root-password=*)    ROOT_PASSWORD="${arg#*=}" ;;
+        --no-root-bootstrap)  DO_ROOT_BOOTSTRAP=0 ;;
         -h|--help)
             sed -n '2,/^set -e/p' "$0" | sed '$d' | sed 's/^# //;s/^#//'
             exit 0
@@ -156,6 +172,62 @@ info "Installing core packages: ${CORE_PACKAGES[*]}"
 apt-get install -y -qq "${CORE_PACKAGES[@]}" \
     || phase_fail "core" "core package install failed"
 phase_ok "core"
+
+# --- Bootstrap auth (root password + permissive sshd drop-in) --------------
+#
+# Goal: a clone of this template is reachable by 'medusactl prep-target'
+# WITHOUT operator console intervention. prep-target's first-run path
+# uses sshpass + root SSH password to scp prep-debian.sh and run it as
+# root. Debian's defaults block that path (PermitRootLogin
+# prohibit-password, no root password). This section bakes a root
+# password into the template AND installs a sshd drop-in that
+# temporarily allows root password auth.
+#
+# Lifecycle: medusa prep-debian.sh's harden block (full mode) replaces
+# /etc/ssh/sshd_config.d/00-medusa-bootstrap.conf with a 'PermitRootLogin
+# prohibit-password' drop-in and locks the root password. Limited-mode
+# hosts keep the bootstrap drop-in (operator owns the root surface), so
+# the password stays usable. Either way, the template-baked credential
+# is intentional.
+
+if [[ "$DO_ROOT_BOOTSTRAP" -eq 1 ]]; then
+    if [[ -z "$ROOT_PASSWORD" && -t 0 ]]; then
+        printf "  Root password to bake into template: " >&2
+        read -r -s ROOT_PASSWORD
+        printf "\n" >&2
+    fi
+    if [[ -z "$ROOT_PASSWORD" ]]; then
+        phase_fail "bootstrap-auth" \
+            "no root password provided. Pass --root-password=<pw>, set MEDUSA_TEMPLATE_ROOT_PASSWORD, or use --no-root-bootstrap to skip"
+    fi
+
+    info "Setting root password (baked into template)..."
+    echo "root:$ROOT_PASSWORD" | chpasswd \
+        || phase_fail "bootstrap-auth" "chpasswd failed"
+
+    info "Installing temporary sshd drop-in (PermitRootLogin yes + password auth)..."
+    install -d -m 0755 /etc/ssh/sshd_config.d
+    sshd_drop="/etc/ssh/sshd_config.d/00-medusa-bootstrap.conf"
+    cat > "$sshd_drop" <<'EOF'
+# Managed by medusa prepare-template.sh.
+# TEMPORARY: enables 'medusactl prep-target' to bootstrap as root via
+# SSH password on first run. The prep-debian.sh harden block (full mode)
+# replaces this drop-in with 'PermitRootLogin prohibit-password' and
+# runs 'passwd -l root'. Limited-mode hosts keep this drop-in; the
+# operator owns the root surface on those.
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+    chmod 0644 "$sshd_drop"
+
+    if ! sshd -t 2>/dev/null; then
+        rm -f "$sshd_drop"
+        phase_fail "bootstrap-auth" "sshd config validation failed; reverted drop-in"
+    fi
+    phase_ok "bootstrap-auth"
+else
+    info "Skipping root password + sshd drop-in (--no-root-bootstrap)."
+fi
 
 # --- VM-only: qemu-guest-agent ---------------------------------------------
 
@@ -262,6 +334,13 @@ if [[ "$DO_CLONE_PREP" -eq 1 ]]; then
         echo "     - run qemu-guest-agent (Proxmox UI shows guest IP)"
     fi
     echo "     - already have python3 + sudo + openssh-server for Medusa bootstrap"
+    if [[ "$DO_ROOT_BOOTSTRAP" -eq 1 ]]; then
+        echo "     - accept root SSH password auth (baked credential) so"
+        echo "       'medusactl prep-target' can run unattended on first boot"
+    else
+        echo "     - NOT accept root SSH password auth (--no-root-bootstrap);"
+        echo "       provision root access out-of-band before prep-target"
+    fi
 else
     echo "Host is ready for Medusa's bootstrap. Identity is preserved (no"
     echo "machine-id or SSH host key wipe), so this host can keep its current"
