@@ -26,7 +26,11 @@ DEFAULT_CODE_REPO_URL="https://github.com/MichelAguilera/Medusa.git"
 DEFAULT_CODE_REPO_REF="main"
 DEFAULT_CODE_CLONE_DIR="${HOME}/Medusa"
 
-DEFAULT_INVENTORY_REPO_URL="https://github.com/MichelAguilera/medusa-inventory.git"
+# Inventory repo URL is operator-specific: only the operator who owns the
+# private inventory repo can clone it. Read from MEDUSA_INVENTORY_REPO_URL
+# when set; otherwise show a placeholder that the operator must edit. The
+# upstream Medusa repo intentionally does not ship a real owner here.
+DEFAULT_INVENTORY_REPO_URL="${MEDUSA_INVENTORY_REPO_URL:-https://github.com/<you>/medusa-inventory.git}"
 DEFAULT_INVENTORY_REPO_REF="main"
 DEFAULT_INVENTORY_CLONE_DIR="${HOME}/medusa-inventory"
 
