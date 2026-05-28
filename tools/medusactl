@@ -1766,6 +1766,17 @@ EOF
     [[ -z "$user" ]] && user="ansible"
     [[ -z "$ip" ]] && fail "prep-target: could not determine IP for $name"
 
+    # Strip stale known_hosts entries on controller for this target.
+    # prep-target is the "fresh host or re-bootstrap" path by contract,
+    # so a host key change is expected (every clone has a unique key per
+    # prepare-template.sh's regen-on-first-boot logic). Without this,
+    # 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED' aborts the
+    # connection. Idempotent: -R on a missing entry is a no-op.
+    local kh_clean_script
+    kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
+        "$name" "${name}.lan" "$ip")
+    ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$kh_clean_script")" >/dev/null 2>&1 || true
+
     # T-043 follow-up: probe controller -> target key auth first. If the
     # ansible user is already authorized + NOPASSWD sudo works, use that
     # path (no password prompt). Otherwise fall back to root SSH password
@@ -2010,6 +2021,15 @@ EOF
     if ! [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
         fail "seed-target: refusing unsafe username '$user' (must match ^[a-z_][a-z0-9_-]*\$)"
     fi
+
+    # Strip stale known_hosts entries on controller (see prep-target
+    # for rationale). seed-target is also a "fresh-host" path by
+    # contract — limited-mode bootstrap of a host whose previous
+    # incarnation may have left a different host key behind.
+    local kh_clean_script
+    kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
+        "$name" "${name}.lan" "$ip")
+    ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$kh_clean_script")" >/dev/null 2>&1 || true
 
     local remote
     remote=$(cat <<REMOTE
