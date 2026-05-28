@@ -2140,6 +2140,40 @@ cmd_install_runtime() {
 }
 
 cmd_self_update() {
+    local skip_python=0
+    for arg in "$@"; do
+        case "$arg" in
+            --no-python) skip_python=1 ;;
+            -h|--help)
+                cat <<EOF
+medusactl self-update — refresh the workstation install.
+
+Usage:
+  medusactl self-update [--no-python]
+
+Updates two things by default:
+  1. The medusactl bash helper (this script) from the public Medusa
+     main branch.
+  2. The 'medusa' Python package, when installed via 'uv tool'.
+     Required for workstation-side inventory mutations like
+     'medusactl add-target' (which call 'medusa add-host' locally
+     against MEDUSACTL_INVENTORY_DIR).
+
+Flags:
+  --no-python  Skip the 'uv tool upgrade medusa' step. Use when the
+               medusa package is managed some other way (system pip,
+               local editable install, etc).
+
+Note: 'medusactl update' is the separate command that pulls the
+controller's checkout (medusa + ansible + inventory) on the
+controller host. self-update is workstation-side only.
+EOF
+                return 0
+                ;;
+            *) fail "self-update: unknown flag '$arg'" ;;
+        esac
+    done
+
     local source destination destination_dir installed tmp_destination
 
     installed=$(command -v medusactl || true)
@@ -2166,6 +2200,40 @@ cmd_self_update() {
     mv -f "$tmp_destination" "$destination" || fail "failed to update $destination"
     printf "%s✓%s medusactl updated at %s\n" "$color_green" "$color_reset" "$destination"
     refresh_installed_completions
+
+    # Workstation-side medusa Python package. T-037 moved inventory
+    # mutations (add-host, remove-host, promote-host) onto the
+    # workstation, so a stale local 'medusa' is a real footgun —
+    # fixes shipped on the controller alone are invisible to
+    # 'medusactl add-target' etc. Upgrade if managed via uv tool.
+    if [[ "$skip_python" -eq 1 ]]; then
+        info "skipping 'medusa' Python upgrade (--no-python)"
+        return 0
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+        info "uv not found in PATH; skipping 'medusa' Python upgrade (install uv or use --no-python to silence)"
+        return 0
+    fi
+    if ! uv tool list 2>/dev/null | grep -q '^medusa\b'; then
+        info "'medusa' not installed via uv tool; skipping Python upgrade"
+        info "  (install once with: uv tool install --from git+https://github.com/MichelAguilera/Medusa.git medusa)"
+        return 0
+    fi
+    info "upgrading 'medusa' Python package via uv tool..."
+    if uv tool upgrade medusa >/dev/null 2>&1; then
+        printf "%s✓%s medusa Python package upgraded\n" "$color_green" "$color_reset"
+    else
+        # 'uv tool upgrade' is a no-op if the source has no newer ref.
+        # Reinstall from main to force-pick up commits that aren't
+        # version-tagged. Idempotent: same SHA -> same install.
+        info "  uv tool upgrade reported no change; reinstalling from main to pick up untagged commits"
+        if uv tool install --reinstall --from \
+                git+https://github.com/MichelAguilera/Medusa.git medusa >/dev/null 2>&1; then
+            printf "%s✓%s medusa Python package reinstalled from main\n" "$color_green" "$color_reset"
+        else
+            warn "  could not refresh medusa Python package via uv tool; run 'uv tool install --reinstall --from git+https://github.com/MichelAguilera/Medusa.git medusa' manually"
+        fi
+    fi
 }
 
 completion_bash() {
@@ -2238,7 +2306,7 @@ _medusactl() {
         'seed-target:non-destructive limited-mode onboarding (key + sudoers)'
         'add-targets-from-file:bulk-add targets from a file'
         'update:update the controller checkout'
-        'self-update:update the local medusactl helper'
+        'self-update:update the local medusactl helper + medusa Python tool'
         'completion:print shell completion'
         'clean:remove local medusactl state'
         'uninstall:remove local medusactl state and binaries'
@@ -2324,7 +2392,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-c
 complete -c medusactl -n '__fish_use_subcommand' -a 'seed-target' -d 'Non-destructive limited-mode onboarding (key + sudoers)'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-targets-from-file' -d 'Bulk-add targets from a file'
 complete -c medusactl -n '__fish_use_subcommand' -a 'update' -d 'Update the controller checkout'
-complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update the local helper'
+complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update local medusactl helper + medusa Python tool'
 complete -c medusactl -n '__fish_use_subcommand' -a 'completion' -d 'Print shell completion'
 complete -c medusactl -n '__fish_use_subcommand' -a 'clean' -d 'Remove local state'
 complete -c medusactl -n '__fish_use_subcommand' -a 'uninstall' -d 'Remove local state and binaries'
