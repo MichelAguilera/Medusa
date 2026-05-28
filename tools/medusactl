@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.11.0"
+VERSION="0.12.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-master}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -133,6 +133,8 @@ MEDUSA_CONTROLLER_HOST=$(quote_env "$MEDUSA_CONTROLLER_HOST")
 MEDUSA_CONTROLLER_USER=$(quote_env "$MEDUSA_CONTROLLER_USER")
 MEDUSA_CONTROLLER_PORT=$(quote_env "$MEDUSA_CONTROLLER_PORT")
 MEDUSA_CONTROLLER_PATH=$(quote_env "$MEDUSA_CONTROLLER_PATH")
+MEDUSA_CONTROLLER_INVENTORY_PATH=$(quote_env "$MEDUSA_CONTROLLER_INVENTORY_PATH")
+MEDUSA_CONTROLLER_GENERATED_PATH=$(quote_env "$MEDUSA_CONTROLLER_GENERATED_PATH")
 EOF
     chmod 600 "$CONFIG_FILE"
 }
@@ -147,6 +149,8 @@ load_config() {
     : "${MEDUSA_CONTROLLER_USER:?missing MEDUSA_CONTROLLER_USER in $CONFIG_FILE}"
     : "${MEDUSA_CONTROLLER_PORT:?missing MEDUSA_CONTROLLER_PORT in $CONFIG_FILE}"
     : "${MEDUSA_CONTROLLER_PATH:?missing MEDUSA_CONTROLLER_PATH in $CONFIG_FILE}"
+    : "${MEDUSA_CONTROLLER_INVENTORY_PATH:?missing MEDUSA_CONTROLLER_INVENTORY_PATH in $CONFIG_FILE; re-run install-controller}"
+    : "${MEDUSA_CONTROLLER_GENERATED_PATH:?missing MEDUSA_CONTROLLER_GENERATED_PATH in $CONFIG_FILE; re-run install-controller}"
 }
 
 ssh_target() {
@@ -233,7 +237,16 @@ ssh_base_opts() {
 
 remote_command() {
     local command=$1
-    printf "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd %q && %s" "$MEDUSA_CONTROLLER_PATH" "$command"
+    # Export both the inventory repo root (for ansible group_vars +
+    # secrets lookup) and the inventory subdir (for the medusa CLI's
+    # ProjectPaths override). MEDUSA_GENERATED_DIR is consumed by both
+    # the medusa CLI and ansible's group_vars/all.yml.
+    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_GENERATED_DIR=%q; cd %q && %s' \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH" \
+        "$MEDUSA_CONTROLLER_PATH" \
+        "$command"
 }
 
 log_path() {
@@ -455,7 +468,7 @@ cmd_install_controller() {
     check_workstation_dependencies
 
     local controller_host controller_user controller_port remote_script target bootstrap
-    local controller_path log
+    local controller_path controller_inventory_path controller_generated_path log
     local -a ssh_opts scp_opts
 
     echo "Medusa controller install"
@@ -464,7 +477,9 @@ cmd_install_controller() {
     prompt controller_user "Controller SSH user" "ansible"
     prompt controller_port "Controller SSH port" "22"
     prompt remote_script "Remote bootstrap script path" "~/medusa-bootstrap-controller.sh"
-    prompt controller_path "Controller repo path after bootstrap" "/home/${controller_user}/Medusa"
+    prompt controller_path "Controller code repo path after bootstrap" "/home/${controller_user}/Medusa"
+    prompt controller_inventory_path "Controller inventory repo path" "/home/${controller_user}/medusa-inventory"
+    prompt controller_generated_path "Controller generated artifacts path" "/home/${controller_user}/.local/state/medusa/generated"
 
     [[ -n "$controller_host" ]] || fail "controller hostname or IP is required"
     [[ -n "$controller_user" ]] || fail "controller SSH user is required"
@@ -499,7 +514,9 @@ cmd_install_controller() {
     info "  Copy:       $bootstrap"
     info "  Remote:     $remote_script"
     info "  Run:        bash $remote_script"
-    info "  Save path:  $controller_path"
+    info "  Code path:     $controller_path"
+    info "  Inventory:     $controller_inventory_path"
+    info "  Generated:     $controller_generated_path"
     echo ""
     confirm "Proceed" "y" || fail "aborted by user"
 
@@ -558,6 +575,8 @@ REMOTE_PREFLIGHT
     MEDUSA_CONTROLLER_USER="$controller_user"
     MEDUSA_CONTROLLER_PORT="$controller_port"
     MEDUSA_CONTROLLER_PATH="$controller_path"
+    MEDUSA_CONTROLLER_INVENTORY_PATH="$controller_inventory_path"
+    MEDUSA_CONTROLLER_GENERATED_PATH="$controller_generated_path"
     write_config
 
     echo ""
@@ -625,11 +644,13 @@ cmd_shell() {
 cmd_config() {
     load_config
     cat <<EOF
-Config: $CONFIG_FILE
-Host:   $MEDUSA_CONTROLLER_HOST
-User:   $MEDUSA_CONTROLLER_USER
-Port:   $MEDUSA_CONTROLLER_PORT
-Path:   $MEDUSA_CONTROLLER_PATH
+Config:    $CONFIG_FILE
+Host:      $MEDUSA_CONTROLLER_HOST
+User:      $MEDUSA_CONTROLLER_USER
+Port:      $MEDUSA_CONTROLLER_PORT
+Code:      $MEDUSA_CONTROLLER_PATH
+Inventory: $MEDUSA_CONTROLLER_INVENTORY_PATH
+Generated: $MEDUSA_CONTROLLER_GENERATED_PATH
 EOF
 }
 
@@ -931,7 +952,12 @@ REMOTE
     printf "log:    %s\n" "$log"
 
     local env_prefix
-    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q RESOLVER=%q CHECK=%q FORCE=%q" "$MEDUSA_CONTROLLER_PATH" "$resolver" "$check" "$force")
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_GENERATED_DIR=%q RESOLVER=%q CHECK=%q FORCE=%q" \
+        "$MEDUSA_CONTROLLER_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH" \
+        "$resolver" "$check" "$force")
 
     local finalize_rc=0
     ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
@@ -982,6 +1008,9 @@ uv run ansible-playbook playbooks/controller-apply.yml"
 set -euo pipefail
 export PATH="\$HOME/.local/bin:\$PATH"
 export MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH")
+export MEDUSA_INVENTORY_ROOT=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH")
+export MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory")
+export MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH")
 cd "\$MEDUSA_CONTROLLER_PATH"
 ${pre_script}
 ${tail}
@@ -1340,8 +1369,7 @@ EOF
     mapfile -t ssh_opts < <(ssh_base_opts)
 
     local lookup
-    lookup=$(ssh "${ssh_opts[@]}" "$target" \
-        "cd $(printf %q "$MEDUSA_CONTROLLER_PATH") && uv run medusa list-hosts --managed-only" \
+    lookup=$(ssh "${ssh_opts[@]}" "$target" "$(remote_command 'uv run medusa list-hosts --managed-only')" \
         2>&1) || fail "prep-target: could not list managed hosts on controller"
 
     local line mode ip user
@@ -1527,7 +1555,20 @@ EOF
 
 cmd_update() {
     load_config
-    run_logged update 'git pull --ff-only && uv sync && uv run ansible-galaxy collection install -r ansible/requirements.yml'
+    # Pull both repos. Code first (because uv sync runs there); inventory
+    # second so any new schema additions land before the next render.
+    run_logged update "$(cat <<EOF
+set -e
+echo '==> code: git pull'
+git -C $(printf %q "$MEDUSA_CONTROLLER_PATH") pull --ff-only
+echo '==> inventory: git pull'
+git -C $(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH") pull --ff-only
+echo '==> uv sync'
+uv sync --quiet
+echo '==> ansible-galaxy'
+uv run --quiet ansible-galaxy collection install -r ansible/requirements.yml
+EOF
+)"
 }
 
 cmd_self_update() {

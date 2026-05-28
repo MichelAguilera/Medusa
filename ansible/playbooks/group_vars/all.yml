@@ -1,7 +1,19 @@
 ---
-# Local checkout root. playbook_dir is ansible/playbooks.
+# Local checkout root. playbook_dir is ansible/playbooks. This is the
+# code repo (public Medusa), where playbooks, roles, and templates live.
 medusa_project_root: "{{ playbook_dir }}/../.."
-medusa_generated_dir: "{{ medusa_project_root }}/generated"
+# Inventory repo (private medusa-inventory). Defaults to the dev tree's
+# single-root layout (code repo itself); the controller overrides via
+# the MEDUSA_INVENTORY_ROOT env var that medusactl exports.
+medusa_inventory_root: "{{ lookup('env', 'MEDUSA_INVENTORY_ROOT') | default(medusa_project_root, true) }}"
+# Generated artifacts. Default lives under the code repo for the dev
+# workspace; on the controller, medusactl exports MEDUSA_GENERATED_DIR
+# (typically ~/.local/state/medusa/generated).
+medusa_generated_dir: "{{ lookup('env', 'MEDUSA_GENERATED_DIR') | default(medusa_project_root + '/generated', true) }}"
+# SOPS-encrypted secret files referenced by secrets-manifest.yaml.
+# Lives in the inventory repo: paths in secrets-manifest are relative
+# to this root (e.g. 'secrets/foo/bar.sops.yaml').
+medusa_secrets_root: "{{ medusa_inventory_root }}"
 medusa_uv_cache_dir: /tmp/medusa-uv-cache
 
 # Keep deployed homelab-managed files under the remote user's home directory.

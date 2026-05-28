@@ -1,4 +1,5 @@
 import difflib
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -114,8 +115,18 @@ class _Inventory:
     ansible_inventory_model: AnsibleInventoryModel
 
 
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name)
+    return Path(value).expanduser().resolve() if value else None
+
+
 def _paths(root: Path | None) -> ProjectPaths:
-    return ProjectPaths(root=(root or Path.cwd()).resolve())
+    return ProjectPaths(
+        root=(root or Path.cwd()).resolve(),
+        inventory_dir_override=_env_path("MEDUSA_INVENTORY_DIR"),
+        templates_dir_override=_env_path("MEDUSA_TEMPLATES_DIR"),
+        generated_dir_override=_env_path("MEDUSA_GENERATED_DIR"),
+    )
 
 
 def _load_all(

@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
 # Medusa controller bootstrap. See docs/bootstrap.md for full reference.
 #
-# Scope (post Stage 3 of scope-split): controller-only. This script
-# installs the controller, sets up keys, and runs 'medusa render' once.
-# Target onboarding (add-target, prep-target, authorize-target,
-# /etc/hosts seed, ~/.ssh/config aliases) lives in 'medusactl' and is
-# never invoked from here.
+# Two-repo layout (T-036): code lives in the public Medusa repo, operator
+# inventory + secrets live in the private medusa-inventory repo. Generated
+# artifacts go to an XDG state dir on the controller, never into either repo.
 #
 # Phases:
-#   1. preflight   collect inputs, validate, confirm
-#   2. install     apt deps, uv, repo clone, python deps, ansible collections
-#   3. identity    age key, ssh key
-#   4. inventory   .sops.yaml recipient management
-#   5. smoke       medusa validate / render / check
+#   1. preflight    collect inputs, validate, confirm
+#   2. install      apt deps, uv, code clone, inventory clone, python deps,
+#                   ansible collections, controller sudoers
+#   3. identity     age key, ssh key
+#   4. inventory    .sops.yaml recipient management (in inventory repo)
+#   5. smoke        medusa validate / render / check with split paths
 #
 # Idempotent: existing keys, clones, and configs are detected and reused
 # rather than overwritten.
 
 set -euo pipefail
 
-SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION="0.4.0"
 AGE_KEY_PATH="${HOME}/.config/sops/age/keys.txt"
 SSH_KEY_PATH="${HOME}/.ssh/id_ed25519"
-DEFAULT_REPO_URL="https://github.com/MichelAguilera/Medusa.git"
-DEFAULT_REPO_REF="master"
-DEFAULT_CLONE_DIR="${HOME}/Medusa"
+
+DEFAULT_CODE_REPO_URL="https://github.com/MichelAguilera/Medusa.git"
+DEFAULT_CODE_REPO_REF="main"
+DEFAULT_CODE_CLONE_DIR="${HOME}/Medusa"
+
+DEFAULT_INVENTORY_REPO_URL="https://github.com/MichelAguilera/medusa-inventory.git"
+DEFAULT_INVENTORY_REPO_REF="main"
+DEFAULT_INVENTORY_CLONE_DIR="${HOME}/medusa-inventory"
+
+DEFAULT_GENERATED_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/medusa/generated"
+
 SOPS_VERSION="${SOPS_VERSION:-v3.10.2}"
 
 # --- Output helpers ---------------------------------------------------------
@@ -78,16 +85,48 @@ confirm() {
 
 # --- Preflight --------------------------------------------------------------
 
-REPO_URL=""
-REPO_REF=""
-REPO_USER=""
-REPO_TOKEN=""
-CLONE_DIR=""
-AGE_CHOICE=""        # generate | import | reuse
+CODE_REPO_URL=""
+CODE_REPO_REF=""
+CODE_CLONE_DIR=""
+
+INVENTORY_REPO_URL=""
+INVENTORY_REPO_REF=""
+INVENTORY_CLONE_DIR=""
+
+GENERATED_DIR=""
+
+INVENTORY_AUTH=""          # gh | ssh | https
+INVENTORY_HTTPS_USER=""
+INVENTORY_HTTPS_TOKEN=""
+
+AGE_CHOICE=""              # generate | import | reuse
 AGE_IMPORT_PATH=""
-SSH_CHOICE=""        # generate | import | reuse
+SSH_CHOICE=""              # generate | import | reuse
 SSH_IMPORT_PATH=""
 SUDO_PASSWORD=""
+
+# Detect how to authenticate the private inventory clone. Order:
+#   1. gh CLI installed and authenticated → use 'gh repo clone'
+#   2. SSH key present and github.com reachable → use ssh URL form
+#   3. fallback: prompt for HTTPS user + PAT
+detect_inventory_auth() {
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        info "gh CLI authenticated; will use 'gh repo clone' for the private inventory repo"
+        INVENTORY_AUTH="gh"
+        return
+    fi
+    if [[ -f "$SSH_KEY_PATH" ]] && ssh -o BatchMode=yes -o ConnectTimeout=5 -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        info "SSH key authenticated with github.com; will use SSH URL for the private inventory repo"
+        INVENTORY_AUTH="ssh"
+        return
+    fi
+    warn "no gh CLI auth and no SSH access to github.com; falling back to HTTPS + personal access token"
+    INVENTORY_AUTH="https"
+    prompt INVENTORY_HTTPS_USER "GitHub username for HTTPS auth"
+    prompt_silent INVENTORY_HTTPS_TOKEN "GitHub personal access token (repo scope)"
+    [[ -n "$INVENTORY_HTTPS_USER" && -n "$INVENTORY_HTTPS_TOKEN" ]] \
+        || phase_fail "preflight" "HTTPS auth requires both username and token"
+}
 
 preflight() {
     info "Collecting setup inputs..."
@@ -99,16 +138,24 @@ preflight() {
         fi
     fi
 
-    prompt REPO_URL "Git URL of the Medusa repo (HTTPS)" "$DEFAULT_REPO_URL"
-    prompt REPO_REF "Git ref to check out" "$DEFAULT_REPO_REF"
-    prompt CLONE_DIR "Path to clone the repo into" "$DEFAULT_CLONE_DIR"
+    info ""
+    info "Code repo (public Medusa) — runnable medusa package + ansible playbooks"
+    prompt CODE_REPO_URL "Git URL of the code repo" "$DEFAULT_CODE_REPO_URL"
+    prompt CODE_REPO_REF "Git ref to check out" "$DEFAULT_CODE_REPO_REF"
+    prompt CODE_CLONE_DIR "Path to clone the code repo into" "$DEFAULT_CODE_CLONE_DIR"
 
-    if [[ "$REPO_URL" =~ ^https:// ]]; then
-        prompt REPO_USER "Git username for HTTPS auth (blank for public repo)" ""
-        if [[ -n "$REPO_USER" ]]; then
-            prompt_silent REPO_TOKEN "Git personal access token"
-        fi
-    fi
+    info ""
+    info "Inventory repo (private medusa-inventory) — DNS/services/storage YAML + secrets"
+    prompt INVENTORY_REPO_URL "Git URL of the inventory repo" "$DEFAULT_INVENTORY_REPO_URL"
+    prompt INVENTORY_REPO_REF "Git ref to check out" "$DEFAULT_INVENTORY_REPO_REF"
+    prompt INVENTORY_CLONE_DIR "Path to clone the inventory repo into" "$DEFAULT_INVENTORY_CLONE_DIR"
+
+    info ""
+    info "Generated artifacts (XDG state, neither repo)"
+    prompt GENERATED_DIR "Path for generated files" "$DEFAULT_GENERATED_DIR"
+
+    info ""
+    detect_inventory_auth
 
     info ""
     if [[ -f "$AGE_KEY_PATH" ]]; then
@@ -170,8 +217,10 @@ preflight() {
 
     info ""
     info "About to do the following:"
-    info "  Repo:        $REPO_URL  (ref: $REPO_REF)"
-    info "  Clone to:    $CLONE_DIR"
+    info "  Code:        $CODE_REPO_URL  (ref: $CODE_REPO_REF) → $CODE_CLONE_DIR"
+    info "  Inventory:   $INVENTORY_REPO_URL  (ref: $INVENTORY_REPO_REF) → $INVENTORY_CLONE_DIR"
+    info "  Inv auth:    $INVENTORY_AUTH"
+    info "  Generated:   $GENERATED_DIR"
     info "  Age key:     $AGE_CHOICE${AGE_IMPORT_PATH:+ from $AGE_IMPORT_PATH}"
     info "  SSH key:     $SSH_CHOICE${SSH_IMPORT_PATH:+ from $SSH_IMPORT_PATH}"
     info ""
@@ -217,6 +266,76 @@ install_controller_sudoers() {
         || phase_fail "install" "$sudoers_file failed visudo validation"
 }
 
+# Clone or update a single repo. Public repos can pass auth="" to skip
+# credential handling; private repos pass auth="gh", "ssh", or "https".
+clone_repo() {
+    local url=$1 ref=$2 dir=$3 label=$4 auth=$5
+    local effective_url="$url"
+
+    case "$auth" in
+        gh)
+            # gh repo clone normalizes URL based on gh's git_protocol setting;
+            # passing the slug avoids drift. Extract owner/name from HTTPS URL.
+            local slug
+            slug=$(printf "%s" "$url" | sed -E 's|^https?://github\.com/||; s|\.git$||')
+            if [[ -d "$dir/.git" ]]; then
+                info "$label: existing checkout at $dir, fetching $ref"
+                ( cd "$dir" && git fetch --quiet origin "$ref" \
+                    && git checkout --quiet "$ref" \
+                    && git pull --quiet --ff-only ) \
+                    || phase_fail "install" "$label: git update failed"
+            else
+                info "$label: cloning $slug via gh into $dir"
+                gh repo clone "$slug" "$dir" -- --branch "$ref" --quiet \
+                    || phase_fail "install" "$label: gh repo clone failed"
+            fi
+            return
+            ;;
+        ssh)
+            effective_url=$(printf "%s" "$url" | sed -E 's|^https?://github\.com/|git@github.com:|')
+            ;;
+        https)
+            effective_url="${url/https:\/\//https:\/\/${INVENTORY_HTTPS_USER}:${INVENTORY_HTTPS_TOKEN}@}"
+            ;;
+        "")
+            : # public, no auth munging
+            ;;
+        *)
+            phase_fail "install" "$label: unknown auth method $auth"
+            ;;
+    esac
+
+    if [[ -d "$dir/.git" ]]; then
+        info "$label: existing checkout at $dir, fetching $ref"
+        (
+            cd "$dir"
+            local original_url
+            original_url=$(git remote get-url origin)
+            restore_remote() {
+                # Strip embedded token from origin URL after the operation,
+                # leaving the plain HTTPS form behind.
+                git remote set-url origin "$url" >/dev/null 2>&1 || true
+            }
+            trap restore_remote EXIT
+            if [[ "$effective_url" != "$original_url" ]]; then
+                git remote set-url origin "$effective_url"
+            fi
+            git fetch --quiet origin "$ref" \
+                && git checkout --quiet "$ref" \
+                && git pull --quiet --ff-only
+        ) \
+            || phase_fail "install" "$label: git update failed"
+    else
+        info "$label: cloning into $dir"
+        git clone --quiet --branch "$ref" "$effective_url" "$dir" \
+            || phase_fail "install" "$label: git clone failed"
+        # Strip embedded token from origin URL so it isn't persisted to disk.
+        if [[ "$auth" == "https" ]]; then
+            ( cd "$dir" && git remote set-url origin "$url" )
+        fi
+    fi
+}
+
 install_phase() {
     info "Installing apt dependencies..."
     sudo_run env DEBIAN_FRONTEND=noninteractive apt-get update -qq \
@@ -255,43 +374,22 @@ install_phase() {
         phase_fail "install" "uv installed but not on PATH"
     fi
 
-    local clone_url="$REPO_URL"
-    if [[ -n "$REPO_USER" && -n "$REPO_TOKEN" ]]; then
-        clone_url="${REPO_URL/https:\/\//https:\/\/${REPO_USER}:${REPO_TOKEN}@}"
-    fi
+    info "Preparing code repo at $CODE_CLONE_DIR..."
+    clone_repo "$CODE_REPO_URL" "$CODE_REPO_REF" "$CODE_CLONE_DIR" "code" ""
 
-    info "Preparing repo at $CLONE_DIR..."
-    if [[ -d "$CLONE_DIR/.git" ]]; then
-        info "  already a git checkout; fetching $REPO_REF"
-        (
-            cd "$CLONE_DIR"
-            original_url=$(git remote get-url origin)
-            restore_remote() {
-                git remote set-url origin "$original_url" >/dev/null 2>&1 || true
-            }
-            trap restore_remote EXIT
-            if [[ "$clone_url" != "$REPO_URL" ]]; then
-                git remote set-url origin "$clone_url"
-            fi
-            git fetch --quiet origin "$REPO_REF" \
-                && git checkout --quiet "$REPO_REF" \
-                && git pull --quiet --ff-only
-        ) \
-            || phase_fail "install" "git update failed in existing clone"
-    else
-        git clone --quiet --branch "$REPO_REF" "$clone_url" "$CLONE_DIR" \
-            || phase_fail "install" "git clone failed"
-        if [[ "$clone_url" != "$REPO_URL" ]]; then
-            ( cd "$CLONE_DIR" && git remote set-url origin "$REPO_URL" )
-        fi
-    fi
+    info "Preparing inventory repo at $INVENTORY_CLONE_DIR..."
+    clone_repo "$INVENTORY_REPO_URL" "$INVENTORY_REPO_REF" "$INVENTORY_CLONE_DIR" "inventory" "$INVENTORY_AUTH"
+
+    info "Creating generated artifacts directory at $GENERATED_DIR..."
+    mkdir -p "$GENERATED_DIR" \
+        || phase_fail "install" "failed to create $GENERATED_DIR"
 
     info "Installing Python deps (uv sync)..."
-    ( cd "$CLONE_DIR" && uv sync --quiet ) \
+    ( cd "$CODE_CLONE_DIR" && uv sync --quiet ) \
         || phase_fail "install" "uv sync failed"
 
     info "Installing Ansible collections..."
-    ( cd "$CLONE_DIR" && uv run --quiet ansible-galaxy collection install \
+    ( cd "$CODE_CLONE_DIR" && uv run --quiet ansible-galaxy collection install \
         -r ansible/requirements.yml >/dev/null ) \
         || phase_fail "install" "ansible-galaxy collection install failed"
 
@@ -362,8 +460,8 @@ identity_phase() {
 # --- Inventory --------------------------------------------------------------
 
 inventory_phase() {
-    info "Updating .sops.yaml recipient..."
-    local sops_file="$CLONE_DIR/.sops.yaml"
+    info "Updating .sops.yaml recipient in inventory repo..."
+    local sops_file="$INVENTORY_CLONE_DIR/.sops.yaml"
     if [[ -f "$sops_file" ]]; then
         if grep -q "$AGE_PUBKEY" "$sops_file"; then
             info "  .sops.yaml already lists the current age public key"
@@ -394,16 +492,23 @@ EOF
 # --- Smoke test -------------------------------------------------------------
 
 smoke_phase() {
+    # Run medusa from the code repo (where pyproject.toml is) with env
+    # overrides pointing at the split inventory + generated locations.
+    local -a env_overrides=(
+        "MEDUSA_INVENTORY_DIR=$INVENTORY_CLONE_DIR/inventory"
+        "MEDUSA_GENERATED_DIR=$GENERATED_DIR"
+    )
+
     info "Validating Medusa inventory..."
-    ( cd "$CLONE_DIR" && uv run --quiet medusa validate ) \
+    ( cd "$CODE_CLONE_DIR" && env "${env_overrides[@]}" uv run --quiet medusa validate ) \
         || phase_fail "smoke" "medusa validate failed"
 
     info "Rendering Medusa generated files..."
-    ( cd "$CLONE_DIR" && uv run --quiet medusa render >/dev/null ) \
+    ( cd "$CODE_CLONE_DIR" && env "${env_overrides[@]}" uv run --quiet medusa render >/dev/null ) \
         || phase_fail "smoke" "medusa render failed"
 
     info "Checking generated files are fresh..."
-    ( cd "$CLONE_DIR" && uv run --quiet medusa check ) \
+    ( cd "$CODE_CLONE_DIR" && env "${env_overrides[@]}" uv run --quiet medusa check ) \
         || phase_fail "smoke" "medusa check failed"
 
     phase_ok "smoke"
@@ -425,7 +530,9 @@ main() {
     smoke_phase
     echo ""
     echo "Controller bootstrap complete."
-    echo "  Repo:        $CLONE_DIR"
+    echo "  Code:        $CODE_CLONE_DIR"
+    echo "  Inventory:   $INVENTORY_CLONE_DIR"
+    echo "  Generated:   $GENERATED_DIR"
     echo "  Age pubkey:  $AGE_PUBKEY"
     echo ""
     echo "Next steps:"
