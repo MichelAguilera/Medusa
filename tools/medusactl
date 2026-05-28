@@ -84,7 +84,7 @@ Usage:
     medusactl authorize-target <name>
     medusactl finalize-dns [--resolver <ip>] [--check] [--force]
     medusactl undo [--dry-run]
-    medusactl list-backups [-n <N>]
+    medusactl history [-n <N>]
 
   Misc:
     medusactl version | --version | -V
@@ -1859,7 +1859,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo list-backups clean uninstall config version diff commit push publish discard"
+    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -1929,7 +1929,7 @@ _medusactl() {
         'version:print the medusactl version'
         'ssh-disconnect:close the persistent SSH master to the controller'
         'undo:restore inventory from the most recent snapshot'
-        'list-backups:list inventory snapshots'
+        'history:show recent inventory commits'
     )
 
     if (( CURRENT == 2 )); then
@@ -2013,7 +2013,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'config' -d 'Show local cont
 complete -c medusactl -n '__fish_use_subcommand' -a 'version' -d 'Print the medusactl version'
 complete -c medusactl -n '__fish_use_subcommand' -a 'ssh-disconnect' -d 'Close the persistent SSH master to the controller'
 complete -c medusactl -n '__fish_use_subcommand' -a 'undo' -d 'Restore inventory from the most recent snapshot'
-complete -c medusactl -n '__fish_use_subcommand' -a 'list-backups' -d 'List inventory snapshots'
+complete -c medusactl -n '__fish_use_subcommand' -a 'history' -d 'Show recent inventory commits'
 complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run deploy in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from controller-apply' -l check -d 'Run controller apply in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l check -d 'Show what would be removed without writing'
@@ -2240,38 +2240,34 @@ EOF
         "$color_green" "$color_reset"
 }
 
-cmd_list_backups() {
+cmd_history() {
+    # T-038: replaces the pre-T-038 'list-backups' command. The XDG
+    # snapshot store is gone; git is the inventory audit trail.
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
-medusactl list-backups — list recent inventory snapshots on the controller.
+medusactl history — show recent inventory commits.
 
 Usage:
-  medusactl list-backups [-n <N>] [--limit <N>]
+  medusactl history [-n <N>] [-- <extra git-log args>]
 EOF
         return 0
     fi
     load_config
+    require_local_inventory_dir
     local limit=20
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -n|--limit)
                 shift
-                [[ $# -gt 0 ]] || fail "list-backups: --limit requires a number"
+                [[ $# -gt 0 ]] || fail "history: -n requires a number"
                 limit=$1
                 ;;
-            *) fail "list-backups: unknown flag '$1'" ;;
+            --) shift; break ;;
+            *) break ;;
         esac
         shift
     done
-    local target remote
-    local -a ssh_opts
-    target=$(ssh_target)
-    remote=$(remote_command "uv run --quiet medusa list-backups --limit $(printf %q "$limit")")
-    mapfile -t ssh_opts < <(ssh_base_opts)
-    if [[ ! -t 0 ]]; then
-        ssh_opts+=(-o BatchMode=yes)
-    fi
-    ssh "${ssh_opts[@]}" "$target" "$remote"
+    git -C "$MEDUSACTL_INVENTORY_DIR" log --oneline -n "$limit" "$@"
 }
 
 cmd_ssh_disconnect() {
@@ -2452,9 +2448,9 @@ case "${1:-}" in
         shift
         cmd_undo "$@"
         ;;
-    list-backups)
+    history)
         shift
-        cmd_list_backups "$@"
+        cmd_history "$@"
         ;;
     uninstall)
         shift

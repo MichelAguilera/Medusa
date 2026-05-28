@@ -29,14 +29,6 @@ from medusa.inventory.dns_edit import (
     save_dns_doc,
     serialize_dns_doc,
 )
-from medusa.inventory.backup import (
-    discard_snapshot,
-    gc_snapshots,
-    latest_snapshot,
-    list_snapshots,
-    restore,
-    take_snapshot,
-)
 from medusa.inventory.homepage import parse_homepage_inventory
 from medusa.inventory.loader import load_optional_yaml, load_yaml
 from medusa.inventory.services import ServicesInventory, parse_services_inventory
@@ -366,50 +358,35 @@ def check(
 # explicitly so each step is observable.
 
 
-def _save_dns_with_rollback(
-    doc: Any, paths: ProjectPaths, *, op_label: str | None = None
-) -> None:
+def _save_dns_with_rollback(doc: Any, paths: ProjectPaths) -> None:
     # Save then validate. Without rollback, a cross-reference failure
     # (e.g. storage exports point at a host we just removed) would leave
     # dns.yaml mutated on disk while the operation reported failure.
+    # In-memory bytes are enough; longer-term undo lives in git
+    # (T-038 retired the XDG snapshot store).
     original = paths.dns_inventory.read_bytes()
-    snapshot_dir = (
-        take_snapshot(paths.root, [paths.dns_inventory], op_label)
-        if op_label
-        else None
-    )
     save_dns_doc(doc, paths.dns_inventory)
     try:
         _load_all(paths, on_diagnostics=lambda _: None)
     except (ValidationError, ValueError, NotImplementedError):
         paths.dns_inventory.write_bytes(original)
-        if snapshot_dir is not None:
-            discard_snapshot(snapshot_dir)
         raise
-    gc_snapshots()
 
 
 def _save_inventory_atomic(
     paths: ProjectPaths,
     edits: dict[Path, str],
-    *,
-    op_label: str | None = None,
 ) -> None:
     """Write multiple inventory files as a single atomic unit.
 
-    Snapshots each target's current bytes, writes the proposed contents,
-    runs the full validation pipeline, and restores every snapshot if
-    validation fails. Files that did not exist before are unlinked on
-    rollback rather than restored to empty.
+    Captures each target's current bytes in memory, writes the proposed
+    contents, runs the full validation pipeline, and restores every
+    original if validation fails. Files that did not exist before are
+    unlinked on rollback rather than restored to empty.
     """
     originals: dict[Path, bytes | None] = {}
     for path in edits:
         originals[path] = path.read_bytes() if path.exists() else None
-    snapshot_dir = (
-        take_snapshot(paths.root, list(edits.keys()), op_label)
-        if op_label
-        else None
-    )
     try:
         for path, contents in edits.items():
             path.write_text(contents, encoding="utf-8")
@@ -421,10 +398,7 @@ def _save_inventory_atomic(
                     path.unlink()
             else:
                 path.write_bytes(original)
-        if snapshot_dir is not None:
-            discard_snapshot(snapshot_dir)
         raise
-    gc_snapshots()
 
 
 def _emit_dry_run_multi(
@@ -634,7 +608,7 @@ def add_host_cmd(
             _emit_dry_run(doc, paths, f"would write host {name!r}")
             return
 
-        _save_dns_with_rollback(doc, paths, op_label=f"add-host {name}")
+        _save_dns_with_rollback(doc, paths)
     except (ValidationError, ValueError, NotImplementedError) as error:
         _fail(str(error))
 
@@ -795,8 +769,7 @@ def remove_host_cmd(
             flags.append("--remove-services")
         if cascade:
             flags.append("--cascade")
-        op_label = f"remove-host {name}" + ("".join(f" {f}" for f in flags))
-        _save_inventory_atomic(paths, edits, op_label=op_label)
+        _save_inventory_atomic(paths, edits)
     except (ValidationError, ValueError, NotImplementedError) as error:
         _fail(str(error))
 
@@ -867,71 +840,11 @@ def promote_host_cmd(
             _emit_dry_run(doc, paths, f"would clear bootstrap_ip on host {name!r}")
             return
 
-        _save_dns_with_rollback(doc, paths, op_label=f"promote-host {name}")
+        _save_dns_with_rollback(doc, paths)
     except (ValidationError, ValueError, NotImplementedError) as error:
         _fail(str(error))
 
     _succeed(f"Host {name!r} promoted; bootstrap_ip cleared.")
-
-
-@app.command("undo-last", rich_help_panel=_INVENTORY_PANEL)
-def undo_last_cmd(
-    dry_run: bool = typer.Option(
-        False,
-        "--dry-run",
-        help="Show which files would be restored from the snapshot; do not write.",
-    ),
-    root: Path | None = ROOT_OPTION,
-) -> None:
-    """Restore inventory from the most recent pre-write snapshot.
-
-    Snapshots are taken automatically before any mutating command
-    (``add-host``, ``remove-host``, ``promote-host``). Each restore is
-    itself a mutation and is snapshotted, so an undo can be undone by
-    running ``undo-last`` again.
-    """
-    paths = _paths(root)
-    snapshot = latest_snapshot()
-    if snapshot is None:
-        _fail("no inventory snapshots found")
-
-    typer.echo(f"snapshot: {snapshot.directory.name}")
-    typer.echo(f"op:       {snapshot.op}")
-    typer.echo(f"files:")
-    for path in snapshot.files:
-        typer.echo(f"  - {path}")
-
-    if dry_run:
-        _succeed(
-            f"DRY-RUN: would restore {len(snapshot.files)} file(s); "
-            f"inventory not modified."
-        )
-        return
-
-    # Snapshot the current (post-mutation) state so the undo is itself
-    # undoable. Then restore.
-    current_paths = [paths.root / p for p in snapshot.files]
-    take_snapshot(paths.root, current_paths, f"undo-of {snapshot.op}")
-    restored = restore(snapshot, paths.root)
-    gc_snapshots()
-    _succeed(
-        f"Restored {len(restored)} file(s) from {snapshot.directory.name}."
-    )
-
-
-@app.command("list-backups", rich_help_panel=_INVENTORY_PANEL)
-def list_backups_cmd(
-    limit: int = typer.Option(
-        20, "--limit", "-n", help="Maximum number of snapshots to list."
-    ),
-) -> None:
-    """Print recent inventory snapshots, newest first."""
-    snapshots = list_snapshots(limit=limit)
-    if not snapshots:
-        typer.echo("(no snapshots)")
-        return
-    for snap in snapshots:
-        typer.echo(f"{snap.directory.name}  {snap.op}")
 
 
 @app.command("list-hosts", rich_help_panel=_INVENTORY_PANEL)
