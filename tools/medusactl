@@ -998,12 +998,19 @@ cmd_deploy() {
     require_clean_for_deploy
     if [[ "${1:-}" == "--check" ]]; then
         run_logged deploy-check \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/deploy.yml --check --diff"
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff"
     else
         require_controller_apply_prereqs deploy \
             || fail "deploy prerequisites failed"
+        # controller-apply BEFORE deploy: controller-apply rewrites
+        # /etc/hosts (bootstrap_ip block) and ~/.ssh/config aliases on
+        # the controller. Both feed hostname-based SSH that deploy.yml
+        # uses to reach targets. If a host's bootstrap_ip changed and
+        # we ran deploy first, ansible would resolve through stale
+        # /etc/hosts and fail with 'No route to host', short-circuiting
+        # controller-apply via '&&'.
         run_logged deploy \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/deploy.yml && uv run ansible-playbook playbooks/controller-apply.yml"
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml"
     fi
 }
 
