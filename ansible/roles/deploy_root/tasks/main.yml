@@ -1,0 +1,52 @@
+---
+- name: Ensure deployment group exists
+  ansible.builtin.command:
+    cmd: "sudo -n groupadd -f {{ medusa_deploy_group }}"
+  check_mode: false
+  changed_when: false
+
+- name: Ensure deploy owner is in deployment group
+  ansible.builtin.command:
+    cmd: "sudo -n usermod -aG {{ medusa_deploy_group }} {{ medusa_deploy_owner }}"
+  check_mode: false
+  changed_when: false
+
+- name: Ensure remote user is in deployment group
+  ansible.builtin.command:
+    cmd: "sudo -n usermod -aG {{ medusa_deploy_group }} {{ medusa_remote_user }}"
+  check_mode: false
+  changed_when: false
+
+- name: Ensure deploy owner can traverse remote home root
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      if command -v setfacl >/dev/null 2>&1; then
+        sudo -n setfacl -m u:{{ medusa_deploy_owner }}:x {{ medusa_home_root }}
+      else
+        sudo -n chmod o+x {{ medusa_home_root }}
+      fi
+  check_mode: false
+  changed_when: false
+
+- name: Ensure managed stacks root exists
+  ansible.builtin.command:
+    cmd: >-
+      sudo -n install -d
+      -o {{ medusa_deploy_owner }}
+      -g {{ medusa_deploy_group }}
+      -m 2775
+      {{ medusa_managed_stacks_root }}
+  check_mode: false
+  changed_when: false
+
+- name: Ensure generated deployment root exists
+  ansible.builtin.command:
+    cmd: >-
+      sudo -n install -d
+      -o {{ medusa_deploy_owner }}
+      -g {{ medusa_deploy_group }}
+      -m 2775
+      {{ medusa_deploy_root }}
+  check_mode: false
+  changed_when: false

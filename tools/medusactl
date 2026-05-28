@@ -1,0 +1,2136 @@
+#!/usr/bin/env bash
+# Optional workstation-side helper for common Medusa controller workflows.
+
+set -euo pipefail
+
+VERSION="0.11.0"
+MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-master}"
+MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
+MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
+MEDUSACTL_SOURCE_URL="${MEDUSACTL_SOURCE_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/medusactl}"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/medusa"
+CONFIG_FILE="${MEDUSACTL_CONFIG:-$CONFIG_DIR/medusactl.env}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/medusa"
+LOG_DIR="${MEDUSACTL_LOG_DIR:-$STATE_DIR/logs}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/medusa"
+SSH_MUX_DIR="${CACHE_DIR}/ssh"
+SSH_MUX_PERSIST="${MEDUSACTL_SSH_PERSIST:-300}"
+SSH_CONFIG="${MEDUSACTL_SSH_CONFIG:-}"
+SSH_CONFIG_OPTS=()
+if [[ -n "$SSH_CONFIG" ]]; then
+    SSH_CONFIG_OPTS=(-F "$SSH_CONFIG")
+fi
+
+color_red=$'\033[31m'
+color_green=$'\033[32m'
+color_yellow=$'\033[33m'
+color_blue=$'\033[34m'
+color_reset=$'\033[0m'
+
+info() { printf "  %s\n" "$1" >&2; }
+warn() { printf "  %s%s%s\n" "$color_yellow" "$1" "$color_reset" >&2; }
+fail() {
+    printf "%s✗%s medusactl: %s\n" "$color_red" "$color_reset" "$1" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+medusactl v${VERSION}
+
+Usage:
+
+  Controller ops:
+    medusactl install-controller
+    medusactl authorize-controller
+    medusactl status
+    medusactl shell
+    medusactl config
+    medusactl update
+    medusactl self-update
+    medusactl ssh-disconnect
+    medusactl clean
+    medusactl uninstall
+
+  Render / deploy:
+    medusactl check
+    medusactl render
+    medusactl deploy [--check]
+    medusactl controller-apply [--check]
+
+  Target ops:
+    medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
+                          [--zone <zone>] [--user <user>]
+                          [--alias <alias> ...] [--group <group> ...]
+                          [--prep] [--authorize] [--no-seed-hosts] [--force]
+                          [--dry-run]
+    medusactl remove-target <name> [--dry-run]
+                            [--remove-mounts] [--remove-exports]
+                            [--remove-services] [--cascade]
+    medusactl promote-target <name> [--dry-run]
+    medusactl list-targets [--managed-only | --full | --limited]
+    medusactl add-targets-from-file <path>
+    medusactl prep-target <name>
+    medusactl authorize-target <name>
+    medusactl finalize-dns [--resolver <ip>] [--check] [--force]
+    medusactl undo [--dry-run]
+    medusactl list-backups [-n <N>]
+
+  Misc:
+    medusactl version | --version | -V
+    medusactl completion <bash|zsh|fish> [install]
+    medusactl completion install
+
+Config:
+  $CONFIG_FILE
+
+This is a thin SSH wrapper around known Medusa controller workflows. Direct SSH
+to the controller remains fully supported.
+
+Per-subcommand help: medusactl <subcommand> --help
+EOF
+}
+
+prompt() {
+    local var=$1 question=$2 default=${3:-}
+    local prompt_text response
+    if [[ -n "$default" ]]; then
+        prompt_text="$question [$default]: "
+    else
+        prompt_text="$question: "
+    fi
+    read -r -p "$prompt_text" response < /dev/tty
+    if [[ -z "$response" && -n "$default" ]]; then
+        response="$default"
+    fi
+    printf -v "$var" "%s" "$response"
+}
+
+confirm() {
+    local question=$1 default=${2:-y}
+    local yn_hint response
+    [[ "$default" == "y" ]] && yn_hint="Y/n" || yn_hint="y/N"
+    read -r -p "$question [$yn_hint]: " response < /dev/tty
+    response=${response:-$default}
+    [[ "${response,,}" == "y" || "${response,,}" == "yes" ]]
+}
+
+home_path() {
+    local path=$1
+    [[ "$path" == "$HOME" || "$path" == "$HOME/"* ]]
+}
+
+quote_env() {
+    printf "%q" "$1"
+}
+
+write_config() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+MEDUSA_CONTROLLER_HOST=$(quote_env "$MEDUSA_CONTROLLER_HOST")
+MEDUSA_CONTROLLER_USER=$(quote_env "$MEDUSA_CONTROLLER_USER")
+MEDUSA_CONTROLLER_PORT=$(quote_env "$MEDUSA_CONTROLLER_PORT")
+MEDUSA_CONTROLLER_PATH=$(quote_env "$MEDUSA_CONTROLLER_PATH")
+EOF
+    chmod 600 "$CONFIG_FILE"
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        fail "missing config at $CONFIG_FILE; run 'medusactl install-controller' first"
+    fi
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    : "${MEDUSA_CONTROLLER_HOST:?missing MEDUSA_CONTROLLER_HOST in $CONFIG_FILE}"
+    : "${MEDUSA_CONTROLLER_USER:?missing MEDUSA_CONTROLLER_USER in $CONFIG_FILE}"
+    : "${MEDUSA_CONTROLLER_PORT:?missing MEDUSA_CONTROLLER_PORT in $CONFIG_FILE}"
+    : "${MEDUSA_CONTROLLER_PATH:?missing MEDUSA_CONTROLLER_PATH in $CONFIG_FILE}"
+}
+
+ssh_target() {
+    printf "%s@%s" "$MEDUSA_CONTROLLER_USER" "$MEDUSA_CONTROLLER_HOST"
+}
+
+default_public_key() {
+    if [[ -f "$HOME/.ssh/id_ed25519.pub" ]]; then
+        printf "%s/.ssh/id_ed25519.pub" "$HOME"
+        return 0
+    fi
+    if [[ -f "$HOME/.ssh/id_rsa.pub" ]]; then
+        printf "%s/.ssh/id_rsa.pub" "$HOME"
+        return 0
+    fi
+    return 1
+}
+
+ensure_public_key() {
+    local public_key private_key
+    if public_key=$(default_public_key); then
+        printf "%s" "$public_key"
+        return 0
+    fi
+
+    public_key="$HOME/.ssh/id_ed25519.pub"
+    private_key="${public_key%.pub}"
+    if ! confirm "No workstation SSH public key found. Generate ~/.ssh/id_ed25519 now" "y"; then
+        fail "workstation SSH public key is required"
+    fi
+    command -v ssh-keygen >/dev/null 2>&1 || fail "ssh-keygen is required to generate an SSH key"
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    ssh-keygen -t ed25519 -f "$private_key" -N "" -C "${USER:-medusa}@$(hostname)-medusactl" \
+        || fail "failed to generate $private_key"
+    printf "%s" "$public_key"
+}
+
+authorize_key_on_controller() {
+    local target=$1 port=$2 public_key=$3
+    [[ -f "$public_key" ]] || fail "SSH public key not found at $public_key"
+
+    info "Authorizing workstation key on $target"
+    if command -v ssh-copy-id >/dev/null 2>&1 && [[ -z "$SSH_CONFIG" ]]; then
+        ssh-copy-id -p "$port" -i "$public_key" "$target" \
+            || fail "ssh-copy-id failed for $target"
+        return 0
+    fi
+
+    if ! command -v ssh-copy-id >/dev/null 2>&1; then
+        warn "ssh-copy-id not found; falling back to direct authorized_keys append"
+    else
+        warn "MEDUSACTL_SSH_CONFIG is set; falling back to direct authorized_keys append"
+    fi
+    cat "$public_key" | ssh "${SSH_CONFIG_OPTS[@]}" -p "$port" -o StrictHostKeyChecking=accept-new \
+        "$target" 'key=$(cat); umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qxF "$key" ~/.ssh/authorized_keys || printf "%s\n" "$key" >> ~/.ssh/authorized_keys' \
+        || fail "failed to authorize key on $target"
+}
+
+ssh_mux_opts() {
+    # Persistent SSH connection multiplexing across medusactl invocations.
+    # The first call to a given target opens a master and writes a Unix
+    # socket under SSH_MUX_DIR; subsequent calls reuse it, eliminating
+    # per-command handshake latency. ControlPersist resets each command,
+    # so a 5-minute idle window covers bursty workflows without leaking
+    # sockets after the operator walks away.
+    #
+    # When the operator has supplied their own SSH config via
+    # MEDUSACTL_SSH_CONFIG, defer to it entirely instead of overriding
+    # ControlPath/ControlMaster.
+    [[ -z "$SSH_CONFIG" ]] || return 0
+    mkdir -p "$SSH_MUX_DIR" 2>/dev/null || return 0
+    chmod 700 "$SSH_MUX_DIR" 2>/dev/null || true
+    printf "%s\n" \
+        -o ControlMaster=auto \
+        -o "ControlPersist=${SSH_MUX_PERSIST}" \
+        -o "ControlPath=${SSH_MUX_DIR}/cp-%C"
+}
+
+ssh_base_opts() {
+    printf "%s\n" "${SSH_CONFIG_OPTS[@]}" -p "$MEDUSA_CONTROLLER_PORT" -o StrictHostKeyChecking=accept-new
+    ssh_mux_opts
+}
+
+remote_command() {
+    local command=$1
+    printf "export PATH=\"\$HOME/.local/bin:\$PATH\"; cd %q && %s" "$MEDUSA_CONTROLLER_PATH" "$command"
+}
+
+log_path() {
+    local name=$1 stamp
+    stamp=$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$LOG_DIR"
+    printf "%s/%s-%s.log" "$LOG_DIR" "$stamp" "$name"
+}
+
+sanitize_log() {
+    # Strip ANSI CSI escape sequences (\e[...m and friends) and OSC strings
+    # (\e]...\a) that ssh -t round-trips from terminal queries. Best-effort:
+    # leaves the log intact if perl is unavailable. Editing in place.
+    local file=$1
+    [[ -f "$file" ]] || return 0
+    if command -v perl >/dev/null 2>&1; then
+        perl -i -pe '
+            s/\e\[[0-9;?]*[a-zA-Z]//g;
+            s/\e\][^\a]*\a//g;
+            s/\e[NOPM]//g;
+            s/\r$//g;
+        ' "$file" 2>/dev/null || true
+    fi
+}
+
+run_logged() {
+    local name=$1 command=$2 target log remote
+    local -a ssh_opts
+    target=$(ssh_target)
+    log=$(log_path "$name")
+    remote=$(remote_command "$command")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s %s\n" "$color_blue" "$color_reset" "$name"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "workdir: %s\n" "$MEDUSA_CONTROLLER_PATH"
+    printf "command: %s\n" "$command"
+    printf "log:    %s\n" "$log"
+
+    if [[ ! -t 0 ]]; then
+        ssh_opts+=(-o BatchMode=yes)
+    fi
+
+    info "Checking SSH access..."
+    if ! ssh "${ssh_opts[@]}" -o ConnectTimeout=10 "$target" true >/dev/null 2>&1; then
+        fail "unable to connect to $target over SSH"
+    fi
+
+    if ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1; then
+        printf "%s✓%s %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+
+    printf "%s✗%s %s failed\n" "$color_red" "$color_reset" "$name" >&2
+    printf "log: %s\n" "$log" >&2
+    printf "\nLast output:\n" >&2
+    tail -40 "$log" >&2 || true
+    return 1
+}
+
+require_controller_apply_prereqs() {
+    local name=$1 target remote output
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    if [[ ! -t 0 ]]; then
+        ssh_opts+=(-o BatchMode=yes)
+    fi
+
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+
+if [[ ! -f ansible/playbooks/controller-apply.yml ]]; then
+    echo "controller checkout is missing ansible/playbooks/controller-apply.yml" >&2
+    echo "run 'medusactl update' so the controller checkout includes the Ansible apply playbook" >&2
+    exit 21
+fi
+
+if [[ ! -f ansible/roles/controller_bootstrap/tasks/main.yml ]]; then
+    echo "controller checkout is missing ansible/roles/controller_bootstrap/tasks/main.yml" >&2
+    echo "run 'medusactl update' so the controller checkout includes the controller_bootstrap role" >&2
+    exit 22
+fi
+
+if ! sudo -n /bin/sh -c true >/dev/null 2>&1; then
+    echo "controller apply needs passwordless sudo for $USER" >&2
+    echo "re-run tools/bootstrap-controller.sh on the controller, or install" >&2
+    echo "/etc/sudoers.d/medusa-controller-bootstrap containing:" >&2
+    echo "  $USER ALL=(ALL) NOPASSWD: ALL" >&2
+    exit 23
+fi
+REMOTE
+)
+
+    if output=$(ssh "${ssh_opts[@]}" "$target" "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") bash -s" <<< "$remote" 2>&1); then
+        return 0
+    fi
+
+    printf "%s✗%s %s prerequisites failed\n" "$color_red" "$color_reset" "$name" >&2
+    printf "%s\n" "$output" >&2
+    return 1
+}
+
+fetch_file() {
+    local label=$1 local_path=$2 url=$3 repo_path=$4 dest=$5
+
+    if [[ -n "$local_path" && -f "$local_path" ]]; then
+        cp "$local_path" "$dest" || fail "failed to copy $label from $local_path"
+        return 0
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        info "Downloading $label from $url"
+        if curl -fsSL "$url" -o "$dest"; then
+            return 0
+        fi
+        warn "raw $label download failed; trying authenticated GitHub CLI fallback"
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+        info "Downloading $label through gh api from $MEDUSA_GITHUB_REPO@$MEDUSA_INSTALL_REF"
+        gh api "repos/${MEDUSA_GITHUB_REPO}/contents/${repo_path}?ref=${MEDUSA_INSTALL_REF}" \
+            --jq .content | base64 -d > "$dest" \
+            || fail "failed to download $label with gh api"
+        return 0
+    fi
+
+    fail "failed to download $label; install curl for public repos or gh for private repos"
+}
+
+bootstrap_source() {
+    # Fetch the controller bootstrap script (controller-only post Stage 3;
+    # target ops live in this CLI, not in the bootstrap).
+    local script_dir="" local_bootstrap=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    fi
+
+    if [[ -n "$script_dir" ]]; then
+        if [[ -f "$script_dir/bootstrap-controller.sh" ]]; then
+            local_bootstrap="$script_dir/bootstrap-controller.sh"
+        elif [[ -f "$script_dir/tools/bootstrap-controller.sh" ]]; then
+            local_bootstrap="$script_dir/tools/bootstrap-controller.sh"
+        fi
+    fi
+
+    local tmp_bootstrap
+    tmp_bootstrap=$(mktemp)
+    TEMP_FILES+=("$tmp_bootstrap")
+
+    fetch_file "controller bootstrap" "$local_bootstrap" "$MEDUSA_BOOTSTRAP_URL" \
+        "tools/bootstrap-controller.sh" "$tmp_bootstrap"
+
+    printf "%s" "$tmp_bootstrap"
+}
+
+medusactl_source() {
+    local tmp_cli
+    tmp_cli=$(mktemp)
+    TEMP_FILES+=("$tmp_cli")
+
+    if command -v curl >/dev/null 2>&1; then
+        info "Downloading medusactl from $MEDUSACTL_SOURCE_URL"
+        if curl -fsSL "$MEDUSACTL_SOURCE_URL" -o "$tmp_cli"; then
+            printf "%s" "$tmp_cli"
+            return 0
+        fi
+        warn "raw medusactl download failed; trying authenticated GitHub CLI fallback"
+    fi
+
+    if command -v gh >/dev/null 2>&1; then
+        info "Downloading medusactl through gh api from $MEDUSA_GITHUB_REPO@$MEDUSA_INSTALL_REF"
+        gh api "repos/${MEDUSA_GITHUB_REPO}/contents/tools/medusactl?ref=${MEDUSA_INSTALL_REF}" \
+            --jq .content | base64 -d > "$tmp_cli" \
+            || fail "failed to download medusactl with gh api"
+        printf "%s" "$tmp_cli"
+        return 0
+    fi
+
+    fail "failed to download medusactl; install curl for public repos or gh for private repos"
+}
+
+check_workstation_dependencies() {
+    command -v ssh >/dev/null 2>&1 || fail "ssh is required on the workstation"
+    command -v scp >/dev/null 2>&1 || fail "scp is required on the workstation"
+}
+
+controller_preflight() {
+    local target=$1 port=$2
+    info "Checking SSH connectivity..."
+    ssh -n "${SSH_CONFIG_OPTS[@]}" -p "$port" -o StrictHostKeyChecking=accept-new \
+        "$target" 'printf "controller-ssh-ok\n"' >/dev/null \
+        || fail "unable to connect to $target over SSH"
+
+    info "Checking controller prerequisites..."
+    ssh "${SSH_CONFIG_OPTS[@]}" -p "$port" -o StrictHostKeyChecking=accept-new "$target" 'bash -s' <<'REMOTE_PREFLIGHT' \
+        || fail "controller prerequisite check failed"
+set -euo pipefail
+command -v sh >/dev/null 2>&1 || { echo "missing sh" >&2; exit 10; }
+command -v bash >/dev/null 2>&1 || { echo "missing bash" >&2; exit 11; }
+command -v sudo >/dev/null 2>&1 || { echo "missing sudo" >&2; exit 12; }
+timeout 5 bash -c "</dev/tcp/1.1.1.1/80" >/dev/null 2>&1 || {
+    echo "no outbound IPv4 connectivity" >&2
+    exit 13
+}
+getent hosts deb.debian.org >/dev/null 2>&1 || {
+    echo "cannot resolve deb.debian.org" >&2
+    exit 14
+}
+sudo -n true >/dev/null 2>&1 || {
+    echo "sudo is present; controller bootstrap may prompt for the sudo password" >&2
+}
+REMOTE_PREFLIGHT
+}
+
+cmd_install_controller() {
+    check_workstation_dependencies
+
+    local controller_host controller_user controller_port remote_script target bootstrap
+    local controller_path log
+    local -a ssh_opts scp_opts
+
+    echo "Medusa controller install"
+    echo ""
+    prompt controller_host "Controller hostname or IP"
+    prompt controller_user "Controller SSH user" "ansible"
+    prompt controller_port "Controller SSH port" "22"
+    prompt remote_script "Remote bootstrap script path" "~/medusa-bootstrap-controller.sh"
+    prompt controller_path "Controller repo path after bootstrap" "/home/${controller_user}/Medusa"
+
+    [[ -n "$controller_host" ]] || fail "controller hostname or IP is required"
+    [[ -n "$controller_user" ]] || fail "controller SSH user is required"
+    [[ "$controller_port" =~ ^[0-9]+$ ]] || fail "controller SSH port must be a number"
+
+    bootstrap=$(bootstrap_source)
+    target="${controller_user}@${controller_host}"
+    SSH_TARGET="$target"
+    CONTROL_DIR=$(mktemp -d)
+    CONTROL_PATH="${CONTROL_DIR}/ssh-control"
+    ssh_opts=(
+        -p "$controller_port"
+        "${SSH_CONFIG_OPTS[@]}"
+        -o StrictHostKeyChecking=accept-new
+        -o ControlMaster=auto
+        -o ControlPersist=10m
+        -o ControlPath="$CONTROL_PATH"
+    )
+    scp_opts=(
+        -P "$controller_port"
+        "${SSH_CONFIG_OPTS[@]}"
+        -o StrictHostKeyChecking=accept-new
+        -o ControlMaster=auto
+        -o ControlPersist=10m
+        -o ControlPath="$CONTROL_PATH"
+    )
+
+    echo ""
+    info "About to:"
+    info "  Connect to: $target"
+    info "  SSH port:   $controller_port"
+    info "  Copy:       $bootstrap"
+    info "  Remote:     $remote_script"
+    info "  Run:        bash $remote_script"
+    info "  Save path:  $controller_path"
+    echo ""
+    confirm "Proceed" "y" || fail "aborted by user"
+
+    if confirm "Authorize this workstation's SSH key on the controller now" "y"; then
+        authorize_key_on_controller "$target" "$controller_port" "$(ensure_public_key)"
+    fi
+
+    info "Checking SSH connectivity..."
+    ssh -n "${ssh_opts[@]}" "$target" 'printf "controller-ssh-ok\n"' >/dev/null \
+        || fail "unable to connect to $target over SSH"
+
+    info "Checking controller prerequisites..."
+    ssh "${ssh_opts[@]}" "$target" 'bash -s' <<'REMOTE_PREFLIGHT' \
+        || fail "controller prerequisite check failed"
+set -euo pipefail
+command -v sh >/dev/null 2>&1 || { echo "missing sh" >&2; exit 10; }
+command -v bash >/dev/null 2>&1 || { echo "missing bash" >&2; exit 11; }
+command -v sudo >/dev/null 2>&1 || { echo "missing sudo" >&2; exit 12; }
+timeout 5 bash -c "</dev/tcp/1.1.1.1/80" >/dev/null 2>&1 || {
+    echo "no outbound IPv4 connectivity" >&2
+    exit 13
+}
+getent hosts deb.debian.org >/dev/null 2>&1 || {
+    echo "cannot resolve deb.debian.org" >&2
+    exit 14
+}
+sudo -n true >/dev/null 2>&1 || {
+    echo "sudo is present; controller bootstrap may prompt for the sudo password" >&2
+}
+REMOTE_PREFLIGHT
+
+    info "Copying controller bootstrap..."
+    scp "${scp_opts[@]}" "$bootstrap" "$target:$remote_script" \
+        || fail "failed to copy bootstrap script to controller"
+
+    log=$(log_path install-controller)
+    info "Running controller bootstrap on $target"
+    info "Log: $log"
+    echo ""
+    local install_rc=0
+    ssh -t "${ssh_opts[@]}" "$target" "bash $remote_script" < /dev/tty 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    # ssh -t round-trips TTY control sequences (cursor position, color
+    # queries, OSC title sets) into the log AND leaves stray OSC responses
+    # in the input buffer that pollute the next shell prompt.
+    sanitize_log "$log"
+    stty sane 2>/dev/null || true
+    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
+    if [[ "$install_rc" -ne 0 ]]; then
+        printf "%s✗%s install-controller failed\n" "$color_red" "$color_reset" >&2
+        printf "log: %s\n" "$log" >&2
+        exit 1
+    fi
+
+    MEDUSA_CONTROLLER_HOST="$controller_host"
+    MEDUSA_CONTROLLER_USER="$controller_user"
+    MEDUSA_CONTROLLER_PORT="$controller_port"
+    MEDUSA_CONTROLLER_PATH="$controller_path"
+    write_config
+
+    echo ""
+    printf "%s✓%s install-controller complete\n" "$color_green" "$color_reset"
+    printf "config: %s\n" "$CONFIG_FILE"
+}
+
+cmd_authorize_controller() {
+    local controller_host controller_user controller_port target public_key
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        load_config
+        controller_host="$MEDUSA_CONTROLLER_HOST"
+        controller_user="$MEDUSA_CONTROLLER_USER"
+        controller_port="$MEDUSA_CONTROLLER_PORT"
+    else
+        prompt controller_host "Controller hostname or IP"
+        prompt controller_user "Controller SSH user" "ansible"
+        prompt controller_port "Controller SSH port" "22"
+    fi
+
+    [[ -n "$controller_host" ]] || fail "controller hostname or IP is required"
+    [[ -n "$controller_user" ]] || fail "controller SSH user is required"
+    [[ "$controller_port" =~ ^[0-9]+$ ]] || fail "controller SSH port must be a number"
+
+    public_key=$(ensure_public_key)
+    target="${controller_user}@${controller_host}"
+    authorize_key_on_controller "$target" "$controller_port" "$public_key"
+    printf "%s✓%s authorized %s on %s\n" "$color_green" "$color_reset" "$public_key" "$target"
+}
+
+cmd_version() {
+    printf "medusactl %s\n" "$VERSION"
+}
+
+cmd_status() {
+    load_config
+    local target remote
+    local -a ssh_opts
+    target=$(ssh_target)
+    remote=$(remote_command 'printf "repo: "; pwd; printf "git: "; git rev-parse --short HEAD; printf "branch: "; git branch --show-current; uv run --quiet medusa check')
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    if [[ ! -t 0 ]]; then
+        ssh_opts+=(-o BatchMode=yes)
+    fi
+    printf "%s==>%s status\n" "$color_blue" "$color_reset"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "workdir: %s\n" "$MEDUSA_CONTROLLER_PATH"
+    printf "command: status\n"
+    ssh "${ssh_opts[@]}" "$target" "$remote"
+}
+
+cmd_shell() {
+    load_config
+    local target
+    local -a ssh_opts
+    [[ -t 0 ]] || fail "shell requires an interactive terminal"
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    printf "Opening shell on %s at %s\n" "$target" "$MEDUSA_CONTROLLER_PATH"
+    ssh -t "${ssh_opts[@]}" \
+        "$target" "cd $(printf "%q" "$MEDUSA_CONTROLLER_PATH") && exec bash -l"
+}
+
+cmd_config() {
+    load_config
+    cat <<EOF
+Config: $CONFIG_FILE
+Host:   $MEDUSA_CONTROLLER_HOST
+User:   $MEDUSA_CONTROLLER_USER
+Port:   $MEDUSA_CONTROLLER_PORT
+Path:   $MEDUSA_CONTROLLER_PATH
+EOF
+}
+
+cmd_check() {
+    load_config
+    run_logged check 'uv run medusa check'
+    cmd_audit_targets || true
+}
+
+# Audit SSH hardening across the managed targets. Pulls the host list
+# from 'medusa list-hosts --managed-only' so the mode prefix (F/L) is
+# available per row. 'full' hosts get the sshd + root-account probe;
+# 'limited' hosts get reachability + sudo only, since their hardening
+# surface is the operator's responsibility and is intentionally out of
+# medusa's audit scope. Warns on findings; does not fail the overall
+# check.
+cmd_audit_targets() {
+    local target log
+    target=$(ssh_target)
+    log=$(log_path "audit-targets")
+
+    local remote
+    remote=$(cat <<REMOTE
+set -uo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+hosts=\$(uv run --quiet medusa list-hosts --managed-only) || {
+    echo "audit: medusa list-hosts --managed-only failed on controller" >&2
+    exit 0
+}
+REMOTE
+)
+    remote+=$'\n'
+    remote+=$(cat <<'REMOTE'
+findings=0
+checked=0
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip rows that don't start with the managed-mode prefix letter.
+    [[ "$line" =~ ^[FL][[:space:]] ]] || continue
+
+    mode=$(awk '{print $1}' <<< "$line")
+    name=$(awk '{print $2}' <<< "$line")
+    ip=$(awk '{print $3}' <<< "$line")
+    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
+    [[ -z "$user" ]] && user="ansible"
+    [[ -z "$ip" || -z "$name" ]] && continue
+
+    checked=$((checked + 1))
+
+    if [[ "$mode" == "L" ]]; then
+        # Limited mode: reachability + sudo only. Hardening checks belong
+        # to the operator, not medusa.
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 \
+                -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+                'sudo -n true' >/dev/null 2>&1; then
+            printf "  ✓ %s (%s@%s): reachable + sudo ok (limited; hardening checks skipped)\n" \
+                "$name" "$user" "$ip"
+        else
+            printf "  ! %s (%s@%s): unreachable or sudo -n unavailable (limited)\n" \
+                "$name" "$user" "$ip"
+            findings=$((findings + 1))
+        fi
+        continue
+    fi
+
+    # Full mode: existing sshd + root-account probe.
+    sshd_out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -o StrictHostKeyChecking=accept-new "${user}@${ip}" \
+        'sudo -n sshd -T 2>/dev/null; echo "---"; sudo -n passwd -S root 2>/dev/null' \
+        2>/dev/null) || {
+        printf "  ! %s (%s@%s): unreachable or sudo -n unavailable\n" \
+            "$name" "$user" "$ip"
+        findings=$((findings + 1))
+        continue
+    }
+
+    permit=$(awk -F= '
+        BEGIN { val = "?" }
+        /^---$/ { exit }
+        tolower($1) ~ /^permitrootlogin[[:space:]]*$/ { val = $2; next }
+        /^[[:space:]]*permitrootlogin[[:space:]]/ {
+            sub(/^[[:space:]]*permitrootlogin[[:space:]]+/, "", $0)
+            val = $0
+        }
+        END { print val }
+    ' <<< "$sshd_out")
+    [[ "$permit" == "?" ]] && permit=$(grep -i '^permitrootlogin ' <<< "$sshd_out" | awk '{print $2}' | head -n1)
+    [[ -z "$permit" ]] && permit="?"
+
+    root_status=$(awk '/^---$/{flag=1; next} flag' <<< "$sshd_out" | awk '{print $2}' | head -n1)
+    [[ -z "$root_status" ]] && root_status="?"
+
+    bad=()
+    case "$permit" in
+        yes|without-password) bad+=("PermitRootLogin=$permit") ;;
+    esac
+    if [[ "$root_status" == "P" ]]; then
+        bad+=("root account has password (status=$root_status)")
+    fi
+
+    if [[ ${#bad[@]} -gt 0 ]]; then
+        findings=$((findings + 1))
+        printf "  ! %s (%s@%s): %s\n" "$name" "$user" "$ip" "$(IFS='; '; echo "${bad[*]}")"
+    else
+        printf "  ✓ %s (%s@%s): PermitRootLogin=%s root-status=%s\n" \
+            "$name" "$user" "$ip" "$permit" "$root_status"
+    fi
+done <<< "$hosts"
+
+echo ""
+if [[ "$checked" -eq 0 ]]; then
+    echo "audit: no managed hosts found"
+elif [[ "$findings" -gt 0 ]]; then
+    echo "audit: $findings host(s) flagged as unsafe; see warnings above"
+else
+    echo "audit: all $checked managed host(s) clean"
+fi
+REMOTE
+)
+
+    local ssh_opts
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s audit-targets\n" "$color_blue" "$color_reset"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    if ssh "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log"; then
+        printf "%s✓%s audit-targets\n" "$color_green" "$color_reset"
+        return 0
+    else
+        printf "%s!%s audit-targets reported issues (log: %s)\n" \
+            "$color_yellow" "$color_reset" "$log" >&2
+        return 0
+    fi
+}
+
+cmd_render() {
+    load_config
+    run_logged render 'uv run medusa render'
+}
+
+cmd_deploy() {
+    load_config
+    if [[ "${1:-}" == "--check" ]]; then
+        run_logged deploy-check 'cd ansible && uv run ansible-playbook playbooks/deploy.yml --check --diff'
+    else
+        run_logged deploy 'cd ansible && uv run ansible-playbook playbooks/deploy.yml'
+    fi
+}
+
+cmd_controller_apply() {
+    load_config
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl controller-apply — apply controller-side bootstrap blocks.
+
+Usage:
+  medusactl controller-apply [--check]
+
+Runs ansible/playbooks/controller-apply.yml on the controller. This applies the
+generated /etc/hosts bootstrap block and controller ~/.ssh/config aliases.
+EOF
+        return 0
+    fi
+
+    if [[ "${1:-}" == "--check" ]]; then
+        shift
+        [[ $# -eq 0 ]] || fail "unknown argument to controller-apply: $1"
+        require_controller_apply_prereqs controller-apply-check \
+            || fail "controller-apply check prerequisites failed"
+        run_logged controller-apply-check 'cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff'
+    else
+        [[ $# -eq 0 ]] || fail "unknown argument to controller-apply: $1"
+        require_controller_apply_prereqs controller-apply \
+            || fail "controller-apply prerequisites failed"
+        run_logged controller-apply 'cd ansible && uv run ansible-playbook playbooks/controller-apply.yml'
+    fi
+}
+
+cmd_finalize_dns() {
+    load_config
+    local resolver="" check=0 force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --resolver)
+                shift
+                [[ $# -gt 0 ]] || fail "--resolver requires an IP argument"
+                resolver=$1
+                ;;
+            --resolver=*)
+                resolver=${1#--resolver=}
+                ;;
+            --check)
+                check=1
+                ;;
+            --force)
+                force=1
+                ;;
+            *)
+                fail "unknown argument to finalize-dns: $1"
+                ;;
+        esac
+        shift
+    done
+
+    require_controller_apply_prereqs finalize-dns \
+        || fail "finalize-dns prerequisites failed"
+
+    # Build the remote script. It reads /etc/hosts on the controller, finds
+    # the bootstrap marker block, validates each entry against the resolver
+    # (unless --force), then lets the controller_bootstrap role remove the
+    # block through the same privileged path used for apply.
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd "$MEDUSA_CONTROLLER_PATH"
+RESOLVER=${RESOLVER:-}
+CHECK=${CHECK:-0}
+FORCE=${FORCE:-0}
+BEGIN='# BEGIN MEDUSA BOOTSTRAP (managed by medusa; remove with '"'"'medusactl finalize-dns'"'"')'
+END='# END MEDUSA BOOTSTRAP'
+
+if grep -qxF "$BEGIN" /etc/hosts; then
+    block=$(sed -n "/^${BEGIN//\//\\/}\$/,/^${END//\//\\/}\$/p" /etc/hosts \
+        | sed -e "1d" -e "\$d")
+else
+    echo "no medusa bootstrap block in /etc/hosts; applying absent state anyway"
+    block=""
+fi
+
+if [[ -z "$block" ]]; then
+    echo "bootstrap block is empty; removing markers only"
+fi
+
+if [[ "$FORCE" -ne 1 && -n "$block" ]]; then
+    if [[ -z "$RESOLVER" ]]; then
+        if command -v resolvectl >/dev/null 2>&1; then
+            RESOLVER=$(resolvectl status 2>/dev/null \
+                | awk "/Current DNS Server/ {print \$NF; exit}")
+        fi
+        if [[ -z "$RESOLVER" ]]; then
+            RESOLVER=$(awk "/^nameserver/ {print \$2; exit}" /etc/resolv.conf)
+        fi
+        if [[ -z "$RESOLVER" ]]; then
+            echo "could not auto-detect resolver; pass --resolver" >&2
+            exit 2
+        fi
+    fi
+    if ! command -v dig >/dev/null 2>&1; then
+        echo "dig is required for finalize-dns validation; install dnsutils or use --force" >&2
+        exit 3
+    fi
+
+    echo "validating against resolver: $RESOLVER"
+    fail_count=0
+    while read -r ip host name; do
+        [[ -z "$ip" ]] && continue
+        got=$(dig @"$RESOLVER" +short +time=2 +tries=1 "$host" A | head -n1)
+        if [[ -z "$got" ]]; then
+            echo "  ✗ $host -> NXDOMAIN (expected $ip)" >&2
+            fail_count=$((fail_count + 1))
+        elif [[ "$got" != "$ip" ]]; then
+            echo "  ✗ $host -> $got (expected $ip)" >&2
+            fail_count=$((fail_count + 1))
+        else
+            echo "  ✓ $host -> $got"
+        fi
+    done <<< "$block"
+
+    if [[ "$fail_count" -ne 0 ]]; then
+        echo "validation failed for $fail_count entries; leaving /etc/hosts unchanged" >&2
+        echo "fix the resolver or pass --force to remove the block anyway" >&2
+        exit 4
+    fi
+fi
+
+if [[ "$CHECK" -eq 1 ]]; then
+    cd ansible
+    uv run ansible-playbook playbooks/controller-apply.yml \
+        --check --diff \
+        --extra-vars controller_bootstrap_state=absent
+else
+    cd ansible
+    uv run ansible-playbook playbooks/controller-apply.yml \
+        --extra-vars controller_bootstrap_state=absent
+fi
+REMOTE
+)
+
+    local target ssh_opts log
+    target=$(ssh_target)
+    log=$(log_path "finalize-dns")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s finalize-dns\n" "$color_blue" "$color_reset"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    local env_prefix
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q RESOLVER=%q CHECK=%q FORCE=%q" "$MEDUSA_CONTROLLER_PATH" "$resolver" "$check" "$force")
+
+    local finalize_rc=0
+    ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || finalize_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    if [[ "$finalize_rc" -eq 0 ]]; then
+        printf "%s✓%s finalize-dns\n" "$color_green" "$color_reset"
+    else
+        printf "%s✗%s finalize-dns failed (log: %s)\n" "$color_red" "$color_reset" "$log" >&2
+        return 1
+    fi
+}
+
+# --- Target ops -------------------------------------------------------------
+#
+# All target subcommands run the relevant 'medusa' Python CLI commands on the
+# controller (single source of truth for inventory edits) and, when the edit
+# changed state, apply the regenerated bootstrap blocks through the
+# controller_bootstrap Ansible role.
+
+_run_remote_with_render_and_apply() {
+    # Compose: <pre-block bash> + medusa render + apply blocks.
+    # $1 is the bash snippet to run BEFORE render (typically a medusa
+    # add-host or remove-host call). Echoes the full output and returns
+    # the SSH exit code via PIPESTATUS handling.
+    #
+    # When the third argument is "dry-run", the render + apply tail is
+    # omitted: the pre-script is expected to validate without writing,
+    # and there is nothing to deploy.
+    local pre_script=$1 name=$2 mode=${3:-apply} log target install_rc=0
+    target=$(ssh_target)
+    log=$(log_path "$name")
+
+    if [[ "$mode" != "dry-run" ]]; then
+        require_controller_apply_prereqs "$name" \
+            || return 1
+    fi
+
+    local tail=""
+    if [[ "$mode" != "dry-run" ]]; then
+        tail="uv run medusa render
+cd ansible
+uv run ansible-playbook playbooks/controller-apply.yml"
+    fi
+
+    local full_script
+    full_script=$(cat <<REMOTE
+set -euo pipefail
+export PATH="\$HOME/.local/bin:\$PATH"
+export MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH")
+cd "\$MEDUSA_CONTROLLER_PATH"
+${pre_script}
+${tail}
+REMOTE
+)
+
+    local ssh_opts
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s %s\n" "$color_blue" "$color_reset" "$name"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$full_script" 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    stty sane 2>/dev/null || true
+    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
+    if [[ "$install_rc" -eq 0 ]]; then
+        printf "%s✓%s %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+    printf "%s✗%s %s (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+    return 1
+}
+
+cmd_add_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl add-target — append a host to inventory/dns.yaml and apply blocks.
+
+Usage:
+  medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
+                       [--zone <zone>] [--user <user>]
+                       [--alias <alias> ...] [--group <group> ...]
+                       [--prep] [--authorize] [--no-seed-hosts] [--force]
+                       [--dry-run]
+
+Flags:
+  --ip <ip>              Required. IPv4 (or IPv6) address.
+  --zone <zone>          DNS zone. Defaults to 'lan'. Repeat for multiple.
+  --user <user>          ansible user. Defaults to 'ansible'. Marks host
+                         as managed.
+  --alias <alias>        DNS alias. Repeat for multiple.
+  --group <group>        Ansible inventory group. Repeat for multiple.
+  --limited              Mark host as 'limited' managed mode (baremetal /
+                         pre-existing). Disables prep-target and root-SSH
+                         hardening audit for this host. Without this flag
+                         the host defaults to 'limited' anyway; passing
+                         --full is required to opt into the destructive
+                         template-prep flow.
+  --full                 Mark host as 'full' managed mode. Required to
+                         allow prep-target + hardening audit. Mutually
+                         exclusive with --limited.
+  --prep                 After add, run prep-debian.sh against the target
+                         via root SSH (prompts for shared root password).
+                         Implies --full.
+  --authorize            After add (and prep, if requested), run
+                         ssh-copy-id from controller to target (prompts
+                         for target user's SSH password).
+  --no-seed-hosts        Skip applying the /etc/hosts bootstrap block.
+                         Use when local DNS already serves the name.
+  --force                Replace an existing host of the same name.
+  --bootstrap-ip <addr>  Temporary cutover address for the controller's
+                         /etc/hosts bootstrap block; clear with
+                         'medusactl promote-target' once DNS is live.
+                         Must differ from --ip.
+  --dry-run              Run medusa add-host --dry-run on the controller:
+                         validate the proposed edit and print a unified
+                         diff of inventory/dns.yaml; do not write, do not
+                         render, do not apply. Incompatible with --prep
+                         and --authorize.
+
+Examples:
+  medusactl add-target host01 --ip 10.0.0.10
+  medusactl add-target host01 --ip 10.0.0.10 --dry-run
+  medusactl add-target host02 --ip 10.0.0.11 --prep --authorize
+  medusactl add-target dns --ip 10.0.0.250 --alias coredns --group coredns_hosts
+
+Exit codes: 0 success, non-zero on any failure.
+EOF
+        return 0
+    fi
+
+    load_config
+    local name=${1:-}
+    if [[ -z "$name" ]]; then
+        fail "add-target: name argument is required"
+    fi
+    if [[ "$name" == --* ]]; then
+        fail "add-target: name argument is required (got flag '$name')"
+    fi
+    shift
+
+    local ip="" bootstrap_ip="" user="ansible" force=0 prep=0 authorize=0 dry_run=0
+    local mode=""  # "", "full", or "limited"
+    local -a zones=() aliases=() groups=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ip) shift; ip=$1 ;;
+            --bootstrap-ip) shift; bootstrap_ip=$1 ;;
+            --zone) shift; zones+=("$1") ;;
+            --user) shift; user=$1 ;;
+            --alias) shift; aliases+=("$1") ;;
+            --group) shift; groups+=("$1") ;;
+            --limited) mode="limited" ;;
+            --full) mode="full" ;;
+            --force) force=1 ;;
+            --prep) prep=1 ;;
+            --authorize) authorize=1 ;;
+            --dry-run) dry_run=1 ;;
+            --no-seed-hosts) : ;; # accepted for future toggling; render always emits
+            *) fail "add-target: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+
+    if [[ "$dry_run" -eq 1 ]]; then
+        if [[ "$prep" -eq 1 || "$authorize" -eq 1 ]]; then
+            fail "add-target: --dry-run cannot be combined with --prep or --authorize"
+        fi
+    fi
+
+    [[ -n "$ip" ]] || fail "add-target: --ip is required"
+    if [[ ${#zones[@]} -eq 0 ]]; then
+        zones=(lan)
+    fi
+
+    # --prep runs the destructive root-SSH template prep flow; it only
+    # makes sense for hosts in full mode. Either upgrade an implicit
+    # default to full, or refuse if the operator explicitly asked for
+    # --limited (mixed signals should be loud, not silent).
+    if [[ "$prep" -eq 1 ]]; then
+        if [[ "$mode" == "limited" ]]; then
+            fail "add-target: --prep and --limited are mutually exclusive (prep cannot run on a limited host)"
+        fi
+        mode="full"
+    fi
+
+    # Build the medusa add-host argument list.
+    local args
+    args=$(printf "%q " add-host "$name" --ip "$ip" --ansible-user "$user")
+    local z; for z in "${zones[@]}"; do args+=$(printf "%q " --zone "$z"); done
+    local a; for a in "${aliases[@]}"; do args+=$(printf "%q " --alias "$a"); done
+    local g; for g in "${groups[@]}"; do args+=$(printf "%q " --ansible-group "$g"); done
+    [[ -n "$mode" ]] && args+=$(printf "%q " --managed-mode "$mode")
+    [[ -n "$bootstrap_ip" ]] && args+=$(printf "%q " --bootstrap-ip "$bootstrap_ip")
+    [[ "$force" -eq 1 ]] && args+="--force "
+    [[ "$dry_run" -eq 1 ]] && args+="--dry-run "
+
+    local pre="uv run medusa ${args}"
+    local run_mode="apply"
+    [[ "$dry_run" -eq 1 ]] && run_mode="dry-run"
+    _run_remote_with_render_and_apply "$pre" "add-target-$name" "$run_mode" \
+        || fail "add-target failed"
+
+    if [[ "$dry_run" -eq 1 ]]; then
+        return 0
+    fi
+
+    if [[ "$prep" -eq 1 ]]; then
+        cmd_prep_target "$name" || fail "add-target: prep-target failed"
+    fi
+    if [[ "$authorize" -eq 1 ]]; then
+        cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
+    fi
+}
+
+cmd_remove_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl remove-target — strip a host from inventory/dns.yaml, re-render,
+                          and clean controller-side /etc/hosts / ~/.ssh/config.
+
+Usage:
+  medusactl remove-target <name> [--dry-run]
+                          [--remove-mounts] [--remove-exports]
+                          [--remove-services] [--cascade]
+
+Flags:
+  --dry-run              Run medusa remove-host --dry-run on the
+                         controller: validate the proposed edit and
+                         print a unified diff; do not write, do not
+                         render, do not apply.
+  --remove-mounts        Also drop the host from every storage mount
+                         host list. Mounts whose host list empties are
+                         removed.
+  --remove-exports       Also remove every storage export served by
+                         this host.
+  --remove-services      Also remove every service entry whose host is
+                         this host.
+  --cascade              Imply --remove-mounts, --remove-exports, and
+                         --remove-services.
+
+Exit codes: 0 success (even if host was not present), non-zero on failure.
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "remove-target: name argument is required"
+    if [[ "$name" == --* ]]; then
+        fail "remove-target: name argument is required (got flag '$name')"
+    fi
+    shift
+    local dry_run=0
+    local -a forwarded=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=1 ;;
+            --remove-mounts|--remove-exports|--remove-services|--cascade)
+                forwarded+=("$1")
+                ;;
+            *) fail "remove-target: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    local pre run_mode="apply"
+    local extra=""
+    local flag
+    for flag in "${forwarded[@]:-}"; do
+        [[ -n "$flag" ]] || continue
+        extra+=$(printf " %q" "$flag")
+    done
+    if [[ "$dry_run" -eq 1 ]]; then
+        pre=$(printf "uv run medusa remove-host %q --dry-run" "$name")${extra}
+        run_mode="dry-run"
+    else
+        pre=$(printf "uv run medusa remove-host %q" "$name")${extra}
+    fi
+    _run_remote_with_render_and_apply "$pre" "remove-target-$name" "$run_mode" \
+        || fail "remove-target failed"
+}
+
+cmd_promote_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl promote-target — clear a host's bootstrap_ip so it drops out of
+                           the controller's /etc/hosts bootstrap block.
+                           Run once real DNS is authoritative for the host.
+
+Usage:
+  medusactl promote-target <name> [--dry-run]
+
+Flags:
+  --dry-run              Run medusa promote-host --dry-run on the
+                         controller: validate and print a unified diff;
+                         do not write, do not render, do not apply.
+
+Exit codes: 0 success (idempotent if already promoted), non-zero on failure.
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "promote-target: name argument is required"
+    if [[ "$name" == --* ]]; then
+        fail "promote-target: name argument is required (got flag '$name')"
+    fi
+    shift
+    local dry_run=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=1 ;;
+            *) fail "promote-target: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    local pre run_mode="apply"
+    if [[ "$dry_run" -eq 1 ]]; then
+        pre=$(printf "uv run medusa promote-host %q --dry-run" "$name")
+        run_mode="dry-run"
+    else
+        pre=$(printf "uv run medusa promote-host %q" "$name")
+    fi
+    _run_remote_with_render_and_apply "$pre" "promote-target-$name" "$run_mode" \
+        || fail "promote-target failed"
+}
+
+cmd_list_targets() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl list-targets — print the host inventory from the controller.
+
+Usage:
+  medusactl list-targets [--managed-only | --full | --limited]
+
+Flags:
+  --managed-only         Show only hosts with ansible_user set (F + L).
+  --full                 Show only 'full' managed-mode hosts.
+  --limited              Show only 'limited' managed-mode hosts.
+
+Prefix legend: F = full managed, L = limited managed, - = DNS-only.
+EOF
+        return 0
+    fi
+    load_config
+    local extra=""
+    case "${1:-}" in
+        --managed-only) extra="--managed-only" ;;
+        --full)         extra="--mode full" ;;
+        --limited)      extra="--mode limited" ;;
+        "")             : ;;
+        *)              fail "list-targets: unknown flag '${1:-}'" ;;
+    esac
+
+    # list-hosts is a read-only inspector; stream output straight to the
+    # user's terminal instead of capturing into a log (run_logged hides
+    # the output, which is the whole point of this command).
+    local target remote
+    local -a ssh_opts
+    target=$(ssh_target)
+    remote=$(remote_command "uv run --quiet medusa list-hosts $extra")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    if [[ ! -t 0 ]]; then
+        ssh_opts+=(-o BatchMode=yes)
+    fi
+    ssh "${ssh_opts[@]}" "$target" "$remote"
+}
+
+cmd_prep_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl prep-target — re-run prep-debian.sh against an existing target.
+
+Usage:
+  medusactl prep-target <name>
+
+Prompts for the shared root SSH password on the target. Runs the same
+prep script bootstrap uses: installs sudo/openssh-server/python3,
+creates the ansible user, NOPASSWD sudo, authorizes the controller's
+SSH key, and clamps sshd (PermitRootLogin prohibit-password +
+passwd -l root). Idempotent: re-running on an already-prepped host is
+safe and re-applies hardening.
+
+Refuses to run if the target is in 'limited' managed mode (baremetal /
+pre-existing hosts). For those, authorize the controller key by hand
+(or with 'medusactl authorize-target') — see docs/site-management.md.
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "prep-target: name argument is required"
+
+    local password
+    read -r -s -p "Root SSH password for $name: " password </dev/tty
+    printf "\n" >&2
+
+    # Resolve the target's mode, IP, and ansible user via
+    # 'medusa list-hosts --managed-only'. The mode prefix (F/L/-) is a
+    # public contract between medusa and this wrapper; field 1 of each
+    # row is the letter, field 2 is the name.
+    local target ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    local lookup
+    lookup=$(ssh "${ssh_opts[@]}" "$target" \
+        "cd $(printf %q "$MEDUSA_CONTROLLER_PATH") && uv run medusa list-hosts --managed-only" \
+        2>&1) || fail "prep-target: could not list managed hosts on controller"
+
+    local line mode ip user
+    line=$(grep -E "^[FL][[:space:]]+${name}[[:space:]]" <<< "$lookup" | head -n1) \
+        || true
+    if [[ -z "$line" ]]; then
+        fail "prep-target: $name is not in the managed host list; add it first with 'medusactl add-target'"
+    fi
+    mode=$(awk '{print $1}' <<< "$line")
+    if [[ "$mode" == "L" ]]; then
+        fail "prep-target: $name is in 'limited' managed mode and cannot be prepped via this command. Use 'medusactl authorize-target $name' to authorize the controller key, or onboard manually (docs/site-management.md)."
+    fi
+    ip=$(awk '{print $3}' <<< "$line")
+    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
+    [[ -z "$user" ]] && user="ansible"
+    [[ -z "$ip" ]] && fail "prep-target: could not determine IP for $name"
+
+    # Run the prep script from the controller's tools/prep-debian.sh via
+    # the same root SSH + sshpass approach bootstrap uses, but invoked here.
+    local remote
+    remote=$(cat <<REMOTE
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+if ! command -v sshpass >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass
+fi
+pubkey=\$(cat ~/.ssh/id_ed25519.pub)
+remote_tmp=/tmp/medusa-prep.\$\$
+SSHPASS=$(printf %q "$password") sshpass -e scp \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o ConnectTimeout=10 \\
+    -o PreferredAuthentications=password \\
+    -o PubkeyAuthentication=no \\
+    tools/prep-debian.sh root@${ip}:\${remote_tmp}
+SSHPASS=$(printf %q "$password") sshpass -e ssh \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o ConnectTimeout=10 \\
+    -o PreferredAuthentications=password \\
+    -o PubkeyAuthentication=no \\
+    root@${ip} \\
+    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY=\$(printf %q \"\$pubkey\") bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
+REMOTE
+)
+
+    local log install_rc=0
+    log=$(log_path "prep-target-$name")
+    printf "%s==>%s prep-target %s (%s)\n" "$color_blue" "$color_reset" "$name" "$ip"
+    printf "log:    %s\n" "$log"
+    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    stty sane 2>/dev/null || true
+    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
+    if [[ "$install_rc" -eq 0 ]]; then
+        printf "%s✓%s prep-target %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+    printf "%s✗%s prep-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+    return 1
+}
+
+cmd_authorize_target() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl authorize-target — ssh-copy-id from controller to an existing target.
+
+Usage:
+  medusactl authorize-target <name>
+
+Prompts for the target user's SSH password. Adds the controller's public
+key to the target user's ~/.ssh/authorized_keys via ssh-copy-id. Useful
+for pre-baked targets that already have the user but lack the key, and
+for key rotation. Skip when 'medusactl prep-target' just ran (prep
+already authorizes the key).
+EOF
+        return 0
+    fi
+    load_config
+    local name=${1:-}
+    [[ -n "$name" ]] || fail "authorize-target: name argument is required"
+
+    local password
+    read -r -s -p "SSH password for ${name} target user: " password </dev/tty
+    printf "\n" >&2
+
+    local target ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    local remote
+    remote=$(cat <<REMOTE
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+host=\$(getent hosts ${name} | awk '{print \$1}' | head -n1) || true
+if [[ -z "\$host" ]]; then
+    echo "  could not resolve ${name}; trying name as-is" >&2
+    host="${name}"
+fi
+# Look up user from medusa list-hosts.
+line=\$(uv run medusa list-hosts --managed-only | grep -E "^[FL][[:space:]]+${name}[[:space:]]" | head -n1) || true
+user=\$(awk '{for(i=1;i<=NF;i++) if(\$i~/^user=/){sub(/^user=/,"",\$i); print \$i}}' <<< "\$line")
+[[ -z "\$user" ]] && user=ansible
+echo "  authorizing key on \${user}@${name} (\${host})"
+if ! command -v sshpass >/dev/null 2>&1; then
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass
+fi
+SSHPASS=$(printf %q "$password") sshpass -e ssh-copy-id \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o ConnectTimeout=10 \\
+    -o PreferredAuthentications=password \\
+    -o PubkeyAuthentication=no \\
+    -i ~/.ssh/id_ed25519.pub "\${user}@${name}"
+REMOTE
+)
+
+    local log install_rc=0
+    log=$(log_path "authorize-target-$name")
+    printf "%s==>%s authorize-target %s\n" "$color_blue" "$color_reset" "$name"
+    printf "log:    %s\n" "$log"
+    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || install_rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    stty sane 2>/dev/null || true
+    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
+    if [[ "$install_rc" -eq 0 ]]; then
+        printf "%s✓%s authorize-target %s\n" "$color_green" "$color_reset" "$name"
+        return 0
+    fi
+    printf "%s✗%s authorize-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
+    return 1
+}
+
+cmd_add_targets_from_file() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl add-targets-from-file — bulk-add targets from a file.
+
+Usage:
+  medusactl add-targets-from-file <path>
+
+File format: one target per line.
+  <name> <ip> [zone] [user] [group1,group2,...]
+
+Blank lines and lines starting with '#' are ignored. Defaults: zone=lan,
+user=ansible. Equivalent to running 'medusactl add-target <name>
+--ip <ip>' for each line.
+
+Does not run --prep or --authorize automatically; run those per-target
+afterwards if needed.
+EOF
+        return 0
+    fi
+    load_config
+    local file=${1:-}
+    [[ -n "$file" ]] || fail "add-targets-from-file: path required"
+    [[ -f "$file" ]] || fail "add-targets-from-file: file not found: $file"
+
+    local lineno=0 line name ip zone user groups
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        read -r name ip zone user groups <<< "$line"
+        [[ -z "$name" || -z "$ip" ]] && fail "line $lineno: name and ip required"
+        [[ -z "$zone" ]] && zone="lan"
+        [[ -z "$user" ]] && user="ansible"
+
+        local -a flags=(--ip "$ip" --zone "$zone" --user "$user")
+        if [[ -n "$groups" ]]; then
+            local g
+            IFS=',' read -ra grp_array <<< "$groups"
+            for g in "${grp_array[@]}"; do
+                flags+=(--group "$g")
+            done
+        fi
+        info "line $lineno: add-target $name (${flags[*]})"
+        cmd_add_target "$name" "${flags[@]}" \
+            || fail "add-targets-from-file: failed at line $lineno ($name)"
+    done < "$file"
+}
+
+cmd_update() {
+    load_config
+    run_logged update 'git pull --ff-only && uv sync && uv run ansible-galaxy collection install -r ansible/requirements.yml'
+}
+
+cmd_self_update() {
+    local source destination destination_dir installed tmp_destination
+
+    installed=$(command -v medusactl || true)
+    if [[ -n "$installed" && -f "$installed" ]]; then
+        destination="$installed"
+    else
+        destination="$HOME/.local/bin/medusactl"
+    fi
+    destination_dir=$(dirname "$destination")
+
+    source=$(medusactl_source)
+    bash -n "$source" || fail "downloaded medusactl failed shell syntax validation"
+
+    mkdir -p "$destination_dir" || fail "failed to create $destination_dir"
+    if [[ -e "$destination" && ! -w "$destination" ]]; then
+        fail "$destination is not writable; update it manually or choose a user-writable install path"
+    fi
+
+    tmp_destination=$(mktemp "${destination_dir}/.medusactl.XXXXXX") \
+        || fail "failed to create temporary file in $destination_dir"
+    TEMP_FILES+=("$tmp_destination")
+    cp "$source" "$tmp_destination" || fail "failed to stage update at $tmp_destination"
+    chmod 0755 "$tmp_destination" || fail "failed to mark $tmp_destination executable"
+    mv -f "$tmp_destination" "$destination" || fail "failed to update $destination"
+    printf "%s✓%s medusactl updated at %s\n" "$color_green" "$color_reset" "$destination"
+    refresh_installed_completions
+}
+
+completion_bash() {
+    cat <<'EOF'
+_medusactl_complete() {
+    local cur prev commands
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    commands="install-controller authorize-controller status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target add-targets-from-file update self-update completion ssh-disconnect undo list-backups clean uninstall config version"
+
+    if [[ "$COMP_CWORD" -eq 1 ]]; then
+        COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
+        return 0
+    fi
+
+    case "${COMP_WORDS[1]}" in
+        deploy|controller-apply)
+            COMPREPLY=( $(compgen -W "--check" -- "$cur") )
+            ;;
+        finalize-dns)
+            COMPREPLY=( $(compgen -W "--check --force --resolver" -- "$cur") )
+            ;;
+        add-target)
+            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --group --full --limited --prep --authorize --no-seed-hosts --force --dry-run --help" -- "$cur") )
+            ;;
+        list-targets)
+            COMPREPLY=( $(compgen -W "--managed-only --full --limited --help" -- "$cur") )
+            ;;
+        remove-target)
+            COMPREPLY=( $(compgen -W "--dry-run --remove-mounts --remove-exports --remove-services --cascade --help" -- "$cur") )
+            ;;
+        promote-target)
+            COMPREPLY=( $(compgen -W "--dry-run --help" -- "$cur") )
+            ;;
+        prep-target|authorize-target|add-targets-from-file)
+            COMPREPLY=( $(compgen -W "--help" -- "$cur") )
+            ;;
+        completion)
+            COMPREPLY=( $(compgen -W "bash zsh fish install" -- "$cur") )
+            ;;
+    esac
+}
+complete -F _medusactl_complete medusactl
+EOF
+}
+
+completion_zsh() {
+    cat <<'EOF'
+#compdef medusactl
+
+_medusactl() {
+    local -a commands
+    commands=(
+        'install-controller:run the controller installer'
+        'authorize-controller:authorize this workstation SSH key on the controller'
+        'status:show controller status'
+        'shell:open a controller shell'
+        'check:run medusa check on the controller'
+        'render:run medusa render on the controller'
+        'deploy:run controller deployment'
+        'controller-apply:apply controller-side bootstrap blocks'
+        'finalize-dns:remove /etc/hosts bootstrap block once DNS is live'
+        'add-target:add a host to inventory and apply bootstrap blocks'
+        'remove-target:strip a host from inventory + bootstrap blocks'
+        'promote-target:clear bootstrap_ip so the host drops out of /etc/hosts'
+        'list-targets:print the host inventory'
+        'prep-target:re-run prep-debian.sh against an existing target'
+        'authorize-target:ssh-copy-id from controller to an existing target'
+        'add-targets-from-file:bulk-add targets from a file'
+        'update:update the controller checkout'
+        'self-update:update the local medusactl helper'
+        'completion:print shell completion'
+        'clean:remove local medusactl state'
+        'uninstall:remove local medusactl state and binaries'
+        'config:show local controller config'
+        'version:print the medusactl version'
+        'ssh-disconnect:close the persistent SSH master to the controller'
+        'undo:restore inventory from the most recent snapshot'
+        'list-backups:list inventory snapshots'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe 'command' commands
+        return
+    fi
+
+    case "$words[2]" in
+        deploy|controller-apply)
+            _arguments '--check[run deploy in check mode]'
+            ;;
+        finalize-dns)
+            _arguments \
+                '--check[show what would be removed without writing]' \
+                '--force[skip resolver validation]' \
+                '--resolver[resolver IP to validate names against]:ip:'
+            ;;
+        add-target)
+            _arguments \
+                '--ip[IPv4 address]:ip:' \
+                '--zone[DNS zone]:zone:' \
+                '--user[ansible user]:user:' \
+                '--alias[DNS alias]:alias:' \
+                '--group[ansible group]:group:' \
+                '--full[mark as full managed mode]' \
+                '--limited[mark as limited managed mode]' \
+                '--prep[also run prep-debian.sh; implies --full]' \
+                '--authorize[also run ssh-copy-id]' \
+                '--no-seed-hosts[skip /etc/hosts seed]' \
+                '--force[replace existing entry]'
+            ;;
+        list-targets)
+            _arguments \
+                '--managed-only[show only managed hosts]' \
+                '--full[show only full managed mode]' \
+                '--limited[show only limited managed mode]'
+            ;;
+        remove-target)
+            _arguments \
+                '--dry-run[validate and diff without writing]' \
+                '--remove-mounts[drop host from storage mount lists]' \
+                '--remove-exports[remove storage exports served by host]' \
+                '--remove-services[remove services hosted on host]' \
+                '--cascade[imply all --remove-* flags]'
+            ;;
+        completion)
+            _arguments '1:shell:(bash zsh fish install)'
+            ;;
+    esac
+}
+
+_medusactl "$@"
+EOF
+}
+
+completion_fish() {
+    cat <<'EOF'
+complete -c medusactl -f
+complete -c medusactl -n '__fish_use_subcommand' -a 'install-controller' -d 'Run the controller installer'
+complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-controller' -d 'Authorize this workstation SSH key on the controller'
+complete -c medusactl -n '__fish_use_subcommand' -a 'status' -d 'Show controller status'
+complete -c medusactl -n '__fish_use_subcommand' -a 'shell' -d 'Open a controller shell'
+complete -c medusactl -n '__fish_use_subcommand' -a 'check' -d 'Run medusa check on the controller'
+complete -c medusactl -n '__fish_use_subcommand' -a 'render' -d 'Run medusa render on the controller'
+complete -c medusactl -n '__fish_use_subcommand' -a 'deploy' -d 'Run controller deployment'
+complete -c medusactl -n '__fish_use_subcommand' -a 'controller-apply' -d 'Apply controller-side bootstrap blocks'
+complete -c medusactl -n '__fish_use_subcommand' -a 'finalize-dns' -d 'Remove /etc/hosts bootstrap block once DNS is live'
+complete -c medusactl -n '__fish_use_subcommand' -a 'add-target' -d 'Add a host to inventory and apply bootstrap blocks'
+complete -c medusactl -n '__fish_use_subcommand' -a 'remove-target' -d 'Strip a host from inventory + bootstrap blocks'
+complete -c medusactl -n '__fish_use_subcommand' -a 'promote-target' -d 'Clear bootstrap_ip so the host drops out of /etc/hosts'
+complete -c medusactl -n '__fish_use_subcommand' -a 'list-targets' -d 'Print the host inventory'
+complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d 'Re-run prep-debian.sh against an existing target'
+complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-copy-id from controller to an existing target'
+complete -c medusactl -n '__fish_use_subcommand' -a 'add-targets-from-file' -d 'Bulk-add targets from a file'
+complete -c medusactl -n '__fish_use_subcommand' -a 'update' -d 'Update the controller checkout'
+complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update the local helper'
+complete -c medusactl -n '__fish_use_subcommand' -a 'completion' -d 'Print shell completion'
+complete -c medusactl -n '__fish_use_subcommand' -a 'clean' -d 'Remove local state'
+complete -c medusactl -n '__fish_use_subcommand' -a 'uninstall' -d 'Remove local state and binaries'
+complete -c medusactl -n '__fish_use_subcommand' -a 'config' -d 'Show local controller config'
+complete -c medusactl -n '__fish_use_subcommand' -a 'version' -d 'Print the medusactl version'
+complete -c medusactl -n '__fish_use_subcommand' -a 'ssh-disconnect' -d 'Close the persistent SSH master to the controller'
+complete -c medusactl -n '__fish_use_subcommand' -a 'undo' -d 'Restore inventory from the most recent snapshot'
+complete -c medusactl -n '__fish_use_subcommand' -a 'list-backups' -d 'List inventory snapshots'
+complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run deploy in check mode'
+complete -c medusactl -n '__fish_seen_subcommand_from controller-apply' -l check -d 'Run controller apply in check mode'
+complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l check -d 'Show what would be removed without writing'
+complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l force -d 'Skip resolver validation and remove the block'
+complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l resolver -d 'Resolver IP to validate names against'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l ip -d 'IPv4 address'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l zone -d 'DNS zone'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l user -d 'ansible user'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l alias -d 'DNS alias'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l group -d 'ansible group'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l full -d 'Mark as full managed mode'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l limited -d 'Mark as limited managed mode'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run prep-debian.sh (implies --full)'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l authorize -d 'Also run ssh-copy-id'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l no-seed-hosts -d 'Skip /etc/hosts seed'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l force -d 'Replace existing entry'
+complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l managed-only -d 'Show only managed hosts (F + L)'
+complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l full -d 'Show only full managed mode'
+complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l limited -d 'Show only limited managed mode'
+complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l dry-run -d 'Validate and diff without writing'
+complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-mounts -d 'Drop host from storage mount lists'
+complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-exports -d 'Remove storage exports served by host'
+complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-services -d 'Remove services hosted on host'
+complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l cascade -d 'Imply all --remove-* flags'
+complete -c medusactl -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish install'
+EOF
+}
+
+cmd_completion() {
+    local shell=${1:-} action=${2:-}
+    case "$shell" in
+        bash)
+            if [[ "$action" == "install" ]]; then
+                cmd_completion_install bash
+                return
+            fi
+            completion_bash
+            ;;
+        zsh)
+            if [[ "$action" == "install" ]]; then
+                cmd_completion_install zsh
+                return
+            fi
+            completion_zsh
+            ;;
+        fish)
+            if [[ "$action" == "install" ]]; then
+                cmd_completion_install fish
+                return
+            fi
+            completion_fish
+            ;;
+        install)
+            cmd_completion_install
+            ;;
+        *)
+            fail "usage: medusactl completion <bash|zsh|fish> [install]"
+            ;;
+    esac
+    [[ -z "$action" ]] || fail "usage: medusactl completion <bash|zsh|fish> [install]"
+}
+
+cmd_completion_install() {
+    local shell_name destination
+    shell_name=${1:-$(basename "${SHELL:-}")}
+    case "$shell_name" in
+        bash)
+            destination="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/medusactl"
+            mkdir -p "$(dirname "$destination")"
+            completion_bash > "$destination"
+            ;;
+        zsh)
+            destination="${ZDOTDIR:-$HOME}/.zfunc/_medusactl"
+            mkdir -p "$(dirname "$destination")"
+            completion_zsh > "$destination"
+            warn "ensure '${ZDOTDIR:-$HOME}/.zfunc' is in fpath before compinit"
+            ;;
+        fish)
+            destination="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/medusactl.fish"
+            mkdir -p "$(dirname "$destination")"
+            completion_fish > "$destination"
+            ;;
+        *)
+            fail "cannot infer shell from SHELL=${SHELL:-}; use 'medusactl completion bash|zsh|fish'"
+            ;;
+    esac
+    printf "%s✓%s installed completion at %s\n" "$color_green" "$color_reset" "$destination"
+    if [[ "$shell_name" == "bash" ]]; then
+        info "Reload in this shell with: complete -r medusactl 2>/dev/null; source $destination"
+    elif [[ "$shell_name" == "zsh" ]]; then
+        info "Reload zsh completions by starting a new shell or running compinit again."
+    elif [[ "$shell_name" == "fish" ]]; then
+        info "Fish should pick this up automatically in new completions."
+    fi
+}
+
+refresh_installed_completions() {
+    local refreshed=0
+    local bash_path="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/medusactl"
+    local zsh_path="${ZDOTDIR:-$HOME}/.zfunc/_medusactl"
+    local fish_path="${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/medusactl.fish"
+
+    if [[ -f "$bash_path" && -w "$bash_path" ]]; then
+        completion_bash > "$bash_path"
+        info "Refreshed bash completion at $bash_path"
+        refreshed=1
+    fi
+    if [[ -f "$zsh_path" && -w "$zsh_path" ]]; then
+        completion_zsh > "$zsh_path"
+        info "Refreshed zsh completion at $zsh_path"
+        refreshed=1
+    fi
+    if [[ -f "$fish_path" && -w "$fish_path" ]]; then
+        completion_fish > "$fish_path"
+        info "Refreshed fish completion at $fish_path"
+        refreshed=1
+    fi
+
+    if [[ "$refreshed" -eq 1 ]]; then
+        info "Restart your shell or reload its completion function to use new completions."
+    fi
+}
+
+known_state_paths() {
+    printf "%s\n" \
+        "$CONFIG_FILE" \
+        "$CONFIG_DIR/controller.env" \
+        "$LOG_DIR" \
+        "$SSH_MUX_DIR" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/medusactl" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/medusa-controller" \
+        "${ZDOTDIR:-$HOME}/.zfunc/_medusactl" \
+        "${ZDOTDIR:-$HOME}/.zfunc/_medusa-controller" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/medusactl.fish" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions/medusa-controller.fish"
+}
+
+known_binary_paths() {
+    local installed
+    printf "%s\n" \
+        "$HOME/.local/bin/medusactl" \
+        "$HOME/.local/bin/medusa-controller"
+    installed=$(command -v medusactl || true)
+    if [[ -n "$installed" && -f "$installed" && "$installed" != "./"* && "$installed" != "../"* ]]; then
+        printf "%s\n" "$installed"
+    fi
+}
+
+remove_paths() {
+    local path removed=0 worktree
+    worktree=$(pwd -P)
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        [[ -e "$path" || -L "$path" ]] || continue
+        if [[ "$path" == "$worktree" || "$path" == "$worktree/"* ]]; then
+            warn "skipping working tree path: $path"
+            continue
+        fi
+        if ! home_path "$path"; then
+            warn "skipping non-home path: $path"
+            continue
+        fi
+        rm -rf "$path"
+        printf "removed %s\n" "$path"
+        removed=1
+    done
+    [[ "$removed" -eq 1 ]] || info "Nothing to remove."
+}
+
+cmd_clean() {
+    if ! confirm "Remove medusactl local config, logs, completions, and legacy controller CLI traces" "n"; then
+        fail "aborted by user"
+    fi
+    cmd_ssh_disconnect --quiet || true
+    known_state_paths | sort -u | remove_paths
+}
+
+cmd_undo() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl undo — restore inventory from the most recent snapshot, then
+                 re-render and re-apply controller-side blocks.
+
+Usage:
+  medusactl undo [--dry-run]
+
+Each mutating medusa command (add-host, remove-host, promote-host)
+auto-snapshots inventory before writing. 'undo' rewinds to the most
+recent snapshot. The restore is itself snapshotted so it can be undone
+in turn.
+
+With --dry-run, prints which files would be restored without writing.
+
+Exit codes: 0 success, non-zero on failure or if no snapshot exists.
+EOF
+        return 0
+    fi
+    load_config
+    local dry_run=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=1 ;;
+            *) fail "undo: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    local pre run_mode="apply"
+    if [[ "$dry_run" -eq 1 ]]; then
+        pre="uv run medusa undo-last --dry-run"
+        run_mode="dry-run"
+    else
+        pre="uv run medusa undo-last"
+    fi
+    _run_remote_with_render_and_apply "$pre" "undo" "$run_mode" \
+        || fail "undo failed"
+}
+
+cmd_list_backups() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl list-backups — list recent inventory snapshots on the controller.
+
+Usage:
+  medusactl list-backups [-n <N>] [--limit <N>]
+EOF
+        return 0
+    fi
+    load_config
+    local limit=20
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--limit)
+                shift
+                [[ $# -gt 0 ]] || fail "list-backups: --limit requires a number"
+                limit=$1
+                ;;
+            *) fail "list-backups: unknown flag '$1'" ;;
+        esac
+        shift
+    done
+    local target remote
+    local -a ssh_opts
+    target=$(ssh_target)
+    remote=$(remote_command "uv run --quiet medusa list-backups --limit $(printf %q "$limit")")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    if [[ ! -t 0 ]]; then
+        ssh_opts+=(-o BatchMode=yes)
+    fi
+    ssh "${ssh_opts[@]}" "$target" "$remote"
+}
+
+cmd_ssh_disconnect() {
+    local target quiet=0
+    if [[ "${1:-}" == "--quiet" ]]; then
+        quiet=1
+    fi
+    load_config
+    target=$(ssh_target)
+    if [[ -n "$SSH_CONFIG" ]]; then
+        [[ "$quiet" -eq 1 ]] || info "MEDUSACTL_SSH_CONFIG is set; ssh-disconnect is a no-op"
+        return 0
+    fi
+    if [[ ! -d "$SSH_MUX_DIR" ]]; then
+        [[ "$quiet" -eq 1 ]] || info "no persistent SSH master to close"
+        return 0
+    fi
+    local -a ssh_opts
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    if ssh "${ssh_opts[@]}" -O check "$target" >/dev/null 2>&1; then
+        ssh "${ssh_opts[@]}" -O exit "$target" >/dev/null 2>&1 || true
+        [[ "$quiet" -eq 1 ]] || printf "%s✓%s closed SSH master to %s\n" "$color_green" "$color_reset" "$target"
+    else
+        [[ "$quiet" -eq 1 ]] || info "no live SSH master to $target"
+    fi
+    find "$SSH_MUX_DIR" -maxdepth 1 -type s -name 'cp-*' -delete 2>/dev/null || true
+}
+
+cmd_uninstall() {
+    if ! confirm "Remove medusactl local state, completions, legacy traces, and installed binaries" "n"; then
+        fail "aborted by user"
+    fi
+    {
+        known_state_paths
+        known_binary_paths
+    } | sort -u | remove_paths
+}
+
+TEMP_FILES=()
+cleanup() {
+    local file
+    for file in "${TEMP_FILES[@]:-}"; do
+        rm -f "$file"
+    done
+    if [[ -n "${SSH_TARGET:-}" && -n "${CONTROL_PATH:-}" && -S "$CONTROL_PATH" ]]; then
+        ssh -O exit -o ControlPath="$CONTROL_PATH" "$SSH_TARGET" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "${CONTROL_DIR:-}" ]]; then
+        rm -rf "$CONTROL_DIR"
+    fi
+}
+trap cleanup EXIT
+
+case "${1:-}" in
+    -h|--help|"")
+        usage
+        ;;
+    -V|--version|version)
+        cmd_version
+        ;;
+    install-controller)
+        shift
+        cmd_install_controller "$@"
+        ;;
+    authorize-controller)
+        shift
+        cmd_authorize_controller "$@"
+        ;;
+    status)
+        shift
+        cmd_status "$@"
+        ;;
+    shell)
+        shift
+        cmd_shell "$@"
+        ;;
+    config)
+        shift
+        cmd_config "$@"
+        ;;
+    check)
+        shift
+        cmd_check "$@"
+        ;;
+    render)
+        shift
+        cmd_render "$@"
+        ;;
+    deploy)
+        shift
+        cmd_deploy "$@"
+        ;;
+    controller-apply)
+        shift
+        cmd_controller_apply "$@"
+        ;;
+    finalize-dns)
+        shift
+        cmd_finalize_dns "$@"
+        ;;
+    add-target)
+        shift
+        cmd_add_target "$@"
+        ;;
+    remove-target)
+        shift
+        cmd_remove_target "$@"
+        ;;
+    promote-target)
+        shift
+        cmd_promote_target "$@"
+        ;;
+    list-targets)
+        shift
+        cmd_list_targets "$@"
+        ;;
+    prep-target)
+        shift
+        cmd_prep_target "$@"
+        ;;
+    authorize-target)
+        shift
+        cmd_authorize_target "$@"
+        ;;
+    add-targets-from-file)
+        shift
+        cmd_add_targets_from_file "$@"
+        ;;
+    update)
+        shift
+        cmd_update "$@"
+        ;;
+    self-update)
+        shift
+        cmd_self_update "$@"
+        ;;
+    completion)
+        shift
+        cmd_completion "$@"
+        ;;
+    clean)
+        shift
+        cmd_clean "$@"
+        ;;
+    ssh-disconnect)
+        shift
+        cmd_ssh_disconnect "$@"
+        ;;
+    undo)
+        shift
+        cmd_undo "$@"
+        ;;
+    list-backups)
+        shift
+        cmd_list_backups "$@"
+        ;;
+    uninstall)
+        shift
+        cmd_uninstall "$@"
+        ;;
+    *)
+        fail "unknown command: $1"
+        ;;
+esac

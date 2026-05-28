@@ -1,0 +1,5 @@
+---
+- name: Restart CoreDNS
+  ansible.builtin.command:
+    cmd: "sudo -n systemctl restart {{ medusa_coredns_service_name }}"
+  when: medusa_coredns_restart | bool

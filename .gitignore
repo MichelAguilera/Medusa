@@ -1,0 +1,23 @@
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.ruff_cache/
+
+# Local environment and secret material referenced by Compose/Ansible.
+.env
+.env.*
+!.env.example
+*.secret
+
+# Ansible runtime/dependency artifacts.
+*.retry
+.ansible/
+ansible/.cache/
+ansible/collections/
+
+# Generated artifacts are never committed; they are produced from
+# inventory on the host that runs `medusa render`.
+/generated/

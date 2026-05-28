@@ -1,0 +1,9 @@
+---
+- name: Check generated artifacts are up to date
+  ansible.builtin.command:
+    cmd: uv run medusa check
+    chdir: "{{ medusa_project_root }}"
+  environment:
+    UV_CACHE_DIR: "{{ medusa_uv_cache_dir }}"
+  changed_when: false
+  check_mode: false

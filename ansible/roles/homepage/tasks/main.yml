@@ -1,0 +1,12 @@
+---
+- name: Ensure Homepage config directory exists
+  ansible.builtin.file:
+    path: "{{ medusa_homepage_config_dir }}"
+    state: directory
+    mode: "2775"
+
+- name: Deploy Homepage services config
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/homepage/{{ inventory_hostname }}/services.yaml"
+    dest: "{{ medusa_homepage_config_dir }}/services.yaml"
+    mode: "0664"

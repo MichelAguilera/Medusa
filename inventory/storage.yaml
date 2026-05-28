@@ -1,0 +1,15 @@
+# Demo storage layout: one NFS export on host01, mounted on host02 and
+# host03. Replace with your own exports and mounts; this file exists so
+# the pipeline has something to render against on a fresh clone.
+exports:
+- id: data
+  server: host01
+  path: /srv/data
+
+mounts:
+- id: data
+  host: [host02, host03]
+  export: data
+  mountpoint: /mnt/data
+  type: nfs
+  options: [rw, hard, vers=4.2, _netdev, nofail, x-systemd.automount, noatime]

@@ -1,0 +1,67 @@
+---
+- name: Load generated controller bootstrap bodies
+  ansible.builtin.set_fact:
+    controller_bootstrap_hosts_body: "{{ lookup('file', medusa_generated_dir + '/etc-hosts-bootstrap-block.txt', errors='ignore') }}"
+    controller_bootstrap_ssh_body: "{{ lookup('file', medusa_generated_dir + '/ssh-config-aliases.txt', errors='ignore') }}"
+
+- name: Resolve controller bootstrap state
+  ansible.builtin.set_fact:
+    controller_bootstrap_effective_state: "{{ controller_bootstrap_state | default('present') }}"
+    controller_bootstrap_home: "{{ lookup('env', 'HOME') }}"
+
+- name: Validate controller bootstrap state
+  ansible.builtin.assert:
+    that:
+      - controller_bootstrap_effective_state in ['present', 'absent']
+    fail_msg: "controller_bootstrap_state must be 'present' or 'absent'"
+
+- name: Preview /etc/hosts bootstrap block change
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark}"
+    marker_begin: "BEGIN MEDUSA BOOTSTRAP (managed by medusa; remove with 'medusactl finalize-dns')"
+    marker_end: "END MEDUSA BOOTSTRAP"
+    block: "{{ controller_bootstrap_hosts_body }}"
+    state: "{{ 'absent' if controller_bootstrap_effective_state == 'absent' or controller_bootstrap_hosts_body | trim == '' else 'present' }}"
+    create: false
+  check_mode: true
+  register: controller_bootstrap_hosts_preview
+
+- name: Back up /etc/hosts before bootstrap block change
+  ansible.builtin.copy:
+    src: /etc/hosts
+    dest: /etc/hosts.medusa-bootstrap-backup
+    remote_src: true
+    mode: "0644"
+  when:
+    - controller_bootstrap_hosts_preview.changed
+    - not ansible_check_mode
+
+- name: Apply /etc/hosts bootstrap block
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark}"
+    marker_begin: "BEGIN MEDUSA BOOTSTRAP (managed by medusa; remove with 'medusactl finalize-dns')"
+    marker_end: "END MEDUSA BOOTSTRAP"
+    block: "{{ controller_bootstrap_hosts_body }}"
+    state: "{{ 'absent' if controller_bootstrap_effective_state == 'absent' or controller_bootstrap_hosts_body | trim == '' else 'present' }}"
+    create: false
+
+- name: Ensure controller SSH config directory exists
+  ansible.builtin.file:
+    path: "{{ controller_bootstrap_home }}/.ssh"
+    state: directory
+    mode: "0700"
+  become: false
+
+- name: Apply controller SSH alias block
+  ansible.builtin.blockinfile:
+    path: "{{ controller_bootstrap_home }}/.ssh/config"
+    marker: "# {mark}"
+    marker_begin: "BEGIN MEDUSA SSH ALIASES (managed by medusactl)"
+    marker_end: "END MEDUSA SSH ALIASES"
+    block: "{{ controller_bootstrap_ssh_body }}"
+    state: "{{ 'absent' if controller_bootstrap_effective_state == 'absent' or controller_bootstrap_ssh_body | trim == '' else 'present' }}"
+    create: true
+    mode: "0600"
+  become: false

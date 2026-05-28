@@ -1,0 +1,34 @@
+---
+# Local checkout root. playbook_dir is ansible/playbooks.
+medusa_project_root: "{{ playbook_dir }}/../.."
+medusa_generated_dir: "{{ medusa_project_root }}/generated"
+medusa_uv_cache_dir: /tmp/medusa-uv-cache
+
+# Keep deployed homelab-managed files under the remote user's home directory.
+# The manual stacks directory is intentionally left alone; generated Compose
+# stacks are deployed beneath medusa-stacks.
+medusa_remote_user: michelaguilera
+medusa_home_root: "/home/{{ medusa_remote_user }}"
+medusa_deploy_root: "{{ medusa_home_root }}/medusa"
+medusa_deploy_group: homelab
+medusa_deploy_owner: ansible
+medusa_managed_stacks_root: "{{ medusa_home_root }}/medusa-stacks"
+
+# Deployment destinations. These are intentionally centralized because homelab
+# paths tend to be host-specific.
+medusa_coredns_config_dir: "/etc/coredns"
+medusa_traefik_dynamic_dir: "{{ medusa_managed_stacks_root }}/infrastructure/traefik/dynamic"
+medusa_homepage_config_dir: "{{ medusa_managed_stacks_root }}/infrastructure/homepage/config"
+medusa_monitoring_config_dir: "{{ medusa_deploy_root }}/monitoring"
+medusa_compose_stacks_root: "{{ medusa_managed_stacks_root }}"
+
+# Service names on the target hosts.
+medusa_coredns_service_name: coredns
+medusa_coredns_restart: true
+medusa_traefik_service_name: traefik
+
+# Compose lifecycle is deployment behavior, not Medusa generation behavior.
+# Use deploy.yml with this false to only copy files, or compose-up/stop.yml
+# to intentionally change runtime state.
+medusa_compose_apply: false
+medusa_compose_state: present

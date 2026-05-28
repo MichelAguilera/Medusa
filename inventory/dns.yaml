@@ -1,0 +1,25 @@
+# Demo inventory shipped with the public Medusa release. Replace with
+# your own hosts and zones; this file exists so a fresh clone can run
+# `medusa validate` and `medusa render` end-to-end without editing
+# anything first.
+zones:
+- name: lan
+  upstreams: [9.9.9.9, 1.1.1.1]
+
+hosts:
+- name: host01
+  ip: 10.0.0.10
+  zones: [lan]
+  aliases: [storage]
+- name: host02
+  ip: 10.0.0.20
+  zones: [lan]
+  aliases: []
+- name: host03
+  ip: 10.0.0.30
+  zones: [lan]
+  aliases: []
+- name: dns01
+  ip: 10.0.0.250
+  zones: [lan]
+  aliases: [dns]

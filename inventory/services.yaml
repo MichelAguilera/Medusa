@@ -1,0 +1,77 @@
+# Demo services. Two stacks ship by default: a reverse-proxied web app
+# and a homepage dashboard. The shapes here are the public surface of
+# the model — replace the contents with your own services once the
+# pipeline runs end-to-end on your inventory.
+
+presets:
+  proxied-web:
+    compose:
+      networks:
+      - proxy
+    route:
+      entrypoints:
+      - web
+      tls: false
+
+services:
+- id: host02-infra-01-traefik
+  name: traefik
+  host: host02
+  stack: infra
+  proxy: traefik
+  image: traefik:v3.6.1
+  compose:
+    restart: always
+    command:
+    - --api.dashboard=true
+    - --api.insecure=true
+    - --entrypoints.web.address=:80
+    - --providers.file.directory=/etc/traefik/dynamic
+    - --providers.file.watch=true
+    ports:
+    - 80:80
+    - 8080:8080
+    volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    - /opt/traefik/dynamic:/etc/traefik/dynamic:ro
+    networks:
+    - proxy
+
+- id: host02-apps-01-homepage
+  name: homepage
+  host: host02
+  stack: apps
+  use:
+  - proxied-web
+  image: ghcr.io/gethomepage/homepage:v1.0.0
+  compose:
+    restart: unless-stopped
+    volumes:
+    - ./homepage/config:/app/config
+  settings:
+    HOMEPAGE_ALLOWED_HOSTS: home.demo.lan
+  route:
+    host: home.demo.lan
+    port: 3000
+    name: home
+
+- id: host02-apps-02-gitea
+  name: gitea
+  host: host02
+  stack: apps
+  use:
+  - proxied-web
+  image: gitea/gitea:1.22
+  compose:
+    restart: unless-stopped
+    volumes:
+    - ./gitea/data:/data
+    - /mnt/data/gitea:/data/git
+  settings:
+    GITEA__server__ROOT_URL: http://gitea.demo.lan/
+    USER_UID: '1000'
+    USER_GID: '1000'
+  route:
+    host: gitea.demo.lan
+    port: 3000
+    name: gitea

@@ -1,0 +1,41 @@
+---
+- name: Stage CoreDNS Corefile
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/coredns/Corefile"
+    dest: /tmp/medusa-coredns-Corefile
+    mode: "0644"
+
+- name: Stage CoreDNS LAN hosts file
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/coredns/lan.hosts"
+    dest: /tmp/medusa-coredns-lan.hosts
+    mode: "0644"
+
+- name: Ensure CoreDNS config directory exists
+  ansible.builtin.command:
+    cmd: "sudo -n install -d -m 0755 {{ medusa_coredns_config_dir }}"
+  changed_when: false
+
+- name: Deploy CoreDNS Corefile
+  ansible.builtin.command:
+    cmd: >-
+      sudo -n install -m 0644 /tmp/medusa-coredns-Corefile
+      {{ medusa_coredns_config_dir }}/Corefile
+  changed_when: true
+  notify: Restart CoreDNS
+
+- name: Deploy CoreDNS LAN hosts file
+  ansible.builtin.command:
+    cmd: >-
+      sudo -n install -m 0644 /tmp/medusa-coredns-lan.hosts
+      {{ medusa_coredns_config_dir }}/lan.hosts
+  changed_when: true
+  notify: Restart CoreDNS
+
+- name: Remove staged CoreDNS files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /tmp/medusa-coredns-Corefile
+    - /tmp/medusa-coredns-lan.hosts

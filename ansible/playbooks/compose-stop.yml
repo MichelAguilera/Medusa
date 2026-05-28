@@ -1,0 +1,9 @@
+---
+- name: Stop Compose stacks
+  hosts: docker_hosts
+  gather_facts: false
+  vars:
+    medusa_compose_apply: true
+    medusa_compose_state: stopped
+  roles:
+    - compose

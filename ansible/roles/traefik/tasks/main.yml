@@ -1,0 +1,12 @@
+---
+- name: Ensure Traefik dynamic config directory exists
+  ansible.builtin.file:
+    path: "{{ medusa_traefik_dynamic_dir }}"
+    state: directory
+    mode: "2775"
+
+- name: Deploy Traefik dynamic config
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/traefik/{{ inventory_hostname }}/dynamic.yaml"
+    dest: "{{ medusa_traefik_dynamic_dir }}/medusa-dynamic.yaml"
+    mode: "0664"

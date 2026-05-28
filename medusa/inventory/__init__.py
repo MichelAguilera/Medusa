@@ -1,0 +1,1 @@
+"""Inventory loading and validation."""

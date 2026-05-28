@@ -1,0 +1,10 @@
+{# Human-authored template. The rendered output is generated. #}
+{# Per-host Host blocks for inclusion in ~/.ssh/config on the controller. #}
+{% for host in managed_hosts %}
+Host {{ host.name }}
+  HostName {{ host.hostname }}
+  User {{ host.ansible_user }}
+{% if not loop.last %}
+
+{% endif %}
+{% endfor %}

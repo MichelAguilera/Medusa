@@ -1,0 +1,10 @@
+{# Human-authored template. The rendered output is generated. #}
+{# Body lines only. Marker fences are added at apply time via #}
+{# the controller bootstrap Ansible role so the same block can be #}
+{# replaced or removed cleanly. #}
+{# Emits only hosts with bootstrap_ip set: the temporary cutover address #}
+{# used while DNS is not yet authoritative for that host. Once promoted #}
+{# (`medusa promote-host`), the entry disappears here. #}
+{% for host in bootstrap_hosts %}
+{{ host.ip }} {{ host.hostname }} {{ host.name }}
+{% endfor %}

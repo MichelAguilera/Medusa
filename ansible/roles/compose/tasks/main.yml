@@ -1,0 +1,75 @@
+---
+- name: Find generated Compose stack files
+  ansible.builtin.find:
+    paths: "{{ medusa_generated_dir }}/compose"
+    patterns: docker-compose.yml
+    recurse: true
+    file_type: file
+  delegate_to: localhost
+  become: false
+  register: medusa_compose_files
+
+- name: Ensure Compose stack directories exist
+  ansible.builtin.file:
+    path: >-
+      {{ medusa_compose_stacks_root }}/{{ item.path
+      | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}
+    state: directory
+    mode: "2775"
+  loop: "{{ medusa_compose_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+
+- name: Deploy Compose stack files
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: >-
+      {{ medusa_compose_stacks_root }}/{{ item.path
+      | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}/docker-compose.yml
+    mode: "0664"
+  loop: "{{ medusa_compose_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+
+- name: Find generated managed environment files
+  ansible.builtin.find:
+    paths: "{{ medusa_generated_dir }}/compose"
+    patterns: "*.env"
+    recurse: true
+    file_type: file
+  delegate_to: localhost
+  become: false
+  register: medusa_compose_env_files
+
+- name: Ensure generated managed environment directories exist
+  ansible.builtin.file:
+    path: >-
+      {{ medusa_compose_stacks_root }}/{{ item.path
+      | regex_replace('^' ~ medusa_generated_dir ~ '/compose/(.*)/env/[^/]+$', '\1/env') }}
+    state: directory
+    mode: "2775"
+  loop: "{{ medusa_compose_env_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+
+- name: Deploy generated managed environment files
+  ansible.builtin.copy:
+    src: "{{ item.path }}"
+    dest: >-
+      {{ medusa_compose_stacks_root }}/{{ item.path
+      | regex_replace('^' ~ medusa_generated_dir ~ '/compose/(.*)$', '\1') }}
+    mode: "0664"
+  loop: "{{ medusa_compose_env_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+
+- name: Apply Compose stack state
+  community.docker.docker_compose_v2:
+    project_src: >-
+      {{ medusa_compose_stacks_root }}/{{ item.path
+      | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}
+    state: "{{ medusa_compose_state }}"
+  loop: "{{ medusa_compose_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+  when: medusa_compose_apply | bool
