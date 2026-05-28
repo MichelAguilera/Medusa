@@ -184,6 +184,7 @@ def _hosts_equal(a: Any, b: Any) -> bool:
     keys = {
         "name",
         "ip",
+        "bootstrap_ip",
         "zones",
         "aliases",
         "ansible_user",
