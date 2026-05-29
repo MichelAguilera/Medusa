@@ -1,0 +1,10 @@
+---
+# Seconds the host waits before auto-reverting the netplan change if the
+# controller does not confirm a good cutover (identity-verified reachability
+# at the canonical IP). The revert fires from a transient systemd timer on
+# the host, independent of the SSH session that the IP change severs.
+medusa_netplan_rollback_seconds: 120
+
+# Path of the Medusa-managed netplan file on the target. Numbered high so it
+# wins over distro defaults; removing it is what the rollback restores to.
+medusa_netplan_path: /etc/netplan/60-medusa.yaml

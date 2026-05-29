@@ -11,4 +11,5 @@ class AnsibleGroupsModel(BaseModel):
     traefik_hosts: tuple[str, ...]
     homepage_hosts: tuple[str, ...]
     monitoring_hosts: tuple[str, ...]
+    managed_network_hosts: tuple[str, ...]
     groups: tuple[tuple[str, tuple[str, ...]], ...]

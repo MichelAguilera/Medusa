@@ -1,0 +1,16 @@
+---
+# Post-apply health check for the guarded CoreDNS config deploy (T-056).
+# CoreDNS at the canonical DNS IP is the live resolver for the whole LAN, so
+# a bad Corefile/zone must not be left in place. After restart the role
+# health-checks and, on failure, restores the backed-up config.
+#
+# Liveness is always checked (CoreDNS must answer on :53). If
+# medusa_coredns_healthcheck_name is set, the role also asserts that name
+# resolves -- and, when medusa_coredns_healthcheck_expect is also set, that it
+# resolves to that exact address. Set these in group_vars to the managed
+# CoreDNS host's own record for a real correctness check, e.g.:
+#   medusa_coredns_healthcheck_name: coredns.lan
+#   medusa_coredns_healthcheck_expect: 10.0.0.250
+medusa_coredns_healthcheck_name: ""
+medusa_coredns_healthcheck_expect: ""
+medusa_coredns_healthcheck_server: 127.0.0.1

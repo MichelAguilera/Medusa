@@ -1,4 +1,9 @@
-from medusa.inventory.dns import DnsInventory
+from medusa.inventory.dns import (
+    DnsInventory,
+    HostInventory,
+    NetworkConfig,
+    resolve_host_network,
+)
 from medusa.inventory.homepage import HomepageInventory
 from medusa.inventory.services import ServicesInventory
 from medusa.inventory.storage import StorageInventory
@@ -8,11 +13,12 @@ from medusa.model.compose import (
     validate_service_mount_refs,
 )
 from medusa.model.coredns import CorednsModel
-from medusa.model.dns import DnsModel, DnsZone, HostRecord, ManagedMode
+from medusa.model.dns import DnsModel, DnsZone, HostNetwork, HostRecord, ManagedMode
 from medusa.model.groups import AnsibleGroupsModel
-from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
 from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
+from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
+from medusa.model.network import NetworkHost, NetworkModel
 from medusa.model.services import ServiceRecord, ServicesModel, TraefikRoute
 from medusa.model.settings import generated_env_files, secret_sources
 from medusa.model.storage import (
@@ -37,6 +43,23 @@ def _derive_managed_mode(
         # treated as long-lived limited hosts.
         return ManagedMode.LIMITED
     return ManagedMode(ansible_managed_mode)
+
+
+def _resolve_network(
+    host: HostInventory, defaults: NetworkConfig | None
+) -> HostNetwork | None:
+    # resolve_host_network owns the override+default merge and all validation
+    # (already exercised by the inventory validator). Map its result onto the
+    # normalized model type; None for hosts that did not opt in.
+    resolved = resolve_host_network(host, defaults)
+    if resolved is None:
+        return None
+    return HostNetwork(
+        interface=resolved.interface,
+        prefix=resolved.prefix,
+        gateway=resolved.gateway,
+        nameservers=resolved.nameservers,
+    )
 
 
 def normalize_dns(inventory: DnsInventory) -> DnsModel:
@@ -69,6 +92,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             managed_mode=_derive_managed_mode(
                 host.ansible_user, host.ansible_managed_mode
             ),
+            network=_resolve_network(host, inventory.network),
         )
         for host in inventory.hosts
     )
@@ -125,6 +149,28 @@ def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
     return AnsibleInventoryModel(
         managed_hosts=tuple(managed),
         bootstrap_hosts=tuple(bootstrap),
+    )
+
+
+def normalize_network(dns_model: DnsModel) -> NetworkModel:
+    """Build the static-networking model from hosts that opted in
+    (``manage_network: true``, surfaced as ``HostRecord.network``). The
+    canonical ip and prefix are joined into a CIDR ``address`` here so the
+    renderer/template only formats. Hosts that did not opt in contribute
+    nothing; the model is empty when none did. See T-055."""
+    return NetworkModel(
+        hosts=tuple(
+            NetworkHost(
+                name=host.name,
+                ip=host.ip,
+                address=f"{host.ip}/{host.network.prefix}",
+                interface=host.network.interface,
+                gateway=host.network.gateway,
+                nameservers=host.network.nameservers,
+            )
+            for host in dns_model.hosts
+            if host.network is not None
+        )
     )
 
 
@@ -564,11 +610,15 @@ def normalize_ansible_groups(
         coredns_hosts = tuple(
             host.name for host in dns_model.hosts if host.name == "coredns"
         )
+    managed_network_hosts = tuple(
+        sorted(host.name for host in dns_model.hosts if host.network is not None)
+    )
 
     fields: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("coredns_hosts", tuple(sorted(coredns_hosts))),
         ("docker_hosts", docker_hosts),
         ("homepage_hosts", homepage_model.hosts),
+        ("managed_network_hosts", managed_network_hosts),
         ("monitoring_hosts", monitoring_model.hosts),
         ("nfs_export_hosts", nfs_export_hosts),
         ("storage_hosts", storage_hosts),
@@ -583,6 +633,7 @@ def normalize_ansible_groups(
         traefik_hosts=_platform_hosts(services_model, {"traefik"}),
         homepage_hosts=homepage_model.hosts,
         monitoring_hosts=monitoring_model.hosts,
+        managed_network_hosts=managed_network_hosts,
         groups=fields,
     )
 

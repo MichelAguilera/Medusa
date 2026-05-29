@@ -1,0 +1,151 @@
+---
+# T-055 stage 3: guarded DHCP -> static cutover for managed-network hosts.
+#
+# DANGER: this changes the host's primary IP, which severs the controller's
+# SSH session. Safety model:
+#   1. Only opted-in hosts reach here (managed_network_hosts group); a Proxmox
+#      / bridge guard refuses anyway as defense in depth.
+#   2. Before applying, the host arms a transient systemd timer that reverts
+#      the netplan change after medusa_netplan_rollback_seconds unless the
+#      controller cancels it. The revert runs on the host, so it survives the
+#      severed SSH session and a host left unreachable heals itself.
+#   3. After apply, the controller reconnects at the CANONICAL ip and verifies
+#      IDENTITY (machine-id), not mere reachability -- a stale occupant still
+#      holding the canonical IP (e.g. the old DNS box on .250) would answer a
+#      ping but fail the machine-id match. On any failure the timer is left to
+#      fire and the host reverts; the play fails gracefully for that host.
+#   4. Idempotent: once the host already holds its canonical IP and the netplan
+#      file is unchanged, no apply runs.
+
+- name: Load generated network manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/network-manifest.yaml"
+    name: medusa_network_manifest
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Select managed network config for this host
+  ansible.builtin.set_fact:
+    medusa_net: "{{ medusa_network_manifest.hosts[inventory_hostname] }}"
+
+- name: Detect Proxmox host
+  ansible.builtin.stat:
+    path: /etc/pve
+  register: medusa_pve
+  become: true
+
+- name: Refuse cutover on Proxmox or bridge/bond interfaces
+  ansible.builtin.fail:
+    msg: >-
+      Refusing managed-network cutover on {{ inventory_hostname }}:
+      {{ 'host is Proxmox (/etc/pve present)' if medusa_pve.stat.exists
+         else 'interface ' ~ medusa_net.interface ~ ' looks like a bridge/bond' }}.
+      Medusa does not reconfigure Proxmox or bridge/bond networking. Unset
+      manage_network for this host.
+  when: >-
+    medusa_pve.stat.exists
+    or medusa_net.interface is match('^(vmbr|br|bond)')
+
+- name: Capture target identity before cutover (machine-id)
+  ansible.builtin.slurp:
+    src: /etc/machine-id
+  register: medusa_machineid_before
+  become: true
+
+- name: Detect current addresses on the managed interface
+  ansible.builtin.command:
+    cmd: "ip -o -4 addr show dev {{ medusa_net.interface }}"
+  changed_when: false
+  failed_when: false
+  become: true
+  register: medusa_current_addr
+
+- name: Write managed netplan (not yet applied)
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/network/{{ inventory_hostname }}/medusa.yaml"
+    dest: "{{ medusa_netplan_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  register: medusa_netplan_file
+
+- name: Validate netplan syntax before applying
+  ansible.builtin.command:
+    cmd: netplan generate
+  changed_when: false
+  become: true
+
+- name: Decide whether a cutover is needed
+  ansible.builtin.set_fact:
+    # Already converged when the canonical IP is live on the interface AND the
+    # managed netplan file did not change this run.
+    medusa_cutover_needed: >-
+      {{ (medusa_net.ip not in medusa_current_addr.stdout)
+         or medusa_netplan_file.changed }}
+
+- name: Guarded cutover to canonical static IP
+  when: medusa_cutover_needed | bool
+  block:
+    - name: Arm host-side auto-rollback timer
+      ansible.builtin.command:
+        cmd: >-
+          systemd-run --on-active={{ medusa_netplan_rollback_seconds }}
+          --unit=medusa-netplan-rollback --collect
+          /bin/sh -c 'rm -f {{ medusa_netplan_path }} && netplan apply'
+      changed_when: true
+      become: true
+
+    - name: Apply netplan (severs the current SSH session)
+      ansible.builtin.command:
+        cmd: netplan apply
+      become: true
+      async: 1
+      poll: 0
+      changed_when: true
+
+    - name: Point the connection at the canonical IP
+      ansible.builtin.set_fact:
+        ansible_host: "{{ medusa_net.ip }}"
+
+    - name: Reset the connection so it reconnects at the canonical IP
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for the host to answer at the canonical IP
+      ansible.builtin.wait_for_connection:
+        timeout: "{{ medusa_netplan_rollback_seconds - 20 }}"
+
+    - name: Capture identity after cutover (machine-id at canonical IP)
+      ansible.builtin.slurp:
+        src: /etc/machine-id
+      register: medusa_machineid_after
+      become: true
+
+    - name: Verify the canonical IP is THIS host, not a stale occupant
+      ansible.builtin.assert:
+        that:
+          - medusa_machineid_after.content == medusa_machineid_before.content
+        fail_msg: >-
+          Identity mismatch after cutover: the host answering at
+          {{ medusa_net.ip }} is not {{ inventory_hostname }}. A different
+          machine still holds the canonical IP (e.g. an old box not yet
+          retired). Leaving the auto-rollback to fire; retire the occupant
+          first. See T-056.
+        success_msg: "Cutover identity-verified for {{ inventory_hostname }}."
+
+    - name: Cancel the auto-rollback (cutover confirmed)
+      ansible.builtin.command:
+        cmd: systemctl stop medusa-netplan-rollback.timer
+      changed_when: true
+      become: true
+      failed_when: false
+
+  rescue:
+    - name: Report graceful cutover failure
+      ansible.builtin.fail:
+        msg: >-
+          Cutover failed for {{ inventory_hostname }} ({{ medusa_net.ip }}).
+          The host-side rollback timer will revert it to its previous address
+          within {{ medusa_netplan_rollback_seconds }}s, so it is not
+          stranded. Other hosts continue. Investigate before retrying.

@@ -29,6 +29,20 @@ class DnsZone(BaseModel):
     forwarder_tls_servername: str | None = None
 
 
+class HostNetwork(BaseModel):
+    """Resolved static-networking config for a host that opted into
+    Medusa-managed networking (``manage_network: true``). Built in
+    normalization by merging the host's override over the global defaults;
+    ``None`` on HostRecord for any host that did not opt in. See T-055."""
+
+    model_config = ConfigDict(frozen=True)
+
+    interface: str
+    prefix: int
+    gateway: str
+    nameservers: tuple[str, ...]
+
+
 class HostRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -47,6 +61,9 @@ class HostRecord(BaseModel):
     ansible_user: str | None = None
     ansible_groups: tuple[str, ...] = ()
     managed_mode: ManagedMode = ManagedMode.NONE
+    # Resolved static-networking config, set only for hosts that opted into
+    # managed networking (manage_network: true). None otherwise. See T-055.
+    network: HostNetwork | None = None
 
     @property
     def is_ansible_managed(self) -> bool:

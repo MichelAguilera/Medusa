@@ -77,6 +77,14 @@ class HostFields:
     ansible_groups: tuple[str, ...] = ()
     ansible_managed_mode: Literal["full", "limited"] | None = None
     bootstrap_ip: str | None = None
+    # Managed static-networking opt-in + optional per-host override. Unset
+    # override fields fall back to the global `network:` defaults at
+    # validation time (resolve_host_network). See T-055.
+    manage_network: bool = False
+    net_interface: str | None = None
+    net_prefix: int | None = None
+    net_gateway: str | None = None
+    net_nameservers: tuple[str, ...] = ()
 
 
 def find_host_index(doc: CommentedMap, name: str) -> int | None:
@@ -175,6 +183,20 @@ def _serialize_host(fields: HostFields) -> CommentedMap:
         out["ansible_groups"].fa.set_flow_style()
     if fields.ansible_managed_mode is not None:
         out["ansible_managed_mode"] = fields.ansible_managed_mode
+    if fields.manage_network:
+        out["manage_network"] = True
+    network = CommentedMap()
+    if fields.net_interface is not None:
+        network["interface"] = fields.net_interface
+    if fields.net_prefix is not None:
+        network["prefix"] = fields.net_prefix
+    if fields.net_gateway is not None:
+        network["gateway"] = fields.net_gateway
+    if fields.net_nameservers:
+        network["nameservers"] = CommentedSeq(fields.net_nameservers)
+        network["nameservers"].fa.set_flow_style()
+    if network:
+        out["network"] = network
     return out
 
 
@@ -190,6 +212,8 @@ def _hosts_equal(a: Any, b: Any) -> bool:
         "ansible_user",
         "ansible_groups",
         "ansible_managed_mode",
+        "manage_network",
+        "network",
     }
     return {k: _normalize_field(a.get(k)) for k in keys} == {
         k: _normalize_field(b.get(k)) for k in keys

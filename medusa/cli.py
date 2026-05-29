@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from medusa.diagnostics import (
     Diagnostic,
     Severity,
+    coredns_target_diagnostics,
     diagnostic_errors,
     diagnostic_warnings,
     service_diagnostics,
@@ -53,6 +54,7 @@ from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.homepage import HomepageModel
 from medusa.model.hosts import AnsibleInventoryModel
 from medusa.model.monitoring import MonitoringModel
+from medusa.model.network import NetworkModel
 from medusa.model.normalize import (
     normalize_ansible_groups,
     normalize_ansible_inventory,
@@ -60,6 +62,7 @@ from medusa.model.normalize import (
     normalize_dns,
     normalize_homepage,
     normalize_monitoring,
+    normalize_network,
     normalize_services,
     normalize_storage,
 )
@@ -74,6 +77,7 @@ from medusa.render.docs import render_docs
 from medusa.render.homepage import render_homepage
 from medusa.render.hosts import render_hosts
 from medusa.render.monitoring import render_monitoring
+from medusa.render.network import render_network
 from medusa.render.nginx import render_nginx
 from medusa.render.secrets import render_secrets_manifest
 from medusa.render.storage import render_storage_manifest
@@ -105,6 +109,7 @@ class _Inventory:
     groups_model: AnsibleGroupsModel
     coredns_model: CorednsModel
     ansible_inventory_model: AnsibleInventoryModel
+    network_model: NetworkModel
 
 
 def _env_path(name: str) -> Path | None:
@@ -150,8 +155,12 @@ def _load_all(
     groups_model = normalize_ansible_groups(
         dns_model, services_model, storage_model, homepage_model, monitoring_model
     )
+    # Surface the silent DNS-target gap (coredns_hosts member with no
+    # ansible_user -> config renders but never deploys). Warning-only.
+    on_diagnostics(coredns_target_diagnostics(dns_model, groups_model))
     coredns_model = normalize_coredns(dns_model, services_model)
     ansible_inventory_model = normalize_ansible_inventory(dns_model)
+    network_model = normalize_network(dns_model)
 
     return _Inventory(
         paths=paths,
@@ -164,6 +173,7 @@ def _load_all(
         groups_model=groups_model,
         coredns_model=coredns_model,
         ansible_inventory_model=ansible_inventory_model,
+        network_model=network_model,
     )
 
 
@@ -207,6 +217,7 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),
         **render_ansible_groups(loaded.groups_model, templates_dir, generated_dir),
         **render_hosts(loaded.ansible_inventory_model, templates_dir, generated_dir),
+        **render_network(loaded.network_model, templates_dir, generated_dir),
         **render_docs(
             loaded.dns_model,
             services_model,
@@ -568,6 +579,30 @@ def add_host_cmd(
             "and must be deliberate."
         ),
     ),
+    manage_network: bool = typer.Option(
+        False,
+        "--manage-network",
+        help=(
+            "Opt this host into Medusa-managed static networking. Medusa "
+            "renders a netplan and performs a guarded DHCP->static cutover "
+            "to --ip during deploy. Override fields fall back to the global "
+            "network: defaults. NEVER set on Proxmox/bridge hosts."
+        ),
+    ),
+    net_interface: str | None = typer.Option(
+        None, "--net-interface", help="Per-host network override: NIC name."
+    ),
+    net_prefix: int | None = typer.Option(
+        None, "--net-prefix", help="Per-host network override: CIDR prefix length."
+    ),
+    net_gateway: str | None = typer.Option(
+        None, "--net-gateway", help="Per-host network override: default gateway."
+    ),
+    net_nameserver: list[str] = typer.Option(
+        [],
+        "--net-nameserver",
+        help="Per-host network override: nameserver. Repeat for multiple.",
+    ),
     force: bool = typer.Option(
         False,
         "--force",
@@ -587,6 +622,13 @@ def add_host_cmd(
             _fail("--managed-mode must be 'full' or 'limited'")
         if ansible_user is None:
             _fail("--managed-mode requires --ansible-user")
+    if not manage_network and (
+        net_interface is not None
+        or net_prefix is not None
+        or net_gateway is not None
+        or net_nameserver
+    ):
+        _fail("--net-* overrides require --manage-network")
     try:
         doc = load_dns_doc(paths.dns_inventory)
         fields = HostFields(
@@ -598,6 +640,11 @@ def add_host_cmd(
             ansible_groups=tuple(ansible_group),
             ansible_managed_mode=managed_mode,  # type: ignore[arg-type]
             bootstrap_ip=bootstrap_ip,
+            manage_network=manage_network,
+            net_interface=net_interface,
+            net_prefix=net_prefix,
+            net_gateway=net_gateway,
+            net_nameservers=tuple(net_nameserver),
         )
         mutated = add_host(doc, fields, replace=force)
         if not mutated:
