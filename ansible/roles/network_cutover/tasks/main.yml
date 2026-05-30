@@ -4,23 +4,24 @@
 # (netplan/ifupdown/NetworkManager); it installs systemd-networkd +
 # systemd-resolved and moves the managed NIC onto them. See T-060.
 #
-# DANGER: this changes the host's primary IP, which severs the controller's
-# SSH session. Safety model:
+# ADDITIVE cutover: networkd brings the canonical IP up ALONGSIDE the existing
+# DHCP address, so the controller's connection never drops. Only after the
+# canonical IP is reachable AND identity-verified do we remove the old address
+# and neutralize ifupdown. A failed canonical IP therefore never touches the
+# working DHCP address -- the host stays online and the play fails cleanly.
+#
+# Safety model:
 #   1. Only opted-in hosts reach here (managed_network_hosts group); a Proxmox
 #      / bridge guard refuses anyway as defense in depth.
-#   2. Before applying, the host arms a transient systemd timer that reverts
-#      to the pre-cutover state (restores /etc/network/interfaces + resolv.conf,
-#      removes the networkd unit, disables networkd, brings ifupdown back) after
-#      medusa_net_rollback_seconds unless the controller cancels it. The revert
-#      runs on the host, so it survives the severed SSH session and a host left
-#      unreachable heals itself.
-#   3. After apply, the controller reconnects at the CANONICAL ip and verifies
-#      IDENTITY (machine-id), not mere reachability -- a stale occupant still
-#      holding the canonical IP would answer a ping but fail the machine-id
-#      match. On any failure the timer is left to fire and the host reverts;
-#      the play fails gracefully for that host.
+#   2. The canonical IP is added first and verified by reconnecting at it and
+#      checking /etc/machine-id (identity, not mere reachability) -- a stale
+#      occupant holding the IP would answer a ping but fail the match.
+#   3. Before the (now low-risk) teardown of the old address, the host arms a
+#      transient systemd timer that restores the pre-cutover state after
+#      medusa_net_rollback_seconds unless the controller cancels it. It runs on
+#      the host, so a host left unreachable heals itself.
 #   4. Idempotent: once the host already holds its canonical IP and the networkd
-#      unit is unchanged, no apply runs.
+#      unit is unchanged, no cutover runs.
 
 - name: Load generated network manifest
   ansible.builtin.include_vars:
@@ -66,6 +67,13 @@
   become: true
   register: medusa_current_addr
 
+- name: Ensure systemd-resolved is installed
+  ansible.builtin.apt:
+    name: systemd-resolved
+    state: present
+    update_cache: true
+  become: true
+
 - name: Write managed systemd-networkd unit (inert until networkd starts)
   ansible.builtin.copy:
     src: "{{ medusa_generated_dir }}/network/{{ inventory_hostname }}/medusa.network"
@@ -84,7 +92,7 @@
       {{ (medusa_net.ip not in medusa_current_addr.stdout)
          or medusa_networkd_file.changed }}
 
-- name: Guarded cutover to canonical static IP
+- name: Guarded additive cutover to canonical static IP
   when: medusa_cutover_needed | bool
   block:
     - name: Back up pre-cutover /etc/network/interfaces (once)
@@ -98,7 +106,7 @@
         mode: "0644"
       become: true
 
-    - name: Back up pre-cutover /etc/resolv.conf (once)
+    - name: Back up pre-cutover /etc/resolv.conf (once, before relinking)
       ansible.builtin.copy:
         src: /etc/resolv.conf
         dest: "{{ medusa_resolv_backup }}"
@@ -106,11 +114,82 @@
         force: false
       become: true
 
-    - name: Ensure systemd-resolved is installed
-      ansible.builtin.apt:
+    - name: Enable systemd-resolved
+      ansible.builtin.systemd_service:
         name: systemd-resolved
-        state: present
-        update_cache: true
+        enabled: true
+        state: started
+      become: true
+
+    - name: Point resolv.conf at the systemd-resolved stub
+      ansible.builtin.file:
+        src: /run/systemd/resolve/stub-resolv.conf
+        dest: /etc/resolv.conf
+        state: link
+        force: true
+      become: true
+
+    - name: Enable and start systemd-networkd (adds the canonical IP)
+      # Additive: networkd configures the canonical IP alongside the existing
+      # DHCP address; the current SSH session (on the old address) survives.
+      ansible.builtin.systemd_service:
+        name: systemd-networkd
+        enabled: true
+        state: started
+      become: true
+
+    - name: Wait for the canonical IP to appear on the interface
+      ansible.builtin.command:
+        cmd: "ip -o -4 addr show dev {{ medusa_net.interface }}"
+      changed_when: false
+      become: true
+      register: medusa_addr_check
+      until: medusa_net.ip in medusa_addr_check.stdout
+      retries: 15
+      delay: 2
+
+    - name: Point the connection at the canonical IP
+      ansible.builtin.set_fact:
+        ansible_host: "{{ medusa_net.ip }}"
+
+    - name: Reset the connection so it reconnects at the canonical IP
+      ansible.builtin.meta: reset_connection
+
+    - name: Wait for the host to answer at the canonical IP
+      ansible.builtin.wait_for_connection:
+        timeout: 60
+
+    - name: Capture identity after cutover (machine-id at canonical IP)
+      ansible.builtin.slurp:
+        src: /etc/machine-id
+      register: medusa_machineid_after
+      become: true
+
+    - name: Verify the canonical IP is THIS host, not a stale occupant
+      ansible.builtin.assert:
+        that:
+          - medusa_machineid_after.content == medusa_machineid_before.content
+        fail_msg: >-
+          Identity mismatch after cutover: the host answering at
+          {{ medusa_net.ip }} is not {{ inventory_hostname }}. A different
+          machine still holds the canonical IP (e.g. an old box not yet
+          retired). The old address is still up; retire the occupant first.
+        success_msg: "Cutover identity-verified for {{ inventory_hostname }}."
+
+    # The canonical IP is now live and proven. Tear down the old DHCP address
+    # and ifupdown -- guarded, because a mistake here could strand the host.
+    - name: Arm host-side auto-rollback timer
+      ansible.builtin.command:
+        cmd: >-
+          systemd-run --on-active={{ medusa_net_rollback_seconds }}
+          --unit=medusa-net-rollback --collect
+          /bin/sh -c '
+          rm -f {{ medusa_networkd_path }};
+          systemctl disable --now systemd-networkd;
+          [ -e {{ medusa_resolv_backup }} ] && cp -a {{ medusa_resolv_backup }} /etc/resolv.conf;
+          [ -e {{ medusa_interfaces_backup }} ] && cp -a {{ medusa_interfaces_backup }} /etc/network/interfaces;
+          ifup {{ medusa_net.interface }} 2>/dev/null || systemctl restart networking'
+      changed_when: true
       become: true
 
     - name: Neutralize ifupdown for the managed interface
@@ -131,64 +210,23 @@
           iface lo inet loopback
       become: true
 
-    - name: Arm host-side auto-rollback timer
-      ansible.builtin.command:
+    - name: Release the old DHCP address, leaving only the canonical IP
+      # The controller is already connected at the canonical IP, so dropping
+      # the old (DHCP) address does not sever the session.
+      ansible.builtin.shell:
         cmd: >-
-          systemd-run --on-active={{ medusa_net_rollback_seconds }}
-          --unit=medusa-net-rollback --collect
-          /bin/sh -c '
-          rm -f {{ medusa_networkd_path }};
-          systemctl disable --now systemd-networkd;
-          [ -e {{ medusa_resolv_backup }} ] && cp -a {{ medusa_resolv_backup }} /etc/resolv.conf;
-          [ -e {{ medusa_interfaces_backup }} ] && cp -a {{ medusa_interfaces_backup }} /etc/network/interfaces;
-          ifup {{ medusa_net.interface }} 2>/dev/null || systemctl restart networking'
+          dhclient -r {{ medusa_net.interface }} 2>/dev/null || true;
+          pkill -f "dhclient.*{{ medusa_net.interface }}" 2>/dev/null || true;
+          for a in $(ip -o -4 addr show dev {{ medusa_net.interface }}
+          | awk '{print $4}'); do
+          [ "$a" = "{{ medusa_net.address }}" ] || ip addr del "$a"
+          dev {{ medusa_net.interface }}; done; true
       changed_when: true
       become: true
 
-    - name: Apply cutover to systemd-networkd (severs the current SSH session)
-      # Detached: the address flush drops the old IP and the SSH session, so the
-      # switch must finish on the host independently of the controller.
-      ansible.builtin.command:
-        cmd: >-
-          systemd-run --collect --unit=medusa-net-apply
-          /bin/sh -c '
-          systemctl enable --now systemd-resolved;
-          ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf;
-          systemctl enable systemd-networkd;
-          pkill -f "dhclient.*{{ medusa_net.interface }}" 2>/dev/null;
-          ip addr flush dev {{ medusa_net.interface }};
-          systemctl restart systemd-networkd'
-      become: true
-      changed_when: true
-
-    - name: Point the connection at the canonical IP
-      ansible.builtin.set_fact:
-        ansible_host: "{{ medusa_net.ip }}"
-
-    - name: Reset the connection so it reconnects at the canonical IP
-      ansible.builtin.meta: reset_connection
-
-    - name: Wait for the host to answer at the canonical IP
+    - name: Confirm the host still answers at the canonical IP after teardown
       ansible.builtin.wait_for_connection:
-        timeout: "{{ medusa_net_rollback_seconds - 20 }}"
-
-    - name: Capture identity after cutover (machine-id at canonical IP)
-      ansible.builtin.slurp:
-        src: /etc/machine-id
-      register: medusa_machineid_after
-      become: true
-
-    - name: Verify the canonical IP is THIS host, not a stale occupant
-      ansible.builtin.assert:
-        that:
-          - medusa_machineid_after.content == medusa_machineid_before.content
-        fail_msg: >-
-          Identity mismatch after cutover: the host answering at
-          {{ medusa_net.ip }} is not {{ inventory_hostname }}. A different
-          machine still holds the canonical IP (e.g. an old box not yet
-          retired). Leaving the auto-rollback to fire; retire the occupant
-          first.
-        success_msg: "Cutover identity-verified for {{ inventory_hostname }}."
+        timeout: 30
 
     - name: Cancel the auto-rollback (cutover confirmed)
       ansible.builtin.command:
@@ -202,6 +240,8 @@
       ansible.builtin.fail:
         msg: >-
           Cutover failed for {{ inventory_hostname }} ({{ medusa_net.ip }}).
-          The host-side rollback timer will revert it to its previous address
-          within {{ medusa_net_rollback_seconds }}s, so it is not stranded.
-          Other hosts continue. Investigate before retrying.
+          The canonical IP was added alongside the existing address, so unless
+          the teardown step had started, the host is still reachable on its old
+          address; if teardown began, the host-side rollback timer reverts it
+          within {{ medusa_net_rollback_seconds }}s. Other hosts continue.
+          Investigate before retrying.
