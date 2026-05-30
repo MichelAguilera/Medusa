@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.15.0"
+VERSION="0.16.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -389,6 +389,29 @@ summarize_failure_log() {
     printf "\n  full log: %s%s%s\n" "$color_blue" "$log" "$color_reset" >&2
 }
 
+# Animate a braille spinner on stderr showing the latest Ansible play/task,
+# tailed live from the deploy log, until rc_file becomes non-empty (the
+# background SSH wrote its exit code there). Clears its own line on exit. Only
+# called on a TTY. See T-050.
+spin_progress() {
+    local rc_file=$1 log=$2
+    local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0 frame last cols line
+    printf '\033[?25l' >&2  # hide cursor
+    while [[ ! -s "$rc_file" ]]; do
+        frame=${frames[i++ % ${#frames[@]}]}
+        last=$(grep -E '^(TASK|PLAY) \[' "$log" 2>/dev/null | tail -1 \
+            | sed -E 's/ \*+[[:space:]]*$//' || true)
+        [[ -z "$last" ]] && last="working..."
+        cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
+        line="  ${color_blue}${frame}${color_reset} ${last}"
+        # Truncate to terminal width (account for the color escapes ~9 chars).
+        printf '\r\033[K%s' "${line:0:$((cols + 9))}" >&2
+        sleep 0.2
+    done
+    printf '\r\033[K\033[?25h' >&2  # clear line, restore cursor
+}
+
 run_logged() {
     local name=$1 command=$2 target log remote
     local -a ssh_opts
@@ -412,7 +435,31 @@ run_logged() {
         fail "unable to connect to $target over SSH"
     fi
 
-    if ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1; then
+    # Long remote runs (image pulls during `compose up`) write only to the log,
+    # so the terminal looks frozen. On a TTY, run the SSH in the background and
+    # animate a spinner showing the current Ansible play/task, tailed live from
+    # the log. Off a TTY (pipe/CI) run it plainly so output stays deterministic.
+    local rc=0
+    if [[ -t 2 ]]; then
+        local rc_file="${log}.rc"
+        rm -f "$rc_file"
+        {
+            if ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1; then
+                echo 0
+            else
+                echo "$?"
+            fi >"$rc_file"
+        } &
+        local bgpid=$!
+        spin_progress "$rc_file" "$log"
+        wait "$bgpid" 2>/dev/null || true
+        rc=$(cat "$rc_file" 2>/dev/null || echo 1)
+        rm -f "$rc_file"
+    else
+        ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1 || rc=$?
+    fi
+
+    if [[ "$rc" -eq 0 ]]; then
         printf "%s✓%s %s\n" "$color_green" "$color_reset" "$name"
         return 0
     fi
@@ -2998,6 +3045,8 @@ cmd_uninstall() {
 TEMP_FILES=()
 cleanup() {
     local file
+    # Restore the cursor in case a spinner was interrupted (Ctrl-C mid-run).
+    [[ -t 2 ]] && printf '\033[?25h' >&2 2>/dev/null || true
     for file in "${TEMP_FILES[@]:-}"; do
         rm -f "$file"
     done
