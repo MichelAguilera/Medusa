@@ -221,11 +221,13 @@
 
     - name: Release the old DHCP address, leaving only the canonical IP
       # The controller is already connected at the canonical IP, so dropping
-      # the old (DHCP) address does not sever the session.
+      # the old (DHCP) address does not sever the session. `dhclient -r` stops
+      # the lease's client; the loop then removes any remaining non-canonical
+      # address on the interface. (Deliberately NO `pkill -f dhclient.*<iface>`:
+      # -f matches this shell's own command line and would SIGTERM itself.)
       ansible.builtin.shell:
         cmd: >-
           dhclient -r {{ medusa_net.interface }} 2>/dev/null || true;
-          pkill -f "dhclient.*{{ medusa_net.interface }}" 2>/dev/null || true;
           for a in $(ip -o -4 addr show dev {{ medusa_net.interface }}
           | awk '{print $4}'); do
           [ "$a" = "{{ medusa_net.address }}" ] || ip addr del "$a"
