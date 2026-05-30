@@ -81,6 +81,21 @@
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
 
+- name: Ensure shared external Docker networks exist
+  # Networks shared ACROSS stacks (the Traefik 'proxy' net) are rendered
+  # `external: true` because each stack is its own Compose project; `docker
+  # compose up` will NOT create an external network, so Medusa must create it
+  # before applying any stack. Created as the medusa runtime user (in the
+  # docker group). Must track the external networks the compose renderer emits
+  # -- see medusa/model/compose.py.
+  community.docker.docker_network:
+    name: "{{ item }}"
+    state: present
+  become: true
+  become_user: "{{ medusa_deploy_owner }}"
+  loop: "{{ medusa_compose_external_networks }}"
+  when: medusa_compose_apply | bool
+
 - name: Apply Compose stack state
   # Runs as the medusa service-runtime user, NOT the ansible deployment user:
   # medusa owns the stacks tree and is in the docker group, so it talks to the
