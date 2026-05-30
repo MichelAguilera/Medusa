@@ -1026,10 +1026,12 @@ medusactl compose <up|down> [--check] — drive the Compose lifecycle on
                   (medusa_compose_apply=false); this is the verb that
                   actually starts/stops containers.
 
-                  Medusa does NOT install the Docker engine -- it is a
-                  documented docker_hosts prerequisite (see
-                  architecture-decisions: "configure the daemon, don't
-                  install it"). 'compose up' fails if Docker is absent.
+                  The Docker engine is a Tier-2 dependency Medusa owns
+                  (installs + configures); see architecture-decisions,
+                  "Provisioning boundary: two dependency tiers". Its install
+                  is not yet wired (T-062), so for now 'compose up' fails if
+                  Docker is absent -- install it on the host until T-062
+                  lands.
 
 Usage:
   medusactl compose up   [--check]
