@@ -546,7 +546,10 @@ def _build_homepage_card(service) -> HomepageCard:
     href = dumped.pop("href", None)
     if href is None:
         if service.route is not None and service.route.host is not None:
-            href = f"https://{service.route.host}"
+            # Follow the route's TLS setting; an http-only route (tls falsey,
+            # the default) must not produce an https:// tile that dead-links.
+            scheme = "https" if getattr(service.route, "tls", None) else "http"
+            href = f"{scheme}://{service.route.host}"
         else:
             raise ValueError(
                 f"service {service.id} homepage entry requires href or route.host"
