@@ -45,6 +45,14 @@ class NfsMount(BaseModel):
     type: str
     options: tuple[str, ...]
     source: str
+    # Canonical IPs used by the storage role's export-auth preflight: the
+    # server's IP is the route target, and client_ip is the address the
+    # server's export authorizes (this host's canonical ip). The role
+    # fails fast if the client's live source IP toward the server is not
+    # client_ip -- otherwise the mount is denied with an opaque server-side
+    # error (T-059).
+    server_ip: str
+    client_ip: str
 
 
 class StorageModel(BaseModel):

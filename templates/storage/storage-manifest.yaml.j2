@@ -10,6 +10,8 @@ hosts:
     source: {{ mount.source }}
     fstype: {{ mount.type }}
     options: {{ mount.options | join(",") }}
+    server_ip: {{ mount.server_ip }}
+    client_ip: {{ mount.client_ip }}
 {% endfor %}
 {% endfor %}
 {% else %}

@@ -56,6 +56,32 @@
     label: "{{ item.item.mountpoint }}"
   when: item.rc != 0
 
+- name: Resolve source IP toward each NFS server (export-auth preflight)
+  ansible.builtin.command:
+    cmd: "ip -o route get {{ item.server_ip }}"
+  changed_when: false
+  register: medusa_nfs_route
+  loop: "{{ medusa_host_mounts | selectattr('fstype', 'equalto', 'nfs') | list }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+
+- name: Fail when the client's source IP is not the exported (canonical) IP
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} reaches NFS server {{ item.item.server_ip }} from
+      source IP
+      {{ item.stdout | regex_replace('^.*\bsrc\s+(\S+).*$', '\1') }}, but
+      {{ item.item.source }} is exported only to {{ item.item.client_ip }} (this
+      host's canonical IP). The mount would be denied by the server. Give this
+      host its canonical IP -- a DHCP reservation for {{ item.item.client_ip }},
+      or manage_network: true for a static cutover -- then redeploy.
+  loop: "{{ medusa_nfs_route.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.mountpoint }}"
+  when: >-
+    (item.stdout | regex_replace('^.*\bsrc\s+(\S+).*$', '\1'))
+    != item.item.client_ip
+
 - name: Mount and persist managed NFS mounts
   ansible.posix.mount:
     path: "{{ item.mountpoint }}"

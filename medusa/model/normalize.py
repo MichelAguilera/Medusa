@@ -240,6 +240,10 @@ def normalize_storage(
                         f"{hosts_by_name[exports[mount.export].server].fqdns[0]}:"
                         f"{exports[mount.export].path}"
                     ),
+                    server_ip=hosts_by_name[exports[mount.export].server].ip,
+                    # The export authorizes this client by its canonical IP;
+                    # the role asserts the live source IP matches (T-059).
+                    client_ip=hosts_by_name[host].ip,
                 )
                 for mount in inventory.mounts
                 for host in mount.host
