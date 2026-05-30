@@ -17,6 +17,24 @@
   roles:
     - deploy_root
 
+- name: Deploy Traefik dynamic config
+  hosts: traefik_hosts
+  gather_facts: false
+  roles:
+    - traefik
+
+- name: Deploy Homepage config
+  hosts: homepage_hosts
+  gather_facts: false
+  roles:
+    - homepage
+
+- name: Deploy monitoring config
+  hosts: monitoring_hosts
+  gather_facts: false
+  roles:
+    - monitoring
+
 - name: Deploy managed secrets
   hosts: docker_hosts
   gather_facts: false
