@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.13.0"
+VERSION="0.14.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -66,6 +66,7 @@ Usage:
     medusactl check
     medusactl render
     medusactl deploy [--check]
+    medusactl compose <up|down> [--check]
     medusactl controller-apply [--check]
 
   Target ops:
@@ -1013,6 +1014,52 @@ cmd_deploy() {
         run_logged deploy \
             "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml"
     fi
+}
+
+cmd_compose() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
+        cat <<EOF
+medusactl compose <up|down> [--check] — drive the Compose lifecycle on
+                  docker_hosts. 'up' renders, stages, and brings stacks to
+                  state=present; 'down' brings them to state=stopped. The
+                  default 'deploy' only STAGES stack files
+                  (medusa_compose_apply=false); this is the verb that
+                  actually starts/stops containers.
+
+                  Medusa does NOT install the Docker engine -- it is a
+                  documented docker_hosts prerequisite (see
+                  architecture-decisions: "configure the daemon, don't
+                  install it"). 'compose up' fails if Docker is absent.
+
+Usage:
+  medusactl compose up   [--check]
+  medusactl compose down [--check]
+
+Exit codes: 0 success, non-zero on failure.
+EOF
+        return 0
+    fi
+    load_config
+    local action=$1
+    shift
+    local play
+    case "$action" in
+        up)   play=compose-up.yml ;;
+        down) play=compose-stop.yml ;;
+        *) fail "compose: unknown action '$action' (expected 'up' or 'down')" ;;
+    esac
+    local check=""
+    if [[ "${1:-}" == "--check" ]]; then
+        check=" --check --diff"
+        shift
+    fi
+    [[ $# -eq 0 ]] || fail "compose: unexpected argument '$1'"
+    # 'up' applies host config (renders + brings stacks present), so it
+    # follows the deploy clean-tree discipline. 'down' is a runtime stop and
+    # must work even mid-edit, so it does not require a clean tree.
+    [[ "$action" == "up" ]] && require_clean_for_deploy
+    run_logged "compose-$action" \
+        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check"
 }
 
 cmd_controller_apply() {
@@ -2398,7 +2445,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status controller-status shell check render deploy controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target migrate-deploy-root add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
+    commands="install-controller authorize-controller status controller-status shell check render deploy compose controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target migrate-deploy-root add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -2408,6 +2455,13 @@ _medusactl_complete() {
     case "${COMP_WORDS[1]}" in
         deploy|controller-apply)
             COMPREPLY=( $(compgen -W "--check" -- "$cur") )
+            ;;
+        compose)
+            if [[ "$COMP_CWORD" -eq 2 ]]; then
+                COMPREPLY=( $(compgen -W "up down" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--check --help" -- "$cur") )
+            fi
             ;;
         finalize-dns)
             COMPREPLY=( $(compgen -W "--check --force --resolver" -- "$cur") )
@@ -2453,6 +2507,7 @@ _medusactl() {
         'check:run medusa check on the controller'
         'render:run medusa render on the controller'
         'deploy:run controller deployment'
+        'compose:bring managed Compose stacks up or down'
         'controller-apply:apply controller-side bootstrap blocks'
         'finalize-dns:remove /etc/hosts bootstrap block once DNS is live'
         'add-target:add a host to inventory and apply bootstrap blocks'
@@ -2540,6 +2595,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'shell' -d 'Open a controlle
 complete -c medusactl -n '__fish_use_subcommand' -a 'check' -d 'Run medusa check on the controller'
 complete -c medusactl -n '__fish_use_subcommand' -a 'render' -d 'Run medusa render on the controller'
 complete -c medusactl -n '__fish_use_subcommand' -a 'deploy' -d 'Run controller deployment'
+complete -c medusactl -n '__fish_use_subcommand' -a 'compose' -d 'Bring managed Compose stacks up or down'
 complete -c medusactl -n '__fish_use_subcommand' -a 'controller-apply' -d 'Apply controller-side bootstrap blocks'
 complete -c medusactl -n '__fish_use_subcommand' -a 'finalize-dns' -d 'Remove /etc/hosts bootstrap block once DNS is live'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-target' -d 'Add a host to inventory and apply bootstrap blocks'
@@ -2562,6 +2618,8 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'ssh-disconnect' -d 'Close t
 complete -c medusactl -n '__fish_use_subcommand' -a 'undo' -d 'Restore inventory from the most recent snapshot'
 complete -c medusactl -n '__fish_use_subcommand' -a 'history' -d 'Show recent inventory commits'
 complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run deploy in check mode'
+complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down' -a 'up down' -d 'Compose lifecycle action'
+complete -c medusactl -n '__fish_seen_subcommand_from compose' -l check -d 'Run compose in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from controller-apply' -l check -d 'Run controller apply in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l check -d 'Show what would be removed without writing'
 complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l force -d 'Skip resolver validation and remove the block'
@@ -2934,6 +2992,10 @@ case "${1:-}" in
     deploy)
         shift
         cmd_deploy "$@"
+        ;;
+    compose)
+        shift
+        cmd_compose "$@"
         ;;
     controller-apply)
         shift
