@@ -67,11 +67,20 @@
   become: true
   register: medusa_current_addr
 
+- name: Refresh apt cache (best-effort)
+  # Best-effort so a transient DNS/mirror hiccup cannot block the cutover
+  # before it starts; the install below works from the existing cache, and
+  # systemd-resolved is usually already present.
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  become: true
+  failed_when: false
+
 - name: Ensure systemd-resolved is installed
   ansible.builtin.apt:
     name: systemd-resolved
     state: present
-    update_cache: true
   become: true
 
 - name: Write managed systemd-networkd unit (inert until networkd starts)
@@ -186,7 +195,7 @@
           /bin/sh -c '
           rm -f {{ medusa_networkd_path }};
           systemctl disable --now systemd-networkd;
-          [ -e {{ medusa_resolv_backup }} ] && cp -a {{ medusa_resolv_backup }} /etc/resolv.conf;
+          [ -e {{ medusa_resolv_backup }} ] && { rm -f /etc/resolv.conf; cp -a {{ medusa_resolv_backup }} /etc/resolv.conf; };
           [ -e {{ medusa_interfaces_backup }} ] && cp -a {{ medusa_interfaces_backup }} /etc/network/interfaces;
           ifup {{ medusa_net.interface }} 2>/dev/null || systemctl restart networking'
       changed_when: true
