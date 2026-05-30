@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.14.0"
+VERSION="0.15.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -309,6 +309,86 @@ sanitize_log() {
     fi
 }
 
+# Turn a raw Ansible deploy log into a short, actionable failure summary:
+# the failing play / task / host, the concise error message, a recap of which
+# hosts failed, and a targeted hint for common failure classes. Only the
+# extracted `msg` is surfaced -- never the raw `=> {...}` result payload, which
+# can carry secrets (stdout/env/item). The full raw log on disk stays
+# authoritative. Falls back to a raw tail only when no structured task failure
+# is found. See T-050.
+summarize_failure_log() {
+    local log=$1
+    if [[ ! -s "$log" ]]; then
+        return 0
+    fi
+
+    local fline lineno linetext failhost failtask failplay msg hint recap
+    fline=$(grep -nE '^(fatal|failed): \[' "$log" | head -1 || true)
+
+    if [[ -z "$fline" ]]; then
+        printf "\n%s(no structured task failure found; raw tail below)%s\n" \
+            "$color_yellow" "$color_reset" >&2
+        tail -40 "$log" >&2 || true
+        printf "\n  full log: %s\n" "$log" >&2
+        return 0
+    fi
+
+    lineno="${fline%%:*}"
+    linetext="${fline#*:}"
+
+    failhost=$(printf '%s' "$linetext" | sed -E 's/^(fatal|failed): \[//; s/\].*$//')
+    failtask=$(head -n "$lineno" "$log" | grep -E '^TASK \[' | tail -1 \
+        | sed -E 's/^TASK \[//; s/\] \*+.*$//' || true)
+    failplay=$(head -n "$lineno" "$log" | grep -E '^PLAY \[' | tail -1 \
+        | sed -E 's/^PLAY \[//; s/\] \*+.*$//' || true)
+
+    # Prefer the JSON "msg"; fall back to an `[ERROR]: Task failed:` line.
+    msg=$(printf '%s' "$linetext" | sed -nE 's/.*"msg": ?"(.*)/\1/p' \
+        | sed -E 's/".*$//' || true)
+    if [[ -z "$msg" ]]; then
+        msg=$(head -n "$lineno" "$log" | grep -E '\[ERROR\]: Task failed:' \
+            | tail -1 | sed -E 's/.*Task failed: //' || true)
+    fi
+    [[ -z "$msg" ]] && msg="(see full log)"
+    msg=${msg//$'\n'/ }
+    if [[ ${#msg} -gt 400 ]]; then
+        msg="${msg:0:400}..."
+    fi
+
+    case "$linetext$msg" in
+        *UNREACHABLE*|*"No route to host"*|*"Failed to connect"*)
+            hint="Host unreachable over SSH. Check it is powered on and on the LAN. If it just moved to its canonical IP, run 'medusactl promote-target $failhost' so the controller stops targeting the old address." ;;
+        *"access denied by server"*|*"exported only to"*|*"this host's canonical IP"*)
+            hint="NFS export-auth: $failhost is not reaching the server from its canonical IP. Put it on that IP (DHCP reservation or finish the network cutover), then redeploy." ;;
+        *mount.nfs*|*"could not be mounted"*)
+            hint="NFS mount failed. Verify the export exists on the server ('exportfs -v') and that name/IP resolution works both directions." ;;
+        *docker.sock*|*"permission denied while trying to connect"*)
+            hint="Docker socket permission denied. The medusa runtime user may not be in the docker group yet -- re-run 'medusactl deploy' so the docker_engine role enrols it." ;;
+        *netplan*|*"/etc/netplan"*)
+            hint="netplan is absent; Medusa standardizes managed hosts on systemd-networkd. Ensure the host template provides it (Tier-1 prerequisite)." ;;
+        *"does not exist"*)
+            hint="$failhost references a user/group that does not exist on the target. Create it or fix the inventory reference." ;;
+        *)
+            hint="" ;;
+    esac
+
+    recap=$(awk '/^PLAY RECAP/{f=1} f && /(failed|unreachable)=[1-9]/{print}' "$log")
+
+    printf "\n" >&2
+    printf "  %splay:%s  %s\n" "$color_blue" "$color_reset" "${failplay:-?}" >&2
+    printf "  %stask:%s  %s\n" "$color_blue" "$color_reset" "${failtask:-?}" >&2
+    printf "  %shost:%s  %s\n" "$color_blue" "$color_reset" "${failhost:-?}" >&2
+    printf "  %serror:%s %s\n" "$color_red" "$color_reset" "$msg" >&2
+    if [[ -n "$recap" ]]; then
+        printf "\n  %srecap:%s\n" "$color_blue" "$color_reset" >&2
+        printf '%s\n' "$recap" | sed 's/^/    /' >&2
+    fi
+    if [[ -n "$hint" ]]; then
+        printf "\n  %shint:%s  %s\n" "$color_yellow" "$color_reset" "$hint" >&2
+    fi
+    printf "\n  full log: %s%s%s\n" "$color_blue" "$log" "$color_reset" >&2
+}
+
 run_logged() {
     local name=$1 command=$2 target log remote
     local -a ssh_opts
@@ -338,9 +418,7 @@ run_logged() {
     fi
 
     printf "%s✗%s %s failed\n" "$color_red" "$color_reset" "$name" >&2
-    printf "log: %s\n" "$log" >&2
-    printf "\nLast output:\n" >&2
-    tail -40 "$log" >&2 || true
+    summarize_failure_log "$log"
     return 1
 }
 
@@ -2938,6 +3016,11 @@ case "${1:-}" in
         ;;
     -V|--version|version)
         cmd_version
+        ;;
+    __summarize-failure)
+        # Internal: render the failure summary for a given Ansible log. Used by
+        # the deploy-error formatter tests (T-050); not a public command.
+        summarize_failure_log "${2:-}"
         ;;
     install-controller)
         shift
