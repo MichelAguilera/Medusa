@@ -22,6 +22,12 @@
   roles:
     - coredns
 
+- name: Install the Docker engine on managed Docker hosts
+  hosts: docker_hosts
+  gather_facts: false
+  roles:
+    - docker_engine
+
 - name: Prepare managed Docker stack root
   hosts: docker_hosts
   gather_facts: false

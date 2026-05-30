@@ -1,0 +1,24 @@
+---
+# Tier-2 provisioning (see architecture-decisions, "Provisioning boundary:
+# two dependency tiers"). The Docker engine is Medusa's responsibility to
+# install + configure on docker_hosts. Installed ONLY when absent, so a
+# limited target already running Docker its own way is never touched.
+
+# Debian official repository (Medusa targets Debian; see bootstrap.md).
+medusa_docker_gpg_url: https://download.docker.com/linux/debian/gpg
+medusa_docker_keyring_path: /etc/apt/keyrings/docker.asc
+medusa_docker_repo_path: /etc/apt/sources.list.d/docker.list
+
+medusa_docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# So Compose can run without a per-call sudo. The deploy user (deploy_root
+# manages the 'medusa' group separately; this is the docker group).
+medusa_docker_group: docker
+medusa_docker_group_members:
+  - "{{ medusa_deploy_owner }}"
+  - "{{ ansible_user }}"

@@ -1028,10 +1028,10 @@ medusactl compose <up|down> [--check] — drive the Compose lifecycle on
 
                   The Docker engine is a Tier-2 dependency Medusa owns
                   (installs + configures); see architecture-decisions,
-                  "Provisioning boundary: two dependency tiers". Its install
-                  is not yet wired (T-062), so for now 'compose up' fails if
-                  Docker is absent -- install it on the host until T-062
-                  lands.
+                  "Provisioning boundary: two dependency tiers". The
+                  docker_engine role (run by deploy and compose-up) installs
+                  it when absent, so a fresh host needs no manual Docker
+                  setup; a host that already runs Docker is left untouched.
 
 Usage:
   medusactl compose up   [--check]
