@@ -6,9 +6,9 @@ class NetworkHost(BaseModel):
 
     Derived in normalization from a HostRecord whose ``network`` is set
     (``manage_network: true``). The renderer iterates these and writes one
-    netplan file per host without filtering or reshaping. ``address`` is the
-    canonical ip joined with the prefix as CIDR, precomputed here so the
-    template stays formatting-only. See T-055.
+    systemd-networkd unit per host without filtering or reshaping.
+    ``address`` is the canonical ip joined with the prefix as CIDR,
+    precomputed here so the template stays formatting-only. See T-055, T-060.
     """
 
     model_config = ConfigDict(frozen=True)

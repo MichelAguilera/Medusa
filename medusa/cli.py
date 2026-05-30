@@ -584,9 +584,9 @@ def add_host_cmd(
         "--manage-network",
         help=(
             "Opt this host into Medusa-managed static networking. Medusa "
-            "renders a netplan and performs a guarded DHCP->static cutover "
-            "to --ip during deploy. Override fields fall back to the global "
-            "network: defaults. NEVER set on Proxmox/bridge hosts."
+            "installs systemd-networkd and performs a guarded DHCP->static "
+            "cutover to --ip during deploy. Override fields fall back to the "
+            "global network: defaults. NEVER set on Proxmox/bridge hosts."
         ),
     ),
     net_interface: str | None = typer.Option(

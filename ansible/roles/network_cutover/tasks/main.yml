@@ -1,21 +1,26 @@
 ---
-# T-055 stage 3: guarded DHCP -> static cutover for managed-network hosts.
+# Guarded DHCP -> static cutover for managed-network hosts, standardized on
+# systemd-networkd. Medusa does NOT branch per existing backend
+# (netplan/ifupdown/NetworkManager); it installs systemd-networkd +
+# systemd-resolved and moves the managed NIC onto them. See T-060.
 #
 # DANGER: this changes the host's primary IP, which severs the controller's
 # SSH session. Safety model:
 #   1. Only opted-in hosts reach here (managed_network_hosts group); a Proxmox
 #      / bridge guard refuses anyway as defense in depth.
 #   2. Before applying, the host arms a transient systemd timer that reverts
-#      the netplan change after medusa_netplan_rollback_seconds unless the
-#      controller cancels it. The revert runs on the host, so it survives the
-#      severed SSH session and a host left unreachable heals itself.
+#      to the pre-cutover state (restores /etc/network/interfaces + resolv.conf,
+#      removes the networkd unit, disables networkd, brings ifupdown back) after
+#      medusa_net_rollback_seconds unless the controller cancels it. The revert
+#      runs on the host, so it survives the severed SSH session and a host left
+#      unreachable heals itself.
 #   3. After apply, the controller reconnects at the CANONICAL ip and verifies
 #      IDENTITY (machine-id), not mere reachability -- a stale occupant still
-#      holding the canonical IP (e.g. the old DNS box on .250) would answer a
-#      ping but fail the machine-id match. On any failure the timer is left to
-#      fire and the host reverts; the play fails gracefully for that host.
-#   4. Idempotent: once the host already holds its canonical IP and the netplan
-#      file is unchanged, no apply runs.
+#      holding the canonical IP would answer a ping but fail the machine-id
+#      match. On any failure the timer is left to fire and the host reverts;
+#      the play fails gracefully for that host.
+#   4. Idempotent: once the host already holds its canonical IP and the networkd
+#      unit is unchanged, no apply runs.
 
 - name: Load generated network manifest
   ansible.builtin.include_vars:
@@ -61,48 +66,99 @@
   become: true
   register: medusa_current_addr
 
-- name: Write managed netplan (not yet applied)
+- name: Write managed systemd-networkd unit (inert until networkd starts)
   ansible.builtin.copy:
-    src: "{{ medusa_generated_dir }}/network/{{ inventory_hostname }}/medusa.yaml"
-    dest: "{{ medusa_netplan_path }}"
+    src: "{{ medusa_generated_dir }}/network/{{ inventory_hostname }}/medusa.network"
+    dest: "{{ medusa_networkd_path }}"
     owner: root
     group: root
-    mode: "0600"
+    mode: "0644"
   become: true
-  register: medusa_netplan_file
-
-- name: Validate netplan syntax before applying
-  ansible.builtin.command:
-    cmd: netplan generate
-  changed_when: false
-  become: true
+  register: medusa_networkd_file
 
 - name: Decide whether a cutover is needed
   ansible.builtin.set_fact:
     # Already converged when the canonical IP is live on the interface AND the
-    # managed netplan file did not change this run.
+    # managed networkd unit did not change this run.
     medusa_cutover_needed: >-
       {{ (medusa_net.ip not in medusa_current_addr.stdout)
-         or medusa_netplan_file.changed }}
+         or medusa_networkd_file.changed }}
 
 - name: Guarded cutover to canonical static IP
   when: medusa_cutover_needed | bool
   block:
+    - name: Back up pre-cutover /etc/network/interfaces (once)
+      ansible.builtin.copy:
+        src: /etc/network/interfaces
+        dest: "{{ medusa_interfaces_backup }}"
+        remote_src: true
+        force: false
+        owner: root
+        group: root
+        mode: "0644"
+      become: true
+
+    - name: Back up pre-cutover /etc/resolv.conf (once)
+      ansible.builtin.copy:
+        src: /etc/resolv.conf
+        dest: "{{ medusa_resolv_backup }}"
+        remote_src: true
+        force: false
+      become: true
+
+    - name: Ensure systemd-resolved is installed
+      ansible.builtin.apt:
+        name: systemd-resolved
+        state: present
+        update_cache: true
+      become: true
+
+    - name: Neutralize ifupdown for the managed interface
+      # Replace /etc/network/interfaces with a lo-only stub so ifupdown no
+      # longer claims the NIC and cannot fight systemd-networkd on reboot. The
+      # original is preserved in the backup above; rollback restores it.
+      ansible.builtin.copy:
+        dest: /etc/network/interfaces
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by Medusa: {{ medusa_net.interface }} moved to
+          # systemd-networkd. Original backed up at {{ medusa_interfaces_backup }}.
+          source /etc/network/interfaces.d/*
+
+          auto lo
+          iface lo inet loopback
+      become: true
+
     - name: Arm host-side auto-rollback timer
       ansible.builtin.command:
         cmd: >-
-          systemd-run --on-active={{ medusa_netplan_rollback_seconds }}
-          --unit=medusa-netplan-rollback --collect
-          /bin/sh -c 'rm -f {{ medusa_netplan_path }} && netplan apply'
+          systemd-run --on-active={{ medusa_net_rollback_seconds }}
+          --unit=medusa-net-rollback --collect
+          /bin/sh -c '
+          rm -f {{ medusa_networkd_path }};
+          systemctl disable --now systemd-networkd;
+          [ -e {{ medusa_resolv_backup }} ] && cp -a {{ medusa_resolv_backup }} /etc/resolv.conf;
+          [ -e {{ medusa_interfaces_backup }} ] && cp -a {{ medusa_interfaces_backup }} /etc/network/interfaces;
+          ifup {{ medusa_net.interface }} 2>/dev/null || systemctl restart networking'
       changed_when: true
       become: true
 
-    - name: Apply netplan (severs the current SSH session)
+    - name: Apply cutover to systemd-networkd (severs the current SSH session)
+      # Detached: the address flush drops the old IP and the SSH session, so the
+      # switch must finish on the host independently of the controller.
       ansible.builtin.command:
-        cmd: netplan apply
+        cmd: >-
+          systemd-run --collect --unit=medusa-net-apply
+          /bin/sh -c '
+          systemctl enable --now systemd-resolved;
+          ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf;
+          systemctl enable systemd-networkd;
+          pkill -f "dhclient.*{{ medusa_net.interface }}" 2>/dev/null;
+          ip addr flush dev {{ medusa_net.interface }};
+          systemctl restart systemd-networkd'
       become: true
-      async: 1
-      poll: 0
       changed_when: true
 
     - name: Point the connection at the canonical IP
@@ -114,7 +170,7 @@
 
     - name: Wait for the host to answer at the canonical IP
       ansible.builtin.wait_for_connection:
-        timeout: "{{ medusa_netplan_rollback_seconds - 20 }}"
+        timeout: "{{ medusa_net_rollback_seconds - 20 }}"
 
     - name: Capture identity after cutover (machine-id at canonical IP)
       ansible.builtin.slurp:
@@ -131,12 +187,12 @@
           {{ medusa_net.ip }} is not {{ inventory_hostname }}. A different
           machine still holds the canonical IP (e.g. an old box not yet
           retired). Leaving the auto-rollback to fire; retire the occupant
-          first. See T-056.
+          first.
         success_msg: "Cutover identity-verified for {{ inventory_hostname }}."
 
     - name: Cancel the auto-rollback (cutover confirmed)
       ansible.builtin.command:
-        cmd: systemctl stop medusa-netplan-rollback.timer
+        cmd: systemctl stop medusa-net-rollback.timer
       changed_when: true
       become: true
       failed_when: false
@@ -147,5 +203,5 @@
         msg: >-
           Cutover failed for {{ inventory_hostname }} ({{ medusa_net.ip }}).
           The host-side rollback timer will revert it to its previous address
-          within {{ medusa_netplan_rollback_seconds }}s, so it is not
-          stranded. Other hosts continue. Investigate before retrying.
+          within {{ medusa_net_rollback_seconds }}s, so it is not stranded.
+          Other hosts continue. Investigate before retrying.
