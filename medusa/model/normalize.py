@@ -270,6 +270,9 @@ def normalize_storage(
                     NfsExportClient(
                         host=host,
                         fqdn=hosts_by_name[host].fqdns[0],
+                        # Canonical IP, never bootstrap_ip -- the export must
+                        # not carry a host's temporary cutover address (T-059).
+                        ip=hosts_by_name[host].ip,
                         options=export.options,
                     )
                     for mount in export_mounts
