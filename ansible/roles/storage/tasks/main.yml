@@ -65,12 +65,21 @@
   loop_control:
     label: "{{ item.mountpoint }}"
 
+# Extract the kernel-selected source IP from `ip route get` output by splitting
+# on the literal " src " token -- NOT a Jinja regex. A regex pattern written as
+# a Jinja string literal has its backslash escapes processed by Jinja first
+# (e.g. `\b` -> backspace 0x08, `\s` left alone), so `regex_replace` silently
+# fails to match, returns the WHOLE line unchanged, and the comparison below
+# always reports a mismatch -- the gate fired even when the IPs matched. The
+# split is escaping-proof. A missing " src " yields 'unknown', which can never
+# equal the canonical IP, so an unparseable route still blocks the mount.
 - name: Fail when the client's source IP is not the exported (canonical) IP
   ansible.builtin.fail:
     msg: >-
       {{ inventory_hostname }} reaches NFS server {{ item.item.server_ip }} from
       source IP
-      {{ item.stdout | regex_replace('^.*\bsrc\s+(\S+).*$', '\1') }}, but
+      {{ (item.stdout.split(' src ')[1].split()[0]) if ' src ' in item.stdout
+         else 'unknown' }}, but
       {{ item.item.source }} is exported only to {{ item.item.client_ip }} (this
       host's canonical IP). The mount would be denied by the server. Give this
       host its canonical IP -- a DHCP reservation for {{ item.item.client_ip }},
@@ -79,7 +88,8 @@
   loop_control:
     label: "{{ item.item.mountpoint }}"
   when: >-
-    (item.stdout | regex_replace('^.*\bsrc\s+(\S+).*$', '\1'))
+    ((item.stdout.split(' src ')[1].split()[0]) if ' src ' in item.stdout
+     else 'unknown')
     != item.item.client_ip
 
 - name: Mount and persist managed NFS mounts

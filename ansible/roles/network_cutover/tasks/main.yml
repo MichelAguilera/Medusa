@@ -93,13 +93,29 @@
   become: true
   register: medusa_networkd_file
 
+- name: Detect stale (non-canonical) global addresses on the managed interface
+  # A lingering DHCP address (e.g. dhcpcd re-leased .111 after a console rescue)
+  # leaves the kernel picking it as the source IP, which breaks IP-based NFS
+  # export auth even though the canonical IP is also present. The guard below
+  # must treat "canonical present but not sole" as NOT converged.
+  ansible.builtin.shell:
+    cmd: >-
+      ip -o -4 addr show dev {{ medusa_net.interface }} scope global
+      | awk '{print $4}' | grep -vx '{{ medusa_net.address }}' || true
+  changed_when: false
+  failed_when: false
+  become: true
+  register: medusa_stale_addr
+
 - name: Decide whether a cutover is needed
   ansible.builtin.set_fact:
-    # Already converged when the canonical IP is live on the interface AND the
-    # managed networkd unit did not change this run.
+    # Converged ONLY when the canonical IP is the single global address on the
+    # interface AND the managed networkd unit did not change this run. A stale
+    # non-canonical address (lingering DHCP lease) re-triggers the teardown.
     medusa_cutover_needed: >-
       {{ (medusa_net.ip not in medusa_current_addr.stdout)
-         or medusa_networkd_file.changed }}
+         or medusa_networkd_file.changed
+         or (medusa_stale_addr.stdout | trim | length > 0) }}
 
 - name: Guarded additive cutover to canonical static IP
   when: medusa_cutover_needed | bool
