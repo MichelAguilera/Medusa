@@ -221,17 +221,25 @@
 
     - name: Release the old DHCP address, leaving only the canonical IP
       # The controller is already connected at the canonical IP, so dropping
-      # the old (DHCP) address does not sever the session. `dhclient -r` stops
-      # the lease's client; the loop then removes any remaining non-canonical
-      # address on the interface. (Deliberately NO `pkill -f dhclient.*<iface>`:
-      # -f matches this shell's own command line and would SIGTERM itself.)
+      # the old (DHCP) address does not sever the session. Stop the DHCP client
+      # FIRST (release + kill by pidfile), then delete any non-canonical
+      # address. `dhclient -r` can briefly re-add the lease as it exits, racing
+      # a single delete and leaving a stuck leftover address, so the delete
+      # runs in a short retry loop until only the canonical IP remains.
+      # (Deliberately NO `pkill -f dhclient.*<iface>`: -f matches this shell's
+      # own command line and would SIGTERM itself.)
       ansible.builtin.shell:
         cmd: >-
           dhclient -r {{ medusa_net.interface }} 2>/dev/null || true;
+          for p in /run/dhclient.{{ medusa_net.interface }}.pid
+          /run/dhclient-{{ medusa_net.interface }}.pid; do
+          [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true; done;
+          for i in 1 2 3 4 5; do left=0;
           for a in $(ip -o -4 addr show dev {{ medusa_net.interface }}
-          | awk '{print $4}'); do
-          [ "$a" = "{{ medusa_net.address }}" ] || ip addr del "$a"
-          dev {{ medusa_net.interface }}; done; true
+          scope global | awk '{print $4}'); do
+          if [ "$a" != "{{ medusa_net.address }}" ]; then
+          ip addr del "$a" dev {{ medusa_net.interface }}; left=1; fi; done;
+          [ "$left" = 0 ] && break; sleep 1; done; true
       changed_when: true
       become: true
 
