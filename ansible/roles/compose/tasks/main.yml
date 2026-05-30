@@ -9,13 +9,19 @@
   become: false
   register: medusa_compose_files
 
+# The whole stacks tree is owned by the medusa service-runtime user (it runs
+# Compose); ansible writes it via sudo. See architecture-decisions, "Service
+# runtime identity".
 - name: Ensure Compose stack directories exist
   ansible.builtin.file:
     path: >-
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}
     state: directory
+    owner: "{{ medusa_deploy_owner }}"
+    group: "{{ medusa_deploy_group }}"
     mode: "2775"
+  become: true
   loop: "{{ medusa_compose_files.files }}"
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
@@ -26,7 +32,10 @@
     dest: >-
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}/docker-compose.yml
+    owner: "{{ medusa_deploy_owner }}"
+    group: "{{ medusa_deploy_group }}"
     mode: "0664"
+  become: true
   loop: "{{ medusa_compose_files.files }}"
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
@@ -42,12 +51,18 @@
   register: medusa_compose_env_files
 
 - name: Ensure generated managed environment directories exist
+  # 2770 (not 2775): an env dir can also hold secret env files (the secrets
+  # role writes the same <stack>/env path at 2770); matching modes avoids a
+  # per-run flip and keeps env contents off "other".
   ansible.builtin.file:
     path: >-
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^' ~ medusa_generated_dir ~ '/compose/(.*)/env/[^/]+$', '\1/env') }}
     state: directory
-    mode: "2775"
+    owner: "{{ medusa_deploy_owner }}"
+    group: "{{ medusa_deploy_group }}"
+    mode: "2770"
+  become: true
   loop: "{{ medusa_compose_env_files.files }}"
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
@@ -58,7 +73,10 @@
     dest: >-
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^' ~ medusa_generated_dir ~ '/compose/(.*)$', '\1') }}
+    owner: "{{ medusa_deploy_owner }}"
+    group: "{{ medusa_deploy_group }}"
     mode: "0664"
+  become: true
   loop: "{{ medusa_compose_env_files.files }}"
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
