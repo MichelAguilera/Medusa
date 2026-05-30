@@ -64,11 +64,17 @@
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
 
 - name: Apply Compose stack state
+  # Runs as the medusa service-runtime user, NOT the ansible deployment user:
+  # medusa owns the stacks tree and is in the docker group, so it talks to the
+  # docker socket without sudo. ansible never gets docker-group (root-equiv)
+  # access. See architecture-decisions, "Service runtime identity".
   community.docker.docker_compose_v2:
     project_src: >-
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}
     state: "{{ medusa_compose_state }}"
+  become: true
+  become_user: "{{ medusa_deploy_owner }}"
   loop: "{{ medusa_compose_files.files }}"
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"

@@ -75,15 +75,27 @@
         enabled: true
         state: started
 
-    - name: Add the deploy + connection users to the docker group
-      # Only meaningful once we created the group via the install above, so it
-      # lives inside the absent-only block -- a limited host's group model is
-      # not touched.
-      ansible.builtin.user:
-        name: "{{ item }}"
-        groups: "{{ medusa_docker_group }}"
-        append: true
-      loop: "{{ medusa_docker_group_members | unique }}"
+# Group membership runs OUTSIDE the absent-only block: the docker group exists
+# whenever Docker is installed -- including a host where Docker was installed
+# by hand or by a prior run -- and the service-runtime identity must be in it
+# regardless of who installed the engine. (Gating this behind the install
+# block was a bug: a manually-installed host left medusa out of the group and
+# Compose failed on the socket.) Only the `medusa` service user is added --
+# docker-group membership is root-equivalent, so the `ansible` deployment user
+# is deliberately kept OUT (it escalates per-task via sudo instead).
 
-    - name: Reset connection so docker group membership is active
-      ansible.builtin.meta: reset_connection
+- name: Detect the docker group
+  ansible.builtin.command:
+    cmd: "getent group {{ medusa_docker_group }}"
+  changed_when: false
+  failed_when: false
+  become: true
+  register: medusa_docker_group_probe
+
+- name: Add the service-runtime user to the docker group
+  ansible.builtin.user:
+    name: "{{ medusa_deploy_owner }}"
+    groups: "{{ medusa_docker_group }}"
+    append: true
+  become: true
+  when: medusa_docker_group_probe.rc == 0

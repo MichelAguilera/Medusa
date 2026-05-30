@@ -16,9 +16,8 @@ medusa_docker_packages:
   - docker-buildx-plugin
   - docker-compose-plugin
 
-# So Compose can run without a per-call sudo. The deploy user (deploy_root
-# manages the 'medusa' group separately; this is the docker group).
+# docker-group membership is root-equivalent, so ONLY the medusa
+# service-runtime user (medusa_deploy_owner) is added -- it runs Compose. The
+# ansible deployment user is kept out and escalates per task via sudo. See
+# architecture-decisions, "Service runtime identity".
 medusa_docker_group: docker
-medusa_docker_group_members:
-  - "{{ medusa_deploy_owner }}"
-  - "{{ ansible_user }}"
