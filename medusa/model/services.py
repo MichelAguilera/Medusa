@@ -49,6 +49,20 @@ class ComposeService(BaseModel):
     managed_secrets: tuple[str, ...]
     user: str | None
     shm_size: str | None
+    data_owner: str | None
+
+
+class ComposeDataDir(BaseModel):
+    """A service bind-mount data directory Medusa creates + chowns before
+    `compose up`, so a non-root container can write its volume. ``path`` is
+    relative to the managed stacks root. See T-065."""
+
+    model_config = ConfigDict(frozen=True)
+
+    host: str
+    path: str
+    owner: int
+    group: int
 
 
 class ComposeFile(BaseModel):
@@ -92,5 +106,6 @@ class ServicesModel(BaseModel):
     traefik_routes_by_host: dict[str, tuple[TraefikRoute, ...]]
     compose: tuple[ComposeFile, ...]
     env_files: tuple[GeneratedEnvFile, ...]
+    data_dirs: tuple[ComposeDataDir, ...]
     secret_sources: tuple[SecretSource, ...]
     proxies: dict[str, str]

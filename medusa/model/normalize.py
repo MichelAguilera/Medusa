@@ -8,6 +8,7 @@ from medusa.inventory.homepage import HomepageInventory
 from medusa.inventory.services import ServicesInventory
 from medusa.inventory.storage import StorageInventory
 from medusa.model.compose import (
+    normalize_compose_data_dirs,
     normalize_compose_files,
     normalize_compose_services,
     validate_service_mount_refs,
@@ -344,6 +345,7 @@ def normalize_services(
 
     compose_services = normalize_compose_services(inventory, services, mount_index)
     compose_files = normalize_compose_files(inventory, compose_services)
+    compose_data_dirs = normalize_compose_data_dirs(compose_services)
     proxies = _validate_proxy_engines(services, traefik_routes)
     _validate_proxy_network_membership(services)
 
@@ -358,6 +360,7 @@ def normalize_services(
         traefik_routes_by_host=traefik_routes_by_host,
         compose=compose_files,
         env_files=generated_env_files(compose_services),
+        data_dirs=compose_data_dirs,
         secret_sources=secret_sources(services),
         proxies=proxies,
     )

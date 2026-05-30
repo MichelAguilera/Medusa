@@ -23,7 +23,14 @@ def render_compose(
         _env_file_path(generated_dir, env_file): _render_env_file(env_file)
         for env_file in model.env_files
     }
-    return {**compose_files, **env_files}
+    data_dirs = {
+        generated_dir / "compose-data-dirs.yaml": render_template(
+            templates_dir,
+            "compose/data-dirs.yaml.j2",
+            {"data_dirs": model.data_dirs},
+        )
+    }
+    return {**compose_files, **env_files, **data_dirs}
 
 
 def _compose_path(generated_dir: Path, compose_file: ComposeFile) -> Path:

@@ -73,6 +73,25 @@ class ComposeInventory(BaseModel):
     secrets: list[str] = Field(default_factory=list)
     user: str | None = None
     shm_size: str | None = None
+    # Owner (UID[:GID]) for this service's relative bind-mount data
+    # directories. Medusa creates + chowns them before `compose up` so a
+    # non-root container can write its config/data volume. None => Medusa does
+    # not touch the dirs (Docker auto-creates them root). See T-065.
+    data_owner: str | None = None
+
+    @field_validator("data_owner")
+    @classmethod
+    def validate_data_owner(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        parts = value.split(":")
+        if len(parts) not in (1, 2) or not all(p.isdigit() for p in parts):
+            raise ValueError(
+                "compose.data_owner must be 'UID' or 'UID:GID' (numeric), "
+                f"got {value!r}"
+            )
+        return value
 
     @model_validator(mode="after")
     def reject_legacy_env_and_secrets(self) -> Self:

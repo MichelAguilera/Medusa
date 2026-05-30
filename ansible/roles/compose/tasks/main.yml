@@ -135,6 +135,37 @@
   loop: "{{ medusa_external_networks }}"
   when: medusa_compose_apply | bool
 
+# Create + own each service's bind-mount data directory to the UID:GID the
+# container runs as (services declare `data_owner`), BEFORE compose up. Docker
+# otherwise auto-creates a missing bind source as root:root, and a non-root
+# container (e.g. seerr as 1000, www-data as 33) then cannot write its volume
+# -> EACCES / crash-loop -> 502. Runs as root (chown to an arbitrary UID needs
+# it), NOT as medusa; `recurse: true` also fixes already-root-owned dirs from a
+# prior failed run. See T-065.
+- name: Load managed compose data-dir manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/compose-data-dirs.yaml"
+    name: medusa_data_dir_manifest
+  delegate_to: localhost
+  become: false
+  run_once: true
+  when: medusa_compose_apply | bool
+
+- name: Create and own service bind-mount data directories
+  ansible.builtin.file:
+    path: "{{ medusa_compose_stacks_root }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    recurse: true
+  become: true
+  loop: >-
+    {{ (medusa_data_dir_manifest.data_dirs | default([]))
+       | selectattr('host', 'equalto', inventory_hostname) | list }}
+  loop_control:
+    label: "{{ item.path }} -> {{ item.owner }}:{{ item.group }}"
+  when: medusa_compose_apply | bool
+
 - name: Apply Compose stack state
   # Runs as the medusa service-runtime user, NOT the ansible deployment user:
   # medusa owns the stacks tree and is in the docker group, so it talks to the

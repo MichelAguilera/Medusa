@@ -1,5 +1,5 @@
 from medusa.inventory.services import ServicesInventory
-from medusa.model.services import ComposeFile, ComposeService
+from medusa.model.services import ComposeDataDir, ComposeFile, ComposeService
 from medusa.model.settings import (
     managed_env_files,
     managed_environment,
@@ -38,10 +38,44 @@ def normalize_compose_services(
             managed_secrets=managed_file_secret_names(service),
             user=service.compose.user,
             shm_size=service.compose.shm_size,
+            data_owner=service.compose.data_owner,
         )
         for service in sorted(services, key=lambda item: item.id)
         if service.compose is not None
     ]
+
+
+def normalize_compose_data_dirs(
+    compose_services: list[ComposeService],
+) -> tuple[ComposeDataDir, ...]:
+    """Derive the bind-mount data directories Medusa must create + chown.
+
+    For each service that declares ``data_owner``, every RELATIVE bind-mount
+    (``./...``, under the stack project dir) becomes a directory Medusa owns to
+    the declared UID:GID before `compose up`. Absolute/named/NFS mounts are not
+    Medusa's to create and are skipped. ``path`` is relative to the managed
+    stacks root (``<stack>/<source>``).
+    """
+    data_dirs: list[ComposeDataDir] = []
+    for service in compose_services:
+        if service.data_owner is None or service.stack is None:
+            continue
+        uid_str, _, gid_str = service.data_owner.partition(":")
+        uid = int(uid_str)
+        gid = int(gid_str) if gid_str else uid
+        for volume in service.volumes:
+            source = volume.split(":", 1)[0]
+            if not source.startswith("./"):
+                continue
+            path = f"{service.stack}/{source[2:]}"
+            data_dirs.append(
+                ComposeDataDir(
+                    host=service.host, path=path, owner=uid, group=gid
+                )
+            )
+    return tuple(
+        sorted(data_dirs, key=lambda item: (item.host, item.path))
+    )
 
 
 def normalize_compose_files(
