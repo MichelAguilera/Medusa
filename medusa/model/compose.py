@@ -38,6 +38,7 @@ def normalize_compose_services(
             managed_secrets=managed_file_secret_names(service),
             user=service.compose.user,
             shm_size=service.compose.shm_size,
+            hostname=service.compose.hostname,
             data_owner=service.compose.data_owner,
         )
         for service in sorted(services, key=lambda item: item.id)

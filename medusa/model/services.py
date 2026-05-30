@@ -49,6 +49,7 @@ class ComposeService(BaseModel):
     managed_secrets: tuple[str, ...]
     user: str | None
     shm_size: str | None
+    hostname: str | None
     data_owner: str | None
 
 

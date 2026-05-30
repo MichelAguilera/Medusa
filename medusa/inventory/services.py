@@ -73,6 +73,7 @@ class ComposeInventory(BaseModel):
     secrets: list[str] = Field(default_factory=list)
     user: str | None = None
     shm_size: str | None = None
+    hostname: str | None = None
     # Owner (UID[:GID]) for this service's relative bind-mount data
     # directories. Medusa creates + chowns them before `compose up` so a
     # non-root container can write its config/data volume. None => Medusa does
@@ -110,6 +111,7 @@ class ComposeInventory(BaseModel):
         "restart",
         "user",
         "shm_size",
+        "hostname",
     )
     @classmethod
     def normalize_optional_strings(cls, value: str | None) -> str | None:
