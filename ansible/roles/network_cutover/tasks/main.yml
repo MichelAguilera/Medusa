@@ -197,7 +197,10 @@
           systemctl disable --now systemd-networkd;
           [ -e {{ medusa_resolv_backup }} ] && { rm -f /etc/resolv.conf; cp -a {{ medusa_resolv_backup }} /etc/resolv.conf; };
           [ -e {{ medusa_interfaces_backup }} ] && cp -a {{ medusa_interfaces_backup }} /etc/network/interfaces;
-          ifup {{ medusa_net.interface }} 2>/dev/null || systemctl restart networking'
+          systemctl enable --now dhcpcd 2>/dev/null;
+          dhcpcd {{ medusa_net.interface }} 2>/dev/null;
+          ifup {{ medusa_net.interface }} 2>/dev/null;
+          systemctl restart networking 2>/dev/null; true'
       changed_when: true
       become: true
 
@@ -219,21 +222,41 @@
           iface lo inet loopback
       become: true
 
-    - name: Release the old DHCP address, leaving only the canonical IP
-      # The controller is already connected at the canonical IP, so dropping
-      # the old (DHCP) address does not sever the session. Stop the DHCP client
-      # FIRST (release + kill by pidfile), then delete any non-canonical
-      # address. `dhclient -r` can briefly re-add the lease as it exits, racing
-      # a single delete and leaving a stuck leftover address, so the delete
-      # runs in a short retry loop until only the canonical IP remains.
-      # (Deliberately NO `pkill -f dhclient.*<iface>`: -f matches this shell's
-      # own command line and would SIGTERM itself.)
+    - name: Stop competing DHCP clients on the managed interface
+      # The old address can be held by any of several clients -- some hosts
+      # run dhcpcd (sets the address `noprefixroute`, not dhclient), which
+      # ifupdown neutralization does NOT stop and which re-leases the address.
+      # Release via each client's own mechanism; commands no-op when the client
+      # is absent. (Deliberately NO `pkill -f dhclient.*<iface>`: -f matches
+      # this shell's own command line and would SIGTERM itself.)
       ansible.builtin.shell:
         cmd: >-
+          dhcpcd -k {{ medusa_net.interface }} 2>/dev/null || true;
           dhclient -r {{ medusa_net.interface }} 2>/dev/null || true;
           for p in /run/dhclient.{{ medusa_net.interface }}.pid
           /run/dhclient-{{ medusa_net.interface }}.pid; do
-          [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true; done;
+          [ -f "$p" ] && kill "$(cat "$p")" 2>/dev/null || true; done; true
+      changed_when: true
+      become: true
+
+    - name: Disable competing network managers so they stay off across reboot
+      ansible.builtin.systemd_service:
+        name: "{{ item }}"
+        enabled: false
+        state: stopped
+      become: true
+      failed_when: false
+      loop:
+        - dhcpcd
+        - dhcpcd.socket
+
+    - name: Delete the old address, leaving only the canonical IP
+      # The controller is already connected at the canonical IP, so dropping the
+      # old (DHCP) address does not sever the session. A client can briefly
+      # re-add the lease as it exits, racing a single delete, so the delete runs
+      # in a short retry loop until only the canonical IP remains.
+      ansible.builtin.shell:
+        cmd: >-
           for i in 1 2 3 4 5; do left=0;
           for a in $(ip -o -4 addr show dev {{ medusa_net.interface }}
           scope global | awk '{print $4}'); do
