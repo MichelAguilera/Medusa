@@ -81,19 +81,58 @@
   loop_control:
     label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
 
-- name: Ensure shared external Docker networks exist
-  # Networks shared ACROSS stacks (the Traefik 'proxy' net) are rendered
-  # `external: true` because each stack is its own Compose project; `docker
-  # compose up` will NOT create an external network, so Medusa must create it
-  # before applying any stack. Created as the medusa runtime user (in the
-  # docker group). Must track the external networks the compose renderer emits
-  # -- see medusa/model/compose.py.
+# `docker compose up` does NOT create resources declared `external: true`
+# (shared networks like the Traefik 'proxy', and named volumes the operator
+# marks external such as 'portainer_data'); it errors "external <kind> ... not
+# found". Medusa must create them first. Rather than hardcode names, DISCOVER
+# them from the rendered compose files so any operator-declared external
+# resource is handled.
+- name: Read rendered compose files to discover external resources
+  ansible.builtin.slurp:
+    src: "{{ item.path }}"
+  delegate_to: localhost
+  become: false
+  register: medusa_compose_parsed
+  loop: "{{ medusa_compose_files.files }}"
+  loop_control:
+    label: "{{ item.path | regex_replace('^' ~ medusa_generated_dir ~ '/compose/', '') }}"
+  when: medusa_compose_apply | bool
+
+- name: Compute external volumes and networks declared across stacks
+  ansible.builtin.set_fact:
+    medusa_external_volumes: >-
+      {{ medusa_compose_parsed.results | map(attribute='content')
+         | map('b64decode') | map('from_yaml')
+         | map(attribute='volumes', default={}) | map('dict2items')
+         | sum(start=[]) | selectattr('value', 'mapping')
+         | selectattr('value.external', 'defined') | selectattr('value.external')
+         | map(attribute='key') | list | unique }}
+    medusa_external_networks: >-
+      {{ (medusa_compose_external_networks
+          + (medusa_compose_parsed.results | map(attribute='content')
+             | map('b64decode') | map('from_yaml')
+             | map(attribute='networks', default={}) | map('dict2items')
+             | sum(start=[]) | selectattr('value', 'mapping')
+             | selectattr('value.external', 'defined') | selectattr('value.external')
+             | map(attribute='key') | list)) | unique }}
+  when: medusa_compose_apply | bool
+
+- name: Ensure external Docker volumes exist
+  community.docker.docker_volume:
+    name: "{{ item }}"
+    state: present
+  become: true
+  become_user: "{{ medusa_deploy_owner }}"
+  loop: "{{ medusa_external_volumes }}"
+  when: medusa_compose_apply | bool
+
+- name: Ensure external Docker networks exist
   community.docker.docker_network:
     name: "{{ item }}"
     state: present
   become: true
   become_user: "{{ medusa_deploy_owner }}"
-  loop: "{{ medusa_compose_external_networks }}"
+  loop: "{{ medusa_external_networks }}"
   when: medusa_compose_apply | bool
 
 - name: Apply Compose stack state

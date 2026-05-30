@@ -1,9 +1,8 @@
 ---
-# Shared external Docker networks Medusa must create before bringing stacks up.
-# These are networks the compose renderer marks `external: true` because they
-# are shared across separate Compose projects (the Traefik 'proxy' network).
-# `docker compose up` does not create external networks, so the compose role
-# creates them first. Keep in sync with the renderer's external set
-# (medusa/model/compose.py).
+# Fallback/safety-net list of external Docker networks to create before
+# bringing stacks up. The compose role ALSO discovers external networks (and
+# volumes) directly from the rendered compose files, so operator-declared
+# external resources are handled automatically; this list just guarantees the
+# shared Traefik 'proxy' network is always present.
 medusa_compose_external_networks:
   - proxy
