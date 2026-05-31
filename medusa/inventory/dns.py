@@ -211,6 +211,13 @@ class HostInventory(BaseModel):
     # Per-host static-networking override. Fields left unset fall back to the
     # global `network:` defaults. Only meaningful when manage_network is true.
     network: NetworkConfig | None = None
+    # Opt-in to a CoreDNS wildcard (subdomain catch-all) for this host.
+    # When true, `*.<name>.<zone>` resolves to the host's own IP via a
+    # `rewrite stop` block, so the host can do its own Host-header routing.
+    # Independent of Medusa-managed services: a host running its own reverse
+    # proxy (unmanaged) can opt in without any service records. Proxy hosts
+    # get a wildcard automatically regardless of this flag.
+    wildcard: bool = False
 
     @field_validator("name")
     @classmethod

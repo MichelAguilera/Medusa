@@ -94,6 +94,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
                 host.ansible_user, host.ansible_managed_mode
             ),
             network=_resolve_network(host, inventory.network),
+            wildcard=host.wildcard,
         )
         for host in inventory.hosts
     )
@@ -688,10 +689,15 @@ def normalize_coredns(
         forwarder_mode, forwarder_tls_servername = "udp", None
 
     host_zones = {host.name: host.zones for host in dns_model.hosts}
+    # A host gets a wildcard rewrite block if it runs a Medusa-managed proxy
+    # (Host-header routing needs it) OR it explicitly opted in via wildcard:
+    # true (e.g. a host running its own unmanaged reverse proxy).
     proxy_hosts = set(services_model.proxies.keys())
+    wildcard_hosts = {host.name for host in dns_model.hosts if host.wildcard}
+    rewrite_hosts = (proxy_hosts | wildcard_hosts) & host_zones.keys()
     rewrite_zones = tuple(
         f"{host_name}.{zone}"
-        for host_name in sorted(proxy_hosts & host_zones.keys())
+        for host_name in sorted(rewrite_hosts)
         for zone in host_zones[host_name]
     )
     return CorednsModel(

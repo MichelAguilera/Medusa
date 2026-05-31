@@ -64,6 +64,10 @@ class HostRecord(BaseModel):
     # Resolved static-networking config, set only for hosts that opted into
     # managed networking (manage_network: true). None otherwise. See T-055.
     network: HostNetwork | None = None
+    # Explicit opt-in to a CoreDNS wildcard (subdomain catch-all) for this
+    # host, independent of whether it runs a Medusa-managed proxy. Unioned
+    # with proxy hosts when deriving rewrite_zones in normalize.
+    wildcard: bool = False
 
     @property
     def is_ansible_managed(self) -> bool:
