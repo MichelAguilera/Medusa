@@ -12,6 +12,16 @@
     medusa_host_mounts: >-
       {{ medusa_storage_manifest.hosts[inventory_hostname] | default([]) }}
 
+- name: Gather minimal facts for package manager dispatch
+  ansible.builtin.setup:
+    gather_subset:
+      - min
+  when: >-
+    medusa_host_mounts
+    | selectattr('fstype', 'equalto', 'nfs')
+    | list
+    | length > 0
+
 - name: Refresh apt cache (Debian)
   ansible.builtin.apt:
     update_cache: true
