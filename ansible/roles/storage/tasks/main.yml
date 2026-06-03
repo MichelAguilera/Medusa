@@ -12,11 +12,23 @@
     medusa_host_mounts: >-
       {{ medusa_storage_manifest.hosts[inventory_hostname] | default([]) }}
 
-- name: Ensure NFS client utilities are installed
+- name: Refresh apt cache (Debian)
   ansible.builtin.apt:
-    name: nfs-common
-    state: present
     update_cache: true
+  become: true
+  when: >-
+    ansible_os_family == "Debian"
+    and (
+      medusa_host_mounts
+      | selectattr('fstype', 'equalto', 'nfs')
+      | list
+      | length > 0
+    )
+
+- name: Ensure NFS client utilities are installed
+  ansible.builtin.package:
+    name: "{{ 'nfs-utils' if ansible_os_family == 'Archlinux' else 'nfs-common' }}"
+    state: present
   become: true
   when: >-
     medusa_host_mounts
