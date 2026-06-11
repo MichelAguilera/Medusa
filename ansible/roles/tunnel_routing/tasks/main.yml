@@ -51,6 +51,15 @@
     - net.ipv4.conf.default.rp_filter
 
 # --- packet marking (nftables) ---
+- name: Ensure the nftables include directory exists
+  ansible.builtin.file:
+    path: "{{ medusa_tunnel_routing_nftables_file | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  become: true
+
 - name: Deploy the tunnel marking ruleset
   ansible.builtin.copy:
     src: "{{ medusa_generated_dir }}/egress/tunnel-routing.nft"
