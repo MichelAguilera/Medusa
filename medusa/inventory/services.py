@@ -312,6 +312,13 @@ class ServiceInventory(BaseModel):
     host: str
     stack: str | None = None
     proxy: Literal["traefik", "caddy", "nginx"] | None = None
+    # Internet-egress policy. "direct" (default): traffic leaves via the host's
+    # normal gateway. "tunnel": public egress is routed through a shared
+    # WireGuard egress gateway while LAN traffic and inbound reachability stay
+    # direct (split routing). None means "inherit the stack default"
+    # (see StackInventory); the effective value is resolved by `resolve_egress`.
+    # See T-066.
+    egress: Literal["direct", "tunnel"] | None = None
     compose: ComposeInventory | None = None
     use: list[str] = Field(default_factory=list)
     image: str | None = None
@@ -393,11 +400,84 @@ class ServiceInventory(BaseModel):
         return normalized
 
 
+class StackInventory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Stack-wide default egress policy applied to every service in the stack
+    # that does not set its own `egress`. None leaves the built-in "direct"
+    # default in place. See T-066.
+    egress: Literal["direct", "tunnel"] | None = None
+
+
+class EgressGatewayInventory(BaseModel):
+    """Configuration for the shared WireGuard egress gateway that tunneled
+    services route through. The gateway is an existing DNS host; its canonical
+    IP is used as the split-DNS resolver for tunneled containers (so external
+    lookups resolve through the tunnel, `.lan` stays local). The tunnel Docker
+    network is external — created and owned by the host-routing layer, not by
+    compose — so compose only references it by name. See T-066."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    gateway: str
+    network_name: str = "medusa-tunnel"
+
+    @field_validator("gateway", "network_name")
+    @classmethod
+    def normalize_non_empty(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("egress_gateway fields cannot be empty")
+        return normalized
+
+
+def resolve_egress(
+    service: ServiceInventory,
+    stacks: dict[str, "StackInventory"],
+) -> Literal["direct", "tunnel"]:
+    """Resolve a service's effective egress: per-service value wins, then the
+    stack default, else the built-in "direct"."""
+    if service.egress is not None:
+        return service.egress
+    if service.stack is not None:
+        stack = stacks.get(service.stack)
+        if stack is not None and stack.egress is not None:
+            return stack.egress
+    return "direct"
+
+
 class ServicesInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     presets: dict[str, ServicePresetInventory] = Field(default_factory=dict)
+    stacks: dict[str, StackInventory] = Field(default_factory=dict)
+    egress_gateway: EgressGatewayInventory | None = None
     services: list[ServiceInventory] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_egress(self) -> Self:
+        any_tunneled = False
+        for service in self.services:
+            if resolve_egress(service, self.stacks) != "tunnel":
+                continue
+            any_tunneled = True
+            # A reverse proxy must stay directly reachable; routing its egress
+            # through the tunnel would break inbound routing. This is the one
+            # invariant the schema can enforce generically — see T-066 for the
+            # broader "do not tunnel ingress/tunnel-client services" guidance.
+            if service.proxy is not None:
+                raise ValueError(
+                    f"service {service.id}: egress 'tunnel' is invalid for a "
+                    f"proxy service ({service.proxy}); a reverse proxy must "
+                    f"stay directly reachable"
+                )
+        if any_tunneled and self.egress_gateway is None:
+            raise ValueError(
+                "services declare egress 'tunnel' but no egress_gateway is "
+                "configured; set egress_gateway (gateway host + network) so "
+                "tunneled services have a route and a resolver"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_service_ids(self) -> Self:

@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -51,6 +51,11 @@ class ComposeService(BaseModel):
     shm_size: str | None
     hostname: str | None
     data_owner: str | None
+    egress: Literal["direct", "tunnel"]
+    # Container DNS servers. Empty for direct services. Tunneled services point
+    # at the egress gateway's split resolver so external lookups exit via the
+    # tunnel while `.lan` stays local. See T-066.
+    dns: tuple[str, ...]
 
 
 class ComposeDataDir(BaseModel):
@@ -64,6 +69,18 @@ class ComposeDataDir(BaseModel):
     path: str
     owner: int
     group: int
+
+
+class EgressGateway(BaseModel):
+    """Resolved shared-WireGuard-egress config: the external tunnel network
+    name plus the gateway host and its address (split-DNS resolver + routing
+    next-hop). Present only when at least one service is tunneled. See T-066."""
+
+    model_config = ConfigDict(frozen=True)
+
+    network_name: str
+    gateway: str
+    gateway_address: str
 
 
 class ComposeFile(BaseModel):
@@ -110,3 +127,9 @@ class ServicesModel(BaseModel):
     data_dirs: tuple[ComposeDataDir, ...]
     secret_sources: tuple[SecretSource, ...]
     proxies: dict[str, str]
+    # host -> sorted tuple of names of services whose effective egress is
+    # "tunnel". Empty/absent host = nothing to tunnel there. Drives the later
+    # tunnel-network + host-routing stages (T-066).
+    tunnel_services_by_host: dict[str, tuple[str, ...]]
+    # Resolved egress gateway config; None when nothing is tunneled. T-066.
+    egress: EgressGateway | None

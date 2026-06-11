@@ -52,6 +52,12 @@ services:
     healthcheck:
 {{ service.healthcheck | yaml_block(6) }}
 {% endif %}
+{% if service.dns %}
+    dns:
+{% for resolver in service.dns %}
+      - {{ resolver | tojson }}
+{% endfor %}
+{% endif %}
 {% if service.networks %}
     networks:
 {% for network in service.networks %}

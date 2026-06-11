@@ -5,7 +5,7 @@ from medusa.inventory.dns import (
     resolve_host_network,
 )
 from medusa.inventory.homepage import HomepageInventory
-from medusa.inventory.services import ServicesInventory
+from medusa.inventory.services import ServicesInventory, resolve_egress
 from medusa.inventory.storage import StorageInventory
 from medusa.model.compose import (
     normalize_compose_data_dirs,
@@ -20,7 +20,12 @@ from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
 from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
 from medusa.model.network import NetworkHost, NetworkModel
-from medusa.model.services import ServiceRecord, ServicesModel, TraefikRoute
+from medusa.model.services import (
+    EgressGateway,
+    ServiceRecord,
+    ServicesModel,
+    TraefikRoute,
+)
 from medusa.model.settings import generated_env_files, secret_sources
 from medusa.model.storage import (
     NfsExport,
@@ -327,6 +332,8 @@ def normalize_services(
 
     mount_index = validate_service_mount_refs(services, storage_model)
 
+    egress = _resolve_egress_gateway(inventory, services, dns_model)
+
     service_records = tuple(
         ServiceRecord(
             id=service.id,
@@ -344,8 +351,10 @@ def normalize_services(
         if route is not None
     )
 
-    compose_services = normalize_compose_services(inventory, services, mount_index)
-    compose_files = normalize_compose_files(inventory, compose_services)
+    compose_services = normalize_compose_services(
+        inventory, services, mount_index, egress
+    )
+    compose_files = normalize_compose_files(inventory, compose_services, egress)
     compose_data_dirs = normalize_compose_data_dirs(compose_services)
     proxies = _validate_proxy_engines(services, traefik_routes)
     _validate_proxy_network_membership(services)
@@ -353,6 +362,20 @@ def normalize_services(
     traefik_routes_by_host: dict[str, tuple[TraefikRoute, ...]] = {
         host: tuple(route for route in traefik_routes if route.host == host)
         for host in proxies
+    }
+
+    tunnel_hosts = sorted(
+        {service.host for service in compose_services if service.egress == "tunnel"}
+    )
+    tunnel_services_by_host = {
+        host: tuple(
+            sorted(
+                service.name
+                for service in compose_services
+                if service.host == host and service.egress == "tunnel"
+            )
+        )
+        for host in tunnel_hosts
     }
 
     return ServicesModel(
@@ -364,6 +387,40 @@ def normalize_services(
         data_dirs=compose_data_dirs,
         secret_sources=secret_sources(services),
         proxies=proxies,
+        tunnel_services_by_host=tunnel_services_by_host,
+        egress=egress,
+    )
+
+
+def _resolve_egress_gateway(
+    inventory: ServicesInventory,
+    services,
+    dns_model: DnsModel,
+) -> EgressGateway | None:
+    """Resolve the egress gateway config when any service is tunneled. The
+    gateway must be a known DNS host; its canonical IP becomes the split-DNS
+    resolver address tunneled containers point at. Returns None when nothing is
+    tunneled (no network/dns wiring needed)."""
+    any_tunneled = any(
+        resolve_egress(service, inventory.stacks) == "tunnel" for service in services
+    )
+    if not any_tunneled:
+        return None
+
+    # Presence of egress_gateway is guaranteed by ServicesInventory validation
+    # whenever a service is tunneled.
+    config = inventory.egress_gateway
+    host = next(
+        (host for host in dns_model.hosts if host.name == config.gateway), None
+    )
+    if host is None:
+        raise ValueError(
+            f"egress_gateway.gateway '{config.gateway}' is not a known host"
+        )
+    return EgressGateway(
+        network_name=config.network_name,
+        gateway=config.gateway,
+        gateway_address=host.ip,
     )
 
 

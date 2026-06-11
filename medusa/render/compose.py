@@ -30,7 +30,17 @@ def render_compose(
             {"data_dirs": model.data_dirs},
         )
     }
-    return {**compose_files, **env_files, **data_dirs}
+    egress_manifest = {
+        generated_dir / "egress-manifest.yaml": render_template(
+            templates_dir,
+            "compose/egress-manifest.yaml.j2",
+            {
+                "egress": model.egress,
+                "tunnel_services_by_host": model.tunnel_services_by_host,
+            },
+        )
+    }
+    return {**compose_files, **env_files, **data_dirs, **egress_manifest}
 
 
 def _compose_path(generated_dir: Path, compose_file: ComposeFile) -> Path:

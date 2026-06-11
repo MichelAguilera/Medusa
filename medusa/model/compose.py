@@ -1,5 +1,10 @@
-from medusa.inventory.services import ServicesInventory
-from medusa.model.services import ComposeDataDir, ComposeFile, ComposeService
+from medusa.inventory.services import ServicesInventory, resolve_egress
+from medusa.model.services import (
+    ComposeDataDir,
+    ComposeFile,
+    ComposeService,
+    EgressGateway,
+)
 from medusa.model.settings import (
     managed_env_files,
     managed_environment,
@@ -13,37 +18,54 @@ def normalize_compose_services(
     inventory: ServicesInventory,
     services,
     mount_index: dict[tuple[str, str], NfsMount],
+    egress: EgressGateway | None = None,
 ) -> list[ComposeService]:
-    return [
-        ComposeService(
-            id=service.id,
-            name=service.name,
-            host=service.host,
-            stack=service.stack,
-            stack_networks=service.compose.stack_networks,
-            stack_volumes=service.compose.stack_volumes,
-            image=service.image,
-            build=service.compose.build,
-            init=service.compose.init,
-            restart=service.compose.restart,
-            command=service.compose.command,
-            ports=tuple(service.compose.ports),
-            volumes=_service_volumes(service, mount_index),
-            env_files=managed_env_files(service),
-            managed_environment=managed_environment(service),
-            networks=tuple(service.compose.networks),
-            labels=tuple(service.compose.labels),
-            depends_on=service.compose.depends_on,
-            healthcheck=service.compose.healthcheck,
-            managed_secrets=managed_file_secret_names(service),
-            user=service.compose.user,
-            shm_size=service.compose.shm_size,
-            hostname=service.compose.hostname,
-            data_owner=service.compose.data_owner,
+    compose_services: list[ComposeService] = []
+    for service in sorted(services, key=lambda item: item.id):
+        if service.compose is None:
+            continue
+        effective_egress = resolve_egress(service, inventory.stacks)
+        # A tunneled service joins the external tunnel network and points its
+        # DNS at the gateway's split resolver. The gateway is guaranteed present
+        # when anything is tunneled (inventory validation), hence the assert.
+        if effective_egress == "tunnel":
+            assert egress is not None
+            networks = tuple(service.compose.networks) + (egress.network_name,)
+            dns = (egress.gateway_address,)
+        else:
+            networks = tuple(service.compose.networks)
+            dns = ()
+        compose_services.append(
+            ComposeService(
+                id=service.id,
+                name=service.name,
+                host=service.host,
+                stack=service.stack,
+                stack_networks=service.compose.stack_networks,
+                stack_volumes=service.compose.stack_volumes,
+                image=service.image,
+                build=service.compose.build,
+                init=service.compose.init,
+                restart=service.compose.restart,
+                command=service.compose.command,
+                ports=tuple(service.compose.ports),
+                volumes=_service_volumes(service, mount_index),
+                env_files=managed_env_files(service),
+                managed_environment=managed_environment(service),
+                networks=networks,
+                labels=tuple(service.compose.labels),
+                depends_on=service.compose.depends_on,
+                healthcheck=service.compose.healthcheck,
+                managed_secrets=managed_file_secret_names(service),
+                user=service.compose.user,
+                shm_size=service.compose.shm_size,
+                hostname=service.compose.hostname,
+                data_owner=service.compose.data_owner,
+                egress=effective_egress,
+                dns=dns,
+            )
         )
-        for service in sorted(services, key=lambda item: item.id)
-        if service.compose is not None
-    ]
+    return compose_services
 
 
 def normalize_compose_data_dirs(
@@ -82,7 +104,13 @@ def normalize_compose_data_dirs(
 def normalize_compose_files(
     inventory: ServicesInventory,
     compose_services: list[ComposeService],
+    egress: EgressGateway | None = None,
 ) -> tuple[ComposeFile, ...]:
+    # The tunnel network is external (created and owned by the host-routing
+    # layer, like the `proxy` network), so compose only references it.
+    external_networks = {"proxy"}
+    if egress is not None:
+        external_networks.add(egress.network_name)
     groups = sorted(
         {(service.host, service.stack) for service in compose_services},
         key=lambda item: (item[0], item[1] or ""),
@@ -92,7 +120,7 @@ def normalize_compose_files(
             host=host,
             stack=stack,
             services=group_services,
-            networks=_compose_networks(group_services),
+            networks=_compose_networks(group_services, external_networks),
             volumes=_compose_named_volumes(group_services),
             secrets=_compose_secrets(group_services),
         )
@@ -154,9 +182,9 @@ def _compose_group_services(
     )
 
 
-def _compose_networks(services) -> dict:
+def _compose_networks(services, external_networks=frozenset({"proxy"})) -> dict:
     networks = {
-        network: {"external": True} if network == "proxy" else None
+        network: {"external": True} if network in external_networks else None
         for network in sorted(
             {network for service in services for network in service.networks}
         )
