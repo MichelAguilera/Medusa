@@ -53,7 +53,7 @@
       - --decrypt
       - --extract
       - '["value"]'
-      - "{{ medusa_secrets_root }}/{{ medusa_egress.wireguard_secret }}.sops.yaml"
+      - "{{ medusa_secrets_root }}/secrets/{{ medusa_egress.wireguard_secret }}.sops.yaml"
   delegate_to: localhost
   become: false
   changed_when: false
