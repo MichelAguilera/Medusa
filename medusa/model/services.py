@@ -56,6 +56,11 @@ class ComposeService(BaseModel):
     # at the egress gateway's split resolver so external lookups exit via the
     # tunnel while `.lan` stays local. See T-066.
     dns: tuple[str, ...]
+    # The network whose gateway must be the container's DEFAULT route. Set to
+    # the tunnel network for tunneled services so egress can't silently fall
+    # back to another attached network (e.g. `proxy`) on docker's undocumented
+    # multi-network tie-break. None = leave docker's default. See T-066.
+    gateway_network: str | None
 
 
 class ComposeDataDir(BaseModel):

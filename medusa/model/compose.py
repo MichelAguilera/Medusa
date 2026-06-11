@@ -32,9 +32,11 @@ def normalize_compose_services(
             assert egress is not None
             networks = tuple(service.compose.networks) + (egress.network_name,)
             dns = (egress.gateway_address,)
+            gateway_network = egress.network_name
         else:
             networks = tuple(service.compose.networks)
             dns = ()
+            gateway_network = None
         compose_services.append(
             ComposeService(
                 id=service.id,
@@ -63,6 +65,7 @@ def normalize_compose_services(
                 data_owner=service.compose.data_owner,
                 egress=effective_egress,
                 dns=dns,
+                gateway_network=gateway_network,
             )
         )
     return compose_services

@@ -60,9 +60,22 @@ services:
 {% endif %}
 {% if service.networks %}
     networks:
+{% if service.gateway_network %}
+{# Mapping form: the gateway network gets a high gw_priority so it is always
+   the container's default route (egress can't fall back to another network). #}
+{% for network in service.networks %}
+{% if network == service.gateway_network %}
+      {{ network | tojson }}:
+        gw_priority: 100
+{% else %}
+      {{ network | tojson }}: {}
+{% endif %}
+{% endfor %}
+{% else %}
 {% for network in service.networks %}
       - {{ network | tojson }}
 {% endfor %}
+{% endif %}
 {% endif %}
 {% if service.managed_secrets %}
     secrets:
