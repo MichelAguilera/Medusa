@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.17.0"
+VERSION="0.18.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1763,7 +1763,15 @@ EOF
         cmd_seed_target "$name" || fail "add-target: seed-target failed"
     fi
     if [[ "$authorize" -eq 1 ]]; then
-        cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
+        if [[ "$prep" -eq 1 ]]; then
+            # prep-target already authorized the controller key. authorize-target
+            # installs the key over PASSWORD auth, which can't succeed against the
+            # passwordless, key-only user prep just created — so running it here
+            # is both redundant and guaranteed to fail. Skip it.
+            info "authorize-target skipped: prep-target already authorized the controller key"
+        else
+            cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
+        fi
     fi
 
     # Onboarding finished — tear down the temporary entry.
