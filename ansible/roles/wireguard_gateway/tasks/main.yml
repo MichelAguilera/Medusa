@@ -89,7 +89,12 @@
   become: true
 
 # --- NAT + fail-closed kill-switch (nftables) ---
-- name: Ensure the nftables include directory exists
+# Loaded via our own oneshot, NOT the distro nftables.service: the latter runs
+# `flush ruleset` (would wipe co-resident docker/firewall rules) and ships
+# mount-namespace hardening that fails in a container (226/NAMESPACE). Our
+# ruleset is self-contained (add/delete/own-table), so `nft -f` adds only our
+# table and touches nothing else.
+- name: Ensure the nftables ruleset directory exists
   ansible.builtin.file:
     path: "{{ medusa_egress_nftables_file | dirname }}"
     state: directory
@@ -108,24 +113,25 @@
   become: true
   notify: Reload nftables ruleset
 
-- name: Ensure the main nftables config includes the egress ruleset
-  ansible.builtin.blockinfile:
-    path: /etc/nftables.conf
-    create: true
+- name: Install the egress firewall loader service
+  ansible.builtin.template:
+    src: medusa-nft-loader.service.j2
+    dest: /etc/systemd/system/medusa-egress-firewall.service
     owner: root
     group: root
     mode: "0644"
-    marker: "# {mark} MEDUSA EGRESS"
-    block: |
-      include "{{ medusa_egress_nftables_file }}"
+  vars:
+    medusa_nft_description: Medusa egress NAT + kill-switch
+    medusa_nft_file: "{{ medusa_egress_nftables_file }}"
   become: true
   notify: Reload nftables ruleset
 
-- name: Enable and start nftables
+- name: Enable and start the egress firewall loader
   ansible.builtin.systemd_service:
-    name: nftables
+    name: medusa-egress-firewall.service
     enabled: true
     state: started
+    daemon_reload: true
   become: true
 
 # --- Split DNS resolver ---

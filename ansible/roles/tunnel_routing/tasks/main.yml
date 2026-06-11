@@ -51,7 +51,7 @@
     - net.ipv4.conf.default.rp_filter
 
 # --- packet marking (nftables) ---
-- name: Ensure the nftables include directory exists
+- name: Ensure the nftables ruleset directory exists
   ansible.builtin.file:
     path: "{{ medusa_tunnel_routing_nftables_file | dirname }}"
     state: directory
@@ -70,24 +70,29 @@
   become: true
   notify: Reload tunnel marking ruleset
 
-- name: Ensure the main nftables config includes the tunnel ruleset
-  ansible.builtin.blockinfile:
-    path: /etc/nftables.conf
-    create: true
+# Loaded via our own oneshot, NOT the distro nftables.service. On a Docker host
+# nftables.service runs `flush ruleset`, which would wipe Docker's own
+# iptables-nft rules and break container networking. Our ruleset only adds its
+# own table, so `nft -f` is surgical.
+- name: Install the tunnel marking loader service
+  ansible.builtin.template:
+    src: medusa-nft-loader.service.j2
+    dest: /etc/systemd/system/medusa-tunnel-firewall.service
     owner: root
     group: root
     mode: "0644"
-    marker: "# {mark} MEDUSA TUNNEL"
-    block: |
-      include "{{ medusa_tunnel_routing_nftables_file }}"
+  vars:
+    medusa_nft_description: Medusa tunnel packet marking
+    medusa_nft_file: "{{ medusa_tunnel_routing_nftables_file }}"
   become: true
   notify: Reload tunnel marking ruleset
 
-- name: Enable and start nftables
+- name: Enable and start the tunnel marking loader
   ansible.builtin.systemd_service:
-    name: nftables
+    name: medusa-tunnel-firewall.service
     enabled: true
     state: started
+    daemon_reload: true
   become: true
 
 # --- policy routing (ip rule / ip route via a oneshot service) ---
