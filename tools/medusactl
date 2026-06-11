@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.16.0"
+VERSION="0.17.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -261,6 +261,52 @@ ssh_mux_opts() {
 ssh_base_opts() {
     printf "%s\n" "${SSH_CONFIG_OPTS[@]}" -p "$MEDUSA_CONTROLLER_PORT" -o StrictHostKeyChecking=accept-new
     ssh_mux_opts
+}
+
+# Ergonomic first-onboarding: prep-target/authorize-target make the CONTROLLER
+# scp/ssh to the new host BY NAME. On a brand-new host with no bootstrap_ip,
+# the controller can't resolve that name yet (CoreDNS has no record, the
+# /etc/hosts bootstrap block only seeds bootstrap_ip hosts), so the very first
+# prep fails with "Could not resolve hostname". These helpers add a TEMPORARY
+# /etc/hosts entry on the controller (canonical IP, or bootstrap_ip when set)
+# so onboarding connects, then remove it once the process finishes — like a
+# self-cleaning bootstrap. Tracked via MEDUSA_TEMP_HOST_NAME so the EXIT trap
+# also tears it down if prep fails partway.
+MEDUSA_TEMP_HOST_NAME=""
+MEDUSA_TEMP_HOST_MARKER="# MEDUSA TEMP ONBOARD"
+
+controller_seed_temp_host() {
+    local name=$1 ip=$2
+    local ctrl; ctrl=$(ssh_target) || return 0
+    local -a o; mapfile -t o < <(ssh_base_opts)
+    # Skip if the controller can already resolve the name (live DNS or an
+    # existing bootstrap block) — don't touch /etc/hosts we don't own.
+    if ssh "${o[@]}" "$ctrl" "getent hosts $(printf %q "$name") >/dev/null 2>&1"; then
+        return 0
+    fi
+    local line="$ip $name ${name}.lan  ${MEDUSA_TEMP_HOST_MARKER} ${name}"
+    if ssh "${o[@]}" "$ctrl" \
+        "printf '%s\n' $(printf %q "$line") | sudo tee -a /etc/hosts >/dev/null"; then
+        MEDUSA_TEMP_HOST_NAME="$name"
+        info "seeded temporary controller /etc/hosts: $name -> $ip (auto-removed when onboarding finishes)"
+    else
+        warn "could not seed a temporary /etc/hosts entry for $name on the controller; prep may fail to resolve it"
+    fi
+}
+
+controller_clear_temp_host() {
+    [[ -n "${MEDUSA_TEMP_HOST_NAME:-}" ]] || return 0
+    local name="$MEDUSA_TEMP_HOST_NAME"
+    local ctrl; ctrl=$(ssh_target) || return 0
+    local -a o; mapfile -t o < <(ssh_base_opts)
+    # Delete only our marked line.
+    if ssh "${o[@]}" "$ctrl" \
+        "sudo sed -i $(printf %q "/${MEDUSA_TEMP_HOST_MARKER} ${name}\$/d") /etc/hosts"; then
+        info "removed temporary controller /etc/hosts entry for $name"
+    else
+        warn "could not remove the temporary /etc/hosts entry for $name; remove the '${MEDUSA_TEMP_HOST_MARKER} ${name}' line on the controller by hand"
+    fi
+    MEDUSA_TEMP_HOST_NAME=""
 }
 
 remote_command() {
@@ -1702,6 +1748,14 @@ EOF
         return 0
     fi
 
+    # If we are about to reach into the host (prep/seed/authorize) and it has no
+    # bootstrap_ip, seed a temporary controller /etc/hosts entry so the first
+    # connection resolves. Removed at the very end (and by the EXIT trap on
+    # failure). Uses bootstrap_ip when set, else the canonical IP.
+    if [[ "$prep" -eq 1 || "$seed" -eq 1 || "$authorize" -eq 1 ]]; then
+        controller_seed_temp_host "$name" "${bootstrap_ip:-$ip}"
+    fi
+
     if [[ "$prep" -eq 1 ]]; then
         cmd_prep_target "$name" || fail "add-target: prep-target failed"
     fi
@@ -1711,6 +1765,9 @@ EOF
     if [[ "$authorize" -eq 1 ]]; then
         cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
     fi
+
+    # Onboarding finished — tear down the temporary entry.
+    controller_clear_temp_host
 }
 
 cmd_remove_target() {
@@ -3050,6 +3107,11 @@ cleanup() {
     for file in "${TEMP_FILES[@]:-}"; do
         rm -f "$file"
     done
+    # Tear down a temporary onboarding /etc/hosts entry if add-target failed
+    # partway (success path already cleared it).
+    if [[ -n "${MEDUSA_TEMP_HOST_NAME:-}" ]]; then
+        controller_clear_temp_host || true
+    fi
     if [[ -n "${SSH_TARGET:-}" && -n "${CONTROL_PATH:-}" && -S "$CONTROL_PATH" ]]; then
         ssh -O exit -o ControlPath="$CONTROL_PATH" "$SSH_TARGET" >/dev/null 2>&1 || true
     fi
