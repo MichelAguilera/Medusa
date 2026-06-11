@@ -167,6 +167,10 @@
       ansible.builtin.command:
         cmd: "ip -o -4 addr show dev {{ medusa_net.interface }}"
       changed_when: false
+      # Read-only poll: run it even under --check, otherwise check mode skips
+      # the command, returns empty stdout, and the `until` never matches — a
+      # false failure on an already-converged managed-network host.
+      check_mode: false
       become: true
       register: medusa_addr_check
       until: medusa_net.ip in medusa_addr_check.stdout
