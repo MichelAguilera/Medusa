@@ -12,4 +12,6 @@ class AnsibleGroupsModel(BaseModel):
     homepage_hosts: tuple[str, ...]
     monitoring_hosts: tuple[str, ...]
     managed_network_hosts: tuple[str, ...]
+    egress_gateway_hosts: tuple[str, ...]
+    tunnel_routing_hosts: tuple[str, ...]
     groups: tuple[tuple[str, tuple[str, ...]], ...]

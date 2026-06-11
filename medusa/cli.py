@@ -72,6 +72,7 @@ from medusa.paths import ProjectPaths
 from medusa.render.ansible import render_ansible_groups
 from medusa.render.caddy import render_caddy
 from medusa.render.compose import render_compose
+from medusa.render.egress import render_egress
 from medusa.render.coredns import render_coredns
 from medusa.render.docs import render_docs
 from medusa.render.homepage import render_homepage
@@ -212,6 +213,7 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_caddy(services_model, templates_dir, generated_dir),
         **render_nginx(services_model, templates_dir, generated_dir),
         **render_compose(services_model, templates_dir, generated_dir),
+        **render_egress(services_model, templates_dir, generated_dir),
         **render_monitoring(loaded.monitoring_model, templates_dir, generated_dir),
         **render_secrets_manifest(services_model, templates_dir, generated_dir),
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),

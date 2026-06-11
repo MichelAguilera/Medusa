@@ -4,10 +4,34 @@
 network_name: {{ egress.network_name }}
 gateway: {{ egress.gateway }}
 gateway_address: {{ egress.gateway_address }}
+interface: {{ egress.interface }}
+wireguard_secret: {{ egress.wireguard_secret }}
+dns_upstream: {{ egress.dns_upstream }}
+coredns_address: {{ egress.coredns_address }}
+tunnel_subnet: {{ egress.tunnel_subnet }}
+fwmark: {{ egress.fwmark }}
+table: {{ egress.table }}
+zones:
+{% for zone in egress.zones %}
+  - {{ zone }}
+{% endfor %}
+lan_subnets:
+{% for subnet in egress.lan_subnets %}
+  - {{ subnet }}
+{% endfor %}
 {% else %}
 network_name: null
 gateway: null
 gateway_address: null
+interface: null
+wireguard_secret: null
+dns_upstream: null
+coredns_address: null
+tunnel_subnet: null
+fwmark: null
+table: null
+zones: []
+lan_subnets: []
 {% endif %}
 {% if tunnel_services_by_host %}
 hosts:

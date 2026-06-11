@@ -417,10 +417,31 @@ def _resolve_egress_gateway(
         raise ValueError(
             f"egress_gateway.gateway '{config.gateway}' is not a known host"
         )
+
+    # The gateway's split resolver forwards managed zones to CoreDNS; resolve
+    # the CoreDNS host's canonical address for that forward.
+    coredns_host = next(
+        (host for host in dns_model.hosts if host.name == "coredns"), None
+    )
+    if coredns_host is None:
+        raise ValueError(
+            "egress gateway split DNS needs a 'coredns' host in the DNS "
+            "inventory to forward managed zones to"
+        )
+
     return EgressGateway(
         network_name=config.network_name,
         gateway=config.gateway,
         gateway_address=host.ip,
+        interface=config.interface,
+        wireguard_secret=config.wireguard_secret,
+        dns_upstream=config.dns_upstream,
+        coredns_address=coredns_host.ip,
+        zones=tuple(zone.name for zone in dns_model.zones),
+        tunnel_subnet=config.tunnel_subnet,
+        lan_subnets=tuple(config.lan_subnets),
+        fwmark=config.fwmark,
+        table=config.table,
     )
 
 
@@ -684,16 +705,25 @@ def normalize_ansible_groups(
     managed_network_hosts = tuple(
         sorted(host.name for host in dns_model.hosts if host.network is not None)
     )
+    egress_gateway_hosts = (
+        (services_model.egress.gateway,) if services_model.egress else ()
+    )
+    # Docker hosts that actually run a tunneled service get the tunnel network
+    # + policy routing applied. These are exactly the keys of the per-host
+    # tunnel map.
+    tunnel_routing_hosts = tuple(sorted(services_model.tunnel_services_by_host))
 
     fields: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("coredns_hosts", tuple(sorted(coredns_hosts))),
         ("docker_hosts", docker_hosts),
+        ("egress_gateway_hosts", egress_gateway_hosts),
         ("homepage_hosts", homepage_model.hosts),
         ("managed_network_hosts", managed_network_hosts),
         ("monitoring_hosts", monitoring_model.hosts),
         ("nfs_export_hosts", nfs_export_hosts),
         ("storage_hosts", storage_hosts),
         ("traefik_hosts", _platform_hosts(services_model, {"traefik"})),
+        ("tunnel_routing_hosts", tunnel_routing_hosts),
     )
 
     return AnsibleGroupsModel(
@@ -705,6 +735,8 @@ def normalize_ansible_groups(
         homepage_hosts=homepage_model.hosts,
         monitoring_hosts=monitoring_model.hosts,
         managed_network_hosts=managed_network_hosts,
+        egress_gateway_hosts=egress_gateway_hosts,
+        tunnel_routing_hosts=tunnel_routing_hosts,
         groups=fields,
     )
 

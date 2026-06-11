@@ -72,15 +72,26 @@ class ComposeDataDir(BaseModel):
 
 
 class EgressGateway(BaseModel):
-    """Resolved shared-WireGuard-egress config: the external tunnel network
-    name plus the gateway host and its address (split-DNS resolver + routing
-    next-hop). Present only when at least one service is tunneled. See T-066."""
+    """Resolved shared-WireGuard-egress config. Present only when at least one
+    service is tunneled. Carries the external tunnel network name, the gateway
+    host + address (split-DNS resolver + routing next-hop), the WireGuard
+    interface + secret source, and the split-DNS inputs (managed zones forward
+    to CoreDNS, everything else to the in-tunnel upstream). See T-066."""
 
     model_config = ConfigDict(frozen=True)
 
     network_name: str
     gateway: str
     gateway_address: str
+    interface: str
+    wireguard_secret: str
+    dns_upstream: str
+    coredns_address: str
+    zones: tuple[str, ...]
+    tunnel_subnet: str
+    lan_subnets: tuple[str, ...]
+    fwmark: int
+    table: int
 
 
 class ComposeFile(BaseModel):

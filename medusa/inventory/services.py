@@ -1,3 +1,4 @@
+from ipaddress import ip_network
 from pathlib import PurePosixPath
 from typing import Any, Literal, Self
 
@@ -421,13 +422,80 @@ class EgressGatewayInventory(BaseModel):
 
     gateway: str
     network_name: str = "medusa-tunnel"
+    # WireGuard interface name brought up on the gateway host.
+    interface: str = "wg0"
+    # SOPS-encrypted source (relative path under the inventory secrets root)
+    # holding the full wg-quick(8) config for the gateway interface. The VPN
+    # provider's keys/endpoint live here, never in cleartext inventory.
+    wireguard_secret: str
+    # Resolver for non-managed-zone lookups by tunneled clients, reachable
+    # THROUGH the tunnel (e.g. the VPN provider's internal DNS). Sending
+    # external queries here over WireGuard is what prevents a DNS leak.
+    dns_upstream: str
+    # CIDR for the external `medusa-tunnel` Docker network created on each
+    # Docker host that runs a tunneled service. Tunneled containers get
+    # addresses here; the host marks traffic from this subnet for policy
+    # routing.
+    tunnel_subnet: str
+    # Subnets that stay DIRECT for tunneled containers (LAN, NFS, internal
+    # services). Everything outside these is routed through the gateway. At
+    # least one is required — miss one and that path breaks for tunneled
+    # services. Operator-supplied; not hardcoded.
+    lan_subnets: list[str] = Field(min_length=1)
+    # Firewall mark + routing table used to steer tunneled traffic. Defaults
+    # are fine unless they collide with existing host policy routing.
+    fwmark: conint(ge=1, le=4294967295) = 1
+    table: conint(ge=1, le=4294967295) = 100
 
-    @field_validator("gateway", "network_name")
+    @field_validator("tunnel_subnet")
+    @classmethod
+    def validate_tunnel_subnet(cls, value: str) -> str:
+        normalized = value.strip()
+        try:
+            ip_network(normalized, strict=False)
+        except ValueError as error:
+            raise ValueError(
+                f"egress_gateway.tunnel_subnet must be a CIDR: {error}"
+            ) from error
+        return normalized
+
+    @field_validator("lan_subnets")
+    @classmethod
+    def validate_lan_subnets(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for item in value:
+            cidr = item.strip()
+            try:
+                ip_network(cidr, strict=False)
+            except ValueError as error:
+                raise ValueError(
+                    f"egress_gateway.lan_subnets entry must be a CIDR: {error}"
+                ) from error
+            normalized.append(cidr)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("egress_gateway.lan_subnets cannot contain duplicates")
+        return normalized
+
+    @field_validator("gateway", "network_name", "interface", "dns_upstream")
     @classmethod
     def normalize_non_empty(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized:
             raise ValueError("egress_gateway fields cannot be empty")
+        return normalized
+
+    @field_validator("wireguard_secret")
+    @classmethod
+    def normalize_secret_source(cls, value: str) -> str:
+        normalized = value.strip().removesuffix(".sops.yaml")
+        if not normalized:
+            raise ValueError("egress_gateway.wireguard_secret cannot be empty")
+        path = PurePosixPath(normalized)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(
+                "egress_gateway.wireguard_secret must be a relative path "
+                "under secrets"
+            )
         return normalized
 
 

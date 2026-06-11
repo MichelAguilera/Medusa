@@ -1,0 +1,138 @@
+---
+# T-066: shared WireGuard egress gateway.
+#
+# Brings up a WireGuard interface, NATs forwarded traffic out of it behind a
+# fail-closed kill-switch (nftables, drop policy), and runs a split-DNS
+# resolver so tunneled clients resolve managed zones via CoreDNS and everything
+# else through the tunnel (no DNS leak). The WireGuard config itself is an
+# operator secret delivered from SOPS; Medusa never renders or stores it.
+#
+# This role assumes a DEDICATED gateway host. The nftables forward chain uses a
+# drop policy; do not co-locate this with a Docker host or another router whose
+# forwarded traffic must survive.
+
+- name: Load generated egress manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/egress-manifest.yaml"
+    name: medusa_egress
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Gather minimal facts for package-manager dispatch
+  ansible.builtin.setup:
+    gather_subset:
+      - min
+
+- name: Refresh apt cache (Debian)
+  ansible.builtin.apt:
+    update_cache: true
+  become: true
+  when: ansible_os_family == "Debian"
+
+- name: Ensure WireGuard, resolver, and firewall packages are installed
+  ansible.builtin.package:
+    name: "{{ medusa_egress_packages }}"
+    state: present
+  become: true
+
+- name: Enable IPv4 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+  become: true
+
+# --- WireGuard interface (operator secret via SOPS) ---
+- name: Decrypt the WireGuard config on the controller
+  ansible.builtin.command:
+    argv:
+      - sops
+      - --decrypt
+      - --extract
+      - '["value"]'
+      - "{{ medusa_secrets_root }}/{{ medusa_egress.wireguard_secret }}.sops.yaml"
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  check_mode: false
+  no_log: true
+  register: medusa_wg_config
+
+- name: Ensure the WireGuard config directory exists
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+  become: true
+
+- name: Install the WireGuard interface config
+  ansible.builtin.copy:
+    content: "{{ medusa_wg_config.stdout }}\n"
+    dest: "/etc/wireguard/{{ medusa_egress.interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  become: true
+  no_log: true
+  notify: Restart WireGuard interface
+
+- name: Enable and start the WireGuard interface
+  ansible.builtin.systemd_service:
+    name: "wg-quick@{{ medusa_egress.interface }}"
+    enabled: true
+    state: started
+  become: true
+
+# --- NAT + fail-closed kill-switch (nftables) ---
+- name: Deploy the egress nftables ruleset
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/egress/{{ medusa_egress.gateway }}/nftables.conf"
+    dest: "{{ medusa_egress_nftables_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Reload nftables ruleset
+
+- name: Ensure the main nftables config includes the egress ruleset
+  ansible.builtin.blockinfile:
+    path: /etc/nftables.conf
+    create: true
+    owner: root
+    group: root
+    mode: "0644"
+    marker: "# {mark} MEDUSA EGRESS"
+    block: |
+      include "{{ medusa_egress_nftables_file }}"
+  become: true
+  notify: Reload nftables ruleset
+
+- name: Enable and start nftables
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+    state: started
+  become: true
+
+# --- Split DNS resolver ---
+- name: Deploy the split-DNS resolver config
+  ansible.builtin.copy:
+    src: "{{ medusa_generated_dir }}/egress/{{ medusa_egress.gateway }}/resolver.conf"
+    dest: "{{ medusa_egress_resolver_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Restart split-DNS resolver
+
+- name: Enable and start the split-DNS resolver
+  ansible.builtin.systemd_service:
+    name: "{{ medusa_egress_resolver_service }}"
+    enabled: true
+    state: started
+  become: true

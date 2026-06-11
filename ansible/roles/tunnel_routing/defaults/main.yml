@@ -1,0 +1,8 @@
+---
+# Packages the routing setup needs (nftables for marking, iproute2 for policy
+# routing). Names are identical on Debian and Arch.
+medusa_tunnel_routing_packages:
+  - nftables
+  - iproute2
+
+medusa_tunnel_routing_nftables_file: /etc/nftables.d/medusa-tunnel.nft

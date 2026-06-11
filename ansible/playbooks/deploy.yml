@@ -22,6 +22,16 @@
   roles:
     - coredns
 
+# Bring up the shared WireGuard egress gateway before any tunneled container
+# starts, so the tunnel network's split resolver and NAT/kill-switch exist when
+# compose attaches services to it. Ordered after CoreDNS because the gateway's
+# split DNS forwards managed zones there. See T-066.
+- name: Configure the WireGuard egress gateway
+  hosts: egress_gateway_hosts
+  gather_facts: false
+  roles:
+    - wireguard_gateway
+
 - name: Install the Docker engine on managed Docker hosts
   hosts: docker_hosts
   gather_facts: false
@@ -33,6 +43,15 @@
   gather_facts: false
   roles:
     - deploy_root
+
+# Create the tunnel network + split policy routing on Docker hosts that run a
+# tunneled service, before any tunneled stack comes up (the external network
+# must exist, and traffic must be routed through the gateway). See T-066.
+- name: Configure tunnel routing on Docker hosts
+  hosts: tunnel_routing_hosts
+  gather_facts: false
+  roles:
+    - tunnel_routing
 
 - name: Deploy managed NFS exports
   hosts: nfs_export_hosts
