@@ -1556,7 +1556,7 @@ Flags:
   --full                 Mark host as 'full' managed mode. Required to
                          allow prep-target + hardening audit. Mutually
                          exclusive with --limited.
-  --prep                 After add, run prep-debian.sh against the target
+  --prep                 After add, run host prep against the target
                          via root SSH (prompts for shared root password).
                          Mode-aware: on --full hosts runs general prep
                          + hardening (sshd clamp + root lock); on
@@ -1929,7 +1929,11 @@ EOF
 cmd_prep_target() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
-medusactl prep-target — re-run prep-debian.sh against an existing target.
+medusactl prep-target — (re-)run host prep against an existing target.
+
+Detects the target OS family and runs the matching prep script
+(prep-debian.sh / prep-arch.sh) via the prep-host.sh dispatcher, so
+Debian- and Arch-family hosts (incl. Omarchy) are both supported.
 
 Usage:
   medusactl prep-target <name>
@@ -2053,11 +2057,14 @@ cd "$MEDUSA_CONTROLLER_PATH"
 pubkey_b64=\$(base64 -w0 < ~/.ssh/id_ed25519.pub) \\
     || { echo "controller pubkey base64 encode failed" >&2; exit 1; }
 remote_tmp=/tmp/medusa-prep.\$\$
+ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
+    ${user}@${name} "mkdir -p \${remote_tmp}" \\
+    || { echo "could not create remote temp dir on ${name}" >&2; exit 1; }
 scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
-    tools/prep-debian.sh ${user}@${name}:\${remote_tmp}
+    tools/prep-host.sh tools/prep-debian.sh tools/prep-arch.sh ${user}@${name}:\${remote_tmp}/
 ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
     ${user}@${name} \\
-    "sudo -- env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
+    "sudo -- env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}/prep-host.sh; rc=\\\$?; rm -rf \${remote_tmp}; exit \\\$rc"
 REMOTE
 )
     else
@@ -2070,19 +2077,26 @@ fi
 pubkey_b64=\$(base64 -w0 < ~/.ssh/id_ed25519.pub) \\
     || { echo "controller pubkey base64 encode failed" >&2; exit 1; }
 remote_tmp=/tmp/medusa-prep.\$\$
+SSHPASS=$(printf %q "$password") sshpass -e ssh \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o ConnectTimeout=10 \\
+    -o PreferredAuthentications=password \\
+    -o PubkeyAuthentication=no \\
+    root@${name} "mkdir -p \${remote_tmp}" \\
+    || { echo "could not create remote temp dir on ${name}" >&2; exit 1; }
 SSHPASS=$(printf %q "$password") sshpass -e scp \\
     -o StrictHostKeyChecking=accept-new \\
     -o ConnectTimeout=10 \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
-    tools/prep-debian.sh root@${name}:\${remote_tmp}
+    tools/prep-host.sh tools/prep-debian.sh tools/prep-arch.sh root@${name}:\${remote_tmp}/
 SSHPASS=$(printf %q "$password") sshpass -e ssh \\
     -o StrictHostKeyChecking=accept-new \\
     -o ConnectTimeout=10 \\
     -o PreferredAuthentications=password \\
     -o PubkeyAuthentication=no \\
     root@${name} \\
-    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}; rc=\\\$?; rm -f \${remote_tmp}; exit \\\$rc"
+    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}/prep-host.sh; rc=\\\$?; rm -rf \${remote_tmp}; exit \\\$rc"
 REMOTE
 )
     fi
@@ -2706,7 +2720,7 @@ _medusactl() {
         'remove-target:strip a host from inventory + bootstrap blocks'
         'promote-target:clear bootstrap_ip so the host drops out of /etc/hosts'
         'list-targets:print the host inventory'
-        'prep-target:re-run prep-debian.sh against an existing target'
+        'prep-target:(re-)run host prep against an existing target (OS-detected)'
         'authorize-target:ssh-copy-id from controller to an existing target'
         'seed-target:non-destructive limited-mode onboarding (key + sudoers)'
         'migrate-deploy-root:copy old operator-home deploy roots to /home/medusa'
@@ -2747,7 +2761,7 @@ _medusactl() {
                 '--group[ansible group]:group:' \
                 '--full[mark as full managed mode]' \
                 '--limited[mark as limited managed mode]' \
-                '--prep[also run prep-debian.sh; mode-aware harden gate]' \
+                '--prep[also run host prep (OS-detected); mode-aware harden gate]' \
                 '--seed[also run seed-target; limited mode only]' \
                 '--authorize[also run ssh-copy-id]' \
                 '--no-seed-hosts[skip /etc/hosts seed]' \
@@ -2794,7 +2808,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'add-target' -d 'Add a host 
 complete -c medusactl -n '__fish_use_subcommand' -a 'remove-target' -d 'Strip a host from inventory + bootstrap blocks'
 complete -c medusactl -n '__fish_use_subcommand' -a 'promote-target' -d 'Clear bootstrap_ip so the host drops out of /etc/hosts'
 complete -c medusactl -n '__fish_use_subcommand' -a 'list-targets' -d 'Print the host inventory'
-complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d 'Re-run prep-debian.sh against an existing target'
+complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d '(Re-)run host prep against an existing target (OS-detected)'
 complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-copy-id from controller to an existing target'
 complete -c medusactl -n '__fish_use_subcommand' -a 'seed-target' -d 'Non-destructive limited-mode onboarding (key + sudoers)'
 complete -c medusactl -n '__fish_use_subcommand' -a 'migrate-deploy-root' -d 'Copy old operator-home deploy roots to /home/medusa'
@@ -2823,7 +2837,7 @@ complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l alias -d 'D
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l group -d 'ansible group'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l full -d 'Mark as full managed mode'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l limited -d 'Mark as limited managed mode'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run prep-debian.sh (mode-aware harden gate)'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run host prep (OS-detected; mode-aware harden gate)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l seed -d 'Also run seed-target (limited mode only)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l authorize -d 'Also run ssh-copy-id'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l no-seed-hosts -d 'Skip /etc/hosts seed'
