@@ -14,10 +14,16 @@ set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# Path overrides exist only so the dispatcher is testable off-target; they
+# default to the real system paths, so production behavior is unaffected.
+os_release="${MEDUSA_PREP_OS_RELEASE:-/etc/os-release}"
+debian_marker="${MEDUSA_PREP_DEBIAN_MARKER:-/etc/debian_version}"
+arch_marker="${MEDUSA_PREP_ARCH_MARKER:-/etc/arch-release}"
+
 family=""
-if [[ -f /etc/os-release ]]; then
+if [[ -f "$os_release" ]]; then
     # shellcheck disable=SC1091
-    . /etc/os-release
+    . "$os_release"
     case " ${ID:-} ${ID_LIKE:-} " in
         *" debian "*|*" ubuntu "*) family=debian ;;
         *" arch "*)                family=arch ;;
@@ -25,9 +31,9 @@ if [[ -f /etc/os-release ]]; then
 fi
 # Fallbacks when os-release is missing or unhelpful.
 if [[ -z "$family" ]]; then
-    if [[ -f /etc/debian_version ]]; then
+    if [[ -f "$debian_marker" ]]; then
         family=debian
-    elif [[ -f /etc/arch-release ]]; then
+    elif [[ -f "$arch_marker" ]]; then
         family=arch
     fi
 fi
