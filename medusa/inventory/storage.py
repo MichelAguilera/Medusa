@@ -42,6 +42,44 @@ class NfsExportInventory(BaseModel):
         return normalized
 
 
+class NfsServerInventory(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    # Mountpoint of the ZFS pool root for this server (e.g. "/tank"). When set,
+    # Medusa auto-creates missing export paths following the operator's
+    # convention: the first path segment below the pool root is provisioned as a
+    # ZFS dataset, every deeper segment as a plain directory inside it. The pool
+    # root dataset NAME is assumed to equal the mountpoint without its leading
+    # slash (the `zpool create tank` default => dataset "tank" at "/tank"); a
+    # pool mounted somewhere other than "/<dataset>" is out of scope. When unset,
+    # export paths are created as plain directories (no dataset). See T-071.
+    zfs_root: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("server name cannot be empty")
+        return normalized
+
+    @field_validator("zfs_root")
+    @classmethod
+    def normalize_zfs_root(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("zfs_root cannot be empty when set")
+        if not normalized.startswith("/"):
+            raise ValueError("zfs_root must be absolute")
+        normalized = normalized.rstrip("/") or "/"
+        if normalized == "/":
+            raise ValueError("zfs_root cannot be the filesystem root")
+        return normalized
+
+
 class NfsMountInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -99,12 +137,17 @@ class StorageInventory(BaseModel):
 
     exports: list[NfsExportInventory] = Field(default_factory=list)
     mounts: list[NfsMountInventory] = Field(default_factory=list)
+    servers: list[NfsServerInventory] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_references_and_uniqueness(self) -> Self:
         export_ids = [export.id for export in self.exports]
         if len(export_ids) != len(set(export_ids)):
             raise ValueError("export ids must be unique")
+
+        server_names = [server.name for server in self.servers]
+        if len(server_names) != len(set(server_names)):
+            raise ValueError("server names must be unique")
 
         mount_ids = [mount.id for mount in self.mounts]
         if len(mount_ids) != len(set(mount_ids)):

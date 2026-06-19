@@ -181,6 +181,37 @@ def normalize_network(dns_model: DnsModel) -> NetworkModel:
     )
 
 
+def _export_path_plan(
+    path: str, zfs_root: str | None
+) -> tuple[str | None, tuple[str, ...]]:
+    """Derive the (dataset, directories) provisioning plan for an export path.
+
+    Convention (T-071): under a ZFS pool root, the first path segment is a
+    dataset and every deeper segment is a plain directory inside it. Returns the
+    dataset NAME to ensure (or None) and the absolute paths to create+chown (the
+    dataset mountpoint plus deeper dirs, or just the export path when the server
+    has no pool root).
+    """
+    if zfs_root is None:
+        return None, (path,)
+    if path == zfs_root:
+        # The export targets the pool root itself; it already exists.
+        return None, ()
+    prefix = zfs_root + "/"
+    if not path.startswith(prefix):
+        raise ValueError(
+            f"export path {path} is outside the declared zfs_root {zfs_root}"
+        )
+    segments = path[len(prefix):].split("/")
+    dataset = f"{zfs_root.lstrip('/')}/{segments[0]}"
+    directories: list[str] = []
+    accumulator = zfs_root
+    for segment in segments:
+        accumulator = f"{accumulator}/{segment}"
+        directories.append(accumulator)
+    return dataset, tuple(directories)
+
+
 def normalize_storage(
     inventory: StorageInventory,
     dns_model: DnsModel,
@@ -195,6 +226,17 @@ def normalize_storage(
             if export.server not in known_hosts
         }
     )
+    unknown_config_servers = sorted(
+        {
+            server.name
+            for server in inventory.servers
+            if server.name not in known_hosts
+        }
+    )
+    if unknown_config_servers:
+        formatted = ", ".join(unknown_config_servers)
+        raise ValueError(f"server config references unknown hosts: {formatted}")
+
     if unknown_servers:
         formatted = ", ".join(unknown_servers)
         raise ValueError(f"exports reference unknown hosts: {formatted}")
@@ -269,6 +311,9 @@ def normalize_storage(
         )
         for host in sorted(mounts_by_host)
     )
+    zfs_root_by_server = {
+        server.name: server.zfs_root for server in inventory.servers
+    }
     exports_by_server: dict[str, list[NfsServerExport]] = {}
     for export in exports.values():
         export_mounts = sorted(
@@ -292,8 +337,17 @@ def normalize_storage(
                 key=lambda item: item.host,
             )
         )
+        dataset, directories = _export_path_plan(
+            export.path, zfs_root_by_server.get(export.server)
+        )
         exports_by_server.setdefault(export.server, []).append(
-            NfsServerExport(id=export.id, path=export.path, clients=clients)
+            NfsServerExport(
+                id=export.id,
+                path=export.path,
+                clients=clients,
+                dataset=dataset,
+                directories=directories,
+            )
         )
     exports_by_server_tuple = tuple(
         (

@@ -31,6 +31,13 @@ class NfsServerExport(BaseModel):
     id: str
     path: str
     clients: tuple[NfsExportClient, ...]
+    # Path-provisioning plan for the export source (T-071). `dataset`, when set,
+    # is the ZFS dataset NAME the nfs_exports role ensures (state=present) before
+    # `exportfs -ra`; `directories` are the absolute paths to create+chown (the
+    # dataset mountpoint plus any deeper plain dirs, or the bare export path when
+    # the server has no ZFS pool root). Empty `dataset` means "no dataset".
+    dataset: str | None = None
+    directories: tuple[str, ...] = ()
 
 
 class NfsMount(BaseModel):

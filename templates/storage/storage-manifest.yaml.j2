@@ -17,3 +17,26 @@ hosts:
 {% else %}
 hosts: {}
 {% endif %}
+{% set ns = namespace(any=false) %}
+{% for server, exports in storage.exports_by_server %}
+{% for export in exports %}
+{% if export.clients %}{% set ns.any = true %}{% endif %}
+{% endfor %}
+{% endfor %}
+{% if ns.any %}
+servers:
+{% for server, exports in storage.exports_by_server %}
+{% if exports | selectattr("clients") | list %}
+  {{ server }}:
+{% for export in exports %}
+{% if export.clients %}
+  - path: {{ export.path }}
+    dataset: {{ export.dataset if export.dataset else "" }}
+    directories: [{{ export.directories | join(", ") }}]
+{% endif %}
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% else %}
+servers: {}
+{% endif %}

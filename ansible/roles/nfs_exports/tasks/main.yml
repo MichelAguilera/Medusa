@@ -23,6 +23,38 @@
     mode: "0755"
   become: true
 
+- name: Load generated storage manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/storage-manifest.yaml"
+    name: medusa_storage_manifest
+
+- name: Resolve managed exports for this server
+  ansible.builtin.set_fact:
+    medusa_server_exports: >-
+      {{ (medusa_storage_manifest.servers | default({}))[inventory_hostname]
+         | default([]) }}
+
+- name: Ensure ZFS datasets backing exports exist
+  community.general.zfs:
+    name: "{{ item.dataset }}"
+    state: present
+  become: true
+  loop: "{{ medusa_server_exports | selectattr('dataset') | list }}"
+  loop_control:
+    label: "{{ item.dataset }}"
+
+- name: Ensure export directories exist with managed ownership
+  ansible.builtin.file:
+    path: "{{ item.1 }}"
+    state: directory
+    owner: "1000"
+    group: "1000"
+    mode: "0755"
+  become: true
+  loop: "{{ medusa_server_exports | subelements('directories') }}"
+  loop_control:
+    label: "{{ item.1 }}"
+
 - name: Deploy managed NFS exports
   ansible.builtin.copy:
     src: "{{ medusa_generated_dir }}/storage/exports/{{ inventory_hostname }}/medusa.exports"

@@ -151,8 +151,22 @@ info "Ensuring user '$USERNAME' exists..."
 if id "$USERNAME" >/dev/null 2>&1; then
     info "  user already exists; leaving as-is"
 else
-    useradd -m -s /bin/bash "$USERNAME" \
+    # -p '*' creates a disabled-but-NOT-locked password (shadow field '*'),
+    # matching Debian's `adduser --disabled-password`. A bare useradd leaves
+    # the field '!' (locked), which sshd rejects even for pubkey auth when
+    # UsePAM is off (e.g. Omarchy's sshd: "account is locked"). '*' allows
+    # key auth while still permitting no password login.
+    useradd -m -s /bin/bash -p '*' "$USERNAME" \
         || phase_fail "user" "useradd failed for $USERNAME"
+fi
+
+# Repair a locked password field on a pre-existing/previously-prepped account
+# ('!' or '!!' with no hash) so key auth works under UsePAM=no. Only touches
+# the locked-with-no-hash case; never clobbers a real password the operator set.
+current_pw=$(getent shadow "$USERNAME" 2>/dev/null | cut -d: -f2 || true)
+if [[ "$current_pw" == "!" || "$current_pw" == "!!" || -z "$current_pw" ]]; then
+    usermod -p '*' "$USERNAME" \
+        || phase_fail "user" "could not clear locked password field for $USERNAME"
 fi
 
 # On Arch the sudo group is 'wheel'. Parity with the Debian variant's
