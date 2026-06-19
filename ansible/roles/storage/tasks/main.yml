@@ -147,8 +147,29 @@
   become: true
   notify: Reload systemd daemon
 
-# fstab persistence is via the managed region above; mount the live filesystems
-# without touching fstab (state: ephemeral) so the two never fight.
+# A mountpoint already mounted (by its systemd automount, or a pre-existing
+# mount whose source string differs -- FQDN vs IP) must be left alone: an
+# ephemeral mount over it fails ("already mounted with a different source"), and
+# unmounting a live filesystem under running services is not ours to do here.
+- name: Detect already-mounted managed mountpoints
+  ansible.builtin.command:
+    cmd: "findmnt -rno TARGET {{ item.mountpoint }}"
+  become: true
+  changed_when: false
+  failed_when: false
+  register: medusa_already_mounted
+  loop: "{{ medusa_host_mounts }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+
+- name: Record mountpoints that are already mounted
+  ansible.builtin.set_fact:
+    medusa_mounted_paths: >-
+      {{ medusa_already_mounted.results | selectattr('rc', 'equalto', 0)
+         | map(attribute='item.mountpoint') | list }}
+
+# fstab persistence is via the managed region above; mount the not-yet-mounted
+# filesystems without touching fstab (state: ephemeral) so the two never fight.
 - name: Mount managed NFS filesystems
   ansible.posix.mount:
     path: "{{ item.mountpoint }}"
@@ -160,6 +181,7 @@
   loop: "{{ medusa_host_mounts }}"
   loop_control:
     label: "{{ item.mountpoint }}"
+  when: item.mountpoint not in medusa_mounted_paths
 
 # Verify gate: every declared mountpoint must end up mounted, else fail loudly
 # rather than leave a half-migrated host.
