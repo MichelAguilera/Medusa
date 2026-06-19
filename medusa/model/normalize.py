@@ -357,11 +357,20 @@ def normalize_storage(
         for server in sorted(exports_by_server)
     )
 
+    zfs_roots_tuple = tuple(
+        sorted(
+            (server.name, server.zfs_root)
+            for server in inventory.servers
+            if server.zfs_root is not None
+        )
+    )
+
     return StorageModel(
         exports=tuple(sorted(exports.values(), key=lambda item: item.id)),
         exports_by_server=exports_by_server_tuple,
         mounts=mounts,
         mounts_by_host=mounts_by_host_tuple,
+        zfs_roots=zfs_roots_tuple,
     )
 
 

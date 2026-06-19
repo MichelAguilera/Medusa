@@ -114,14 +114,60 @@
      else 'unknown')
     != item.item.client_ip
 
-- name: Mount and persist managed NFS mounts
+# Adopt any pre-existing per-mount fstab lines into the managed region: strip
+# every existing line for a managed mountpoint (legacy unfenced lines AND any
+# stale in-region line) so the blockinfile below is the single source of truth.
+# Scoped to declared mountpoints only -- non-managed fstab lines are untouched.
+# Editing fstab never unmounts a live mount, so this is safe on running hosts.
+- name: Adopt existing managed mountpoints into the managed fstab region
+  ansible.builtin.lineinfile:
+    path: /etc/fstab
+    regexp: "^\\S+\\s+{{ item.mountpoint | regex_escape }}\\s"
+    state: absent
+    backup: true
+  become: true
+  loop: "{{ medusa_host_mounts }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+
+# Medusa owns exactly the lines between these markers. Mounts dropped from
+# inventory leave the region (and thus fstab) on the next deploy. Lines outside
+# the markers are never touched. state is driven by whether the host has any
+# managed mounts, so the region is removed cleanly when the last one goes.
+- name: Persist managed NFS mounts in the fstab managed region
+  ansible.builtin.blockinfile:
+    path: /etc/fstab
+    marker: "# {mark} MEDUSA MANAGED MOUNTS"
+    state: "{{ 'present' if medusa_host_mounts | length > 0 else 'absent' }}"
+    backup: true
+    block: |
+      {% for mount in medusa_host_mounts %}
+      {{ mount.source }} {{ mount.mountpoint }} {{ mount.fstype }} {{ mount.options }} 0 0
+      {% endfor %}
+  become: true
+  notify: Reload systemd daemon
+
+# fstab persistence is via the managed region above; mount the live filesystems
+# without touching fstab (state: ephemeral) so the two never fight.
+- name: Mount managed NFS filesystems
   ansible.posix.mount:
     path: "{{ item.mountpoint }}"
     src: "{{ item.source }}"
     fstype: "{{ item.fstype }}"
     opts: "{{ item.options }}"
-    state: mounted
+    state: ephemeral
   become: true
+  loop: "{{ medusa_host_mounts }}"
+  loop_control:
+    label: "{{ item.mountpoint }}"
+
+# Verify gate: every declared mountpoint must end up mounted, else fail loudly
+# rather than leave a half-migrated host.
+- name: Verify managed NFS mounts are active
+  ansible.builtin.command:
+    cmd: "mountpoint -q {{ item.mountpoint }}"
+  become: true
+  changed_when: false
   loop: "{{ medusa_host_mounts }}"
   loop_control:
     label: "{{ item.mountpoint }}"

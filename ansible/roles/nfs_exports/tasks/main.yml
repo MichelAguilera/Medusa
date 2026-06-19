@@ -55,6 +55,38 @@
   loop_control:
     label: "{{ item.1 }}"
 
+# Orphan detection (T-072): warn -- never destroy -- about datasets under the
+# pool root that back no declared export. Medusa is create-only for ZFS; the
+# operator decides whether any flagged dataset is truly stale.
+- name: Resolve ZFS pool root for this server
+  ansible.builtin.set_fact:
+    medusa_zfs_root: >-
+      {{ (medusa_storage_manifest.zfs_roots | default({}))[inventory_hostname]
+         | default('') }}
+    medusa_declared_datasets: >-
+      {{ medusa_server_exports | selectattr('dataset') | map(attribute='dataset')
+         | unique | list }}
+
+- name: List first-level datasets under the pool root
+  ansible.builtin.command:
+    cmd: "zfs list -H -o name -d 1 -r {{ medusa_zfs_root | regex_replace('^/', '') }}"
+  become: true
+  changed_when: false
+  failed_when: false
+  register: medusa_zfs_children
+  when: medusa_zfs_root | length > 0
+
+- name: Warn about orphaned ZFS datasets backing no declared export
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: ZFS dataset {{ item }} under {{ medusa_zfs_root }} backs no
+      declared Medusa export. Medusa never destroys data; run
+      'zfs destroy {{ item }}' by hand only if it is truly stale.
+  loop: >-
+    {{ (medusa_zfs_children.stdout_lines | default([]) | select('search', '/')
+        | list) | difference(medusa_declared_datasets) }}
+  when: medusa_zfs_root | length > 0
+
 - name: Deploy managed NFS exports
   ansible.builtin.copy:
     src: "{{ medusa_generated_dir }}/storage/exports/{{ inventory_hostname }}/medusa.exports"
