@@ -130,6 +130,12 @@ class SecretSource(BaseModel):
     mode: str
     setting: str
     secret_name: str
+    # Which identity owns the decrypted file on the host. "service" -> the medusa
+    # runtime user (compose secrets, read by the user that runs Compose);
+    # "system" -> root (a system-daemon secret like the WireGuard gateway config,
+    # on a host that may not even have the medusa user). The decrypt unit maps
+    # this to a concrete uid. See T-080.
+    owner: Literal["service", "system"] = "service"
 
 
 class ServicesModel(BaseModel):
@@ -138,7 +144,13 @@ class ServicesModel(BaseModel):
     services: tuple[ServiceRecord, ...]
     traefik: tuple[TraefikRoute, ...]
     traefik_routes_by_host: dict[str, tuple[TraefikRoute, ...]]
+    # Debian/Docker compose render target only. NixOS hosts are partitioned out
+    # here (not in render_compose) so the renderer never branches on platform and
+    # no host renders to both compose and Nix. See the Platform Fork Boundary ADR.
     compose: tuple[ComposeFile, ...]
+    # The same compose intent for NixOS hosts, consumed only by the normalize_nixos
+    # crosscut (-> oci-containers). Never rendered to Debian compose files.
+    nixos_compose: tuple[ComposeFile, ...]
     env_files: tuple[GeneratedEnvFile, ...]
     data_dirs: tuple[ComposeDataDir, ...]
     secret_sources: tuple[SecretSource, ...]

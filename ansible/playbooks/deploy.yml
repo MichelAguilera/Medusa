@@ -30,6 +30,11 @@
   hosts: egress_gateway_hosts
   gather_facts: false
   roles:
+    # secrets first: it installs the medusa-secrets unit and decrypts the gateway
+    # WireGuard config to tmpfs host-side (T-080), which wireguard_gateway then
+    # symlinks wg-quick at. The gateway is not a docker host, so it does not get
+    # the secrets role from the docker_hosts play.
+    - secrets
     - wireguard_gateway
 
 - name: Install the Docker engine on managed Docker hosts

@@ -218,6 +218,48 @@ class HostInventory(BaseModel):
     # proxy (unmanaged) can opt in without any service records. Proxy hosts
     # get a wildcard automatically regardless of this flag.
     wildcard: bool = False
+    # Deploy platform for this host. "debian-docker" (default) renders to the
+    # historical Compose + fstab + systemd-networkd path driven by Ansible.
+    # "nixos" renders to a generated Nix module/flake driven by nixos-rebuild
+    # (T-074/T-075) and is excluded from every Ansible role group. Orthogonal
+    # to ansible_managed_mode: a host's platform and its access mode are
+    # independent. Default keeps every existing host on the Debian path. See
+    # T-073.
+    platform: Literal["debian-docker", "nixos"] = "debian-docker"
+    # Guest type for a nixos host. "vm" (Proxmox/KVM) gets the QEMU guest agent
+    # (services.qemuGuest.enable) so the hypervisor can read the guest's IP, run
+    # graceful shutdown, etc.; "lxc" (Proxmox container) gets no agent and cannot
+    # use disko -- a container has no block device; "physical" gets no agent but
+    # can use disko. Only meaningful for platform: nixos (ignored on debian).
+    # Default "vm" -- the common Proxmox case and the SFTP pilot (T-078).
+    nixos_guest: Literal["vm", "lxc", "physical"] = "vm"
+    # Opt into Medusa-staged disko partitioning for the nixos-anywhere bootstrap
+    # (T-078). When true, the operator authors `templates/nixos/disko/<name>.nix`
+    # (a real disko.devices Nix file -- disk layout is operator territory,
+    # T-071/T-072); render stages it verbatim into the flake tree and the host
+    # module + flake import disko and that config. Default false: a nixos host
+    # whose disk is already laid out (or managed elsewhere) needs no disko.
+    # Requires platform: nixos and a guest with a real disk (not lxc).
+    nixos_disko: bool = False
+    # Admin/deploy SSH public keys authorized for this host's deploy user
+    # (``ansible_user`` -- root or a wheel user). Plain inventory data: public
+    # keys are not secret. Without at least one, `nixos-rebuild --target-host`
+    # cannot authenticate, so a deployable nixos host needs one. nixos-only.
+    nixos_admin_keys: list[str] = Field(default_factory=list)
+    # NixOS `system.stateVersion` for this host -- the release it was first
+    # installed with. Pinned at install and NEVER bumped on upgrade (it guards
+    # stateful defaults), so it is host data, not derived from the flake's
+    # nixpkgs pin. Defaults in normalize to the current release. nixos-only.
+    nixos_state_version: str | None = None
+    # The host's age recipient (public key), derived from its ssh host key via
+    # `ssh-to-age`. Public data -- not key material -- so it lives in inventory.
+    # When a host references a secret, this recipient is added to that secret's
+    # generated creation_rule so the host can decrypt it locally with its own
+    # ssh host key (host-side decryption, T-080). Both platforms: NixOS via
+    # sops-nix, Debian via a local sops decrypt step. Unset until the host's key
+    # is harvested during the T-080 cutover; a secret-referencing host without
+    # one renders a creation_rule it cannot decrypt (surfaced as a warning).
+    age_recipient: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -271,6 +313,18 @@ class HostInventory(BaseModel):
             raise ValueError("ansible_groups must be unique per host")
         return normalized
 
+    @field_validator("age_recipient")
+    @classmethod
+    def normalize_age_recipient(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("age_recipient cannot be empty when set")
+        if not normalized.startswith("age1"):
+            raise ValueError("age_recipient must be an age1 public key")
+        return normalized
+
     @model_validator(mode="after")
     def validate_managed_mode_requires_user(self) -> Self:
         if self.ansible_user is None and self.ansible_managed_mode is not None:
@@ -285,6 +339,36 @@ class HostInventory(BaseModel):
             raise ValueError(
                 f"host {self.name}: bootstrap_ip equals ip; drop bootstrap_ip "
                 f"instead of duplicating the address"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_nixos_guest_options(self) -> Self:
+        # nixos_guest / nixos_disko are nixos-only knobs; reject them on debian
+        # hosts so a misplaced field is a loud error, not a silent no-op.
+        if self.platform != "nixos":
+            if self.nixos_disko:
+                raise ValueError(
+                    f"host {self.name}: nixos_disko requires platform: nixos"
+                )
+            if self.nixos_guest != "vm":
+                raise ValueError(
+                    f"host {self.name}: nixos_guest is only meaningful for "
+                    f"platform: nixos"
+                )
+            if self.nixos_admin_keys:
+                raise ValueError(
+                    f"host {self.name}: nixos_admin_keys requires platform: nixos"
+                )
+            if self.nixos_state_version is not None:
+                raise ValueError(
+                    f"host {self.name}: nixos_state_version requires platform: "
+                    f"nixos"
+                )
+        if self.nixos_disko and self.nixos_guest == "lxc":
+            raise ValueError(
+                f"host {self.name}: nixos_disko cannot apply to an lxc guest -- "
+                f"a container has no block device to partition"
             )
         return self
 

@@ -15,6 +15,7 @@ from medusa.diagnostics import (
     diagnostic_errors,
     diagnostic_warnings,
     service_diagnostics,
+    sops_recipient_diagnostics,
 )
 from medusa.generated import stale_files, write_generated
 from medusa.inventory.dns import parse_dns_inventory
@@ -32,6 +33,8 @@ from medusa.inventory.dns_edit import (
 )
 from medusa.inventory.homepage import parse_homepage_inventory
 from medusa.inventory.loader import load_optional_yaml, load_yaml
+from medusa.inventory.native import parse_native_inventory
+from medusa.inventory.secrets import parse_secrets_inventory
 from medusa.inventory.services import ServicesInventory, parse_services_inventory
 from medusa.inventory.services_edit import (
     load_services_doc,
@@ -54,7 +57,9 @@ from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.homepage import HomepageModel
 from medusa.model.hosts import AnsibleInventoryModel
 from medusa.model.monitoring import MonitoringModel
+from medusa.model.native import NativeModel
 from medusa.model.network import NetworkModel
+from medusa.model.nixos import NixosModel
 from medusa.model.normalize import (
     normalize_ansible_groups,
     normalize_ansible_inventory,
@@ -62,11 +67,15 @@ from medusa.model.normalize import (
     normalize_dns,
     normalize_homepage,
     normalize_monitoring,
+    normalize_native,
     normalize_network,
+    normalize_nixos,
     normalize_services,
+    normalize_sops,
     normalize_storage,
 )
 from medusa.model.services import ServicesModel
+from medusa.model.sops import SopsConfigModel
 from medusa.model.storage import StorageModel
 from medusa.paths import ProjectPaths
 from medusa.render.ansible import render_ansible_groups
@@ -80,7 +89,9 @@ from medusa.render.hosts import render_hosts
 from medusa.render.monitoring import render_monitoring
 from medusa.render.network import render_network
 from medusa.render.nginx import render_nginx
+from medusa.render.nixos import render_nixos
 from medusa.render.secrets import render_secrets_manifest
+from medusa.render.sops import render_sops_config
 from medusa.render.storage import render_storage_manifest
 from medusa.render.traefik import render_traefik
 
@@ -111,6 +122,9 @@ class _Inventory:
     coredns_model: CorednsModel
     ansible_inventory_model: AnsibleInventoryModel
     network_model: NetworkModel
+    native_model: NativeModel
+    nixos_model: NixosModel
+    sops_model: SopsConfigModel
 
 
 def _env_path(name: str) -> Path | None:
@@ -162,6 +176,27 @@ def _load_all(
     coredns_model = normalize_coredns(dns_model, services_model)
     ansible_inventory_model = normalize_ansible_inventory(dns_model)
     network_model = normalize_network(dns_model)
+    native_model = normalize_native(
+        parse_native_inventory(load_optional_yaml(paths.native_inventory)),
+        dns_model,
+        storage_model,
+    )
+    nixos_model = normalize_nixos(
+        dns_model,
+        storage_model,
+        services_model,
+        native_model,
+        _load_disko_sources(dns_model, paths),
+    )
+    sops_model = normalize_sops(
+        dns_model,
+        services_model,
+        parse_secrets_inventory(load_optional_yaml(paths.secrets_inventory)),
+    )
+    # Surface secret-referencing hosts that have no age_recipient yet: under
+    # host-side decryption they cannot decrypt their own secrets until their
+    # key is harvested (T-080). Warning-only.
+    on_diagnostics(sops_recipient_diagnostics(dns_model, services_model))
 
     return _Inventory(
         paths=paths,
@@ -175,7 +210,29 @@ def _load_all(
         coredns_model=coredns_model,
         ansible_inventory_model=ansible_inventory_model,
         network_model=network_model,
+        native_model=native_model,
+        nixos_model=nixos_model,
+        sops_model=sops_model,
     )
+
+
+def _load_disko_sources(
+    dns_model: DnsModel, paths: ProjectPaths
+) -> dict[str, str]:
+    """Read each disko-opted nixos host's operator-authored layout from the
+    inventory tree (``inventory/nixos/disko/<host>.nix``). Disk layout is
+    operator/host config, so it lives beside the rest of the inventory, not in
+    the medusa templates repo. Missing files are left out; normalize_nixos turns
+    that into a clear diagnostic. See T-078."""
+    sources: dict[str, str] = {}
+    disko_dir = paths.inventory_dir / "nixos" / "disko"
+    for host in dns_model.hosts_by_platform("nixos"):
+        if not host.nixos_disko:
+            continue
+        path = disko_dir / f"{host.name}.nix"
+        if path.is_file():
+            sources[host.name] = path.read_text(encoding="utf-8")
+    return sources
 
 
 def _validate_secret_sources(
@@ -216,10 +273,12 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_egress(services_model, templates_dir, generated_dir),
         **render_monitoring(loaded.monitoring_model, templates_dir, generated_dir),
         **render_secrets_manifest(services_model, templates_dir, generated_dir),
+        **render_sops_config(loaded.sops_model, templates_dir, generated_dir),
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),
         **render_ansible_groups(loaded.groups_model, templates_dir, generated_dir),
         **render_hosts(loaded.ansible_inventory_model, templates_dir, generated_dir),
         **render_network(loaded.network_model, templates_dir, generated_dir),
+        **render_nixos(loaded.nixos_model, templates_dir, generated_dir),
         **render_docs(
             loaded.dns_model,
             services_model,
@@ -360,6 +419,37 @@ def check(
         _fail(f"Generated files are stale:\n{formatted}")
 
     _succeed("Generated files are up to date.")
+
+
+@app.command("nixos-deploy-plan", rich_help_panel=_PIPELINE_PANEL)
+def nixos_deploy_plan(
+    root: Path | None = ROOT_OPTION,
+) -> None:
+    """Emit the per-host NixOS deploy plan consumed by `medusactl deploy`.
+
+    One tab-separated ``<host>\\t<user@endpoint>`` line per NixOS host that has a
+    managed SSH endpoint; the flake attribute is the host name (so the apply is
+    ``nixos-rebuild switch --flake <generated>/nixos#<host> --target-host
+    <user@endpoint>``). Hosts with no ansible_user are warned to stderr and
+    skipped. Prints nothing (exit 0) when the fleet has no NixOS hosts, so a
+    pure-Debian deploy is a no-op. This is deploy dispatch seam 2 of the Platform
+    Fork Boundary; medusactl composes the invocation from these lines. See T-075.
+    """
+    paths = _paths(root)
+    try:
+        loaded = _load_all(paths, on_diagnostics=lambda _: None)
+    except (ValidationError, ValueError, NotImplementedError) as error:
+        _fail(str(error))
+
+    for host in loaded.nixos_model.hosts:
+        if host.deploy_target is None:
+            typer.echo(
+                f"nixos host '{host.name}' has no ansible_user; cannot reconcile "
+                f"(skipping)",
+                err=True,
+            )
+            continue
+        typer.echo(f"{host.name}\t{host.deploy_target}")
 
 
 # --- Host inventory ops -----------------------------------------------------

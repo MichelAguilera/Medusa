@@ -14,6 +14,11 @@ medusa_generated_dir: "{{ lookup('env', 'MEDUSA_GENERATED_DIR') | default(medusa
 # Lives in the inventory repo: paths in secrets-manifest are relative
 # to this root (e.g. 'secrets/foo/bar.sops.yaml').
 medusa_secrets_root: "{{ medusa_inventory_root }}"
+# tmpfs root every host decrypts its own secret plaintext into (T-080). MUST
+# match Medusa's SECRET_RUNTIME_ROOT (medusa/model/settings.py): the generated
+# Compose files and the WireGuard symlink both reference secrets here. Shared by
+# the secrets and wireguard_gateway roles, so it lives here, not in a role.
+medusa_secret_runtime_root: /run/medusa-secrets
 medusa_uv_cache_dir: /tmp/medusa-uv-cache
 
 # Keep deployed Medusa-managed files under a dedicated deployment owner. The

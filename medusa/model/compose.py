@@ -9,6 +9,7 @@ from medusa.model.settings import (
     managed_env_files,
     managed_environment,
     managed_file_secret_names,
+    secret_runtime_path,
 )
 from medusa.model.storage import NfsMount, StorageModel
 from medusa.model.volumes import is_named_compose_volume
@@ -212,8 +213,12 @@ def _compose_named_volumes(services) -> dict:
 
 
 def _compose_secrets(services) -> dict:
+    # All services in a compose group share (host, stack), so the runtime path
+    # segment is identical across them. File-backed secrets are decrypted to
+    # tmpfs at boot and referenced by absolute /run path, not the stacks dir.
+    stack_path = services[0].stack or services[0].host
     managed_secrets = {
-        secret: {"file": f"./secrets/{secret}"}
+        secret: {"file": secret_runtime_path(f"{stack_path}/secrets/{secret}")}
         for secret in sorted(
             {secret for service in services for secret in service.managed_secrets}
         )

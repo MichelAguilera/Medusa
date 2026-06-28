@@ -68,6 +68,8 @@ Usage:
     medusactl deploy [--check]
     medusactl compose <up|down> [--check]
     medusactl controller-apply [--check]
+    medusactl nixos-apply [--check]
+    medusactl install-nixos-target <host> --ip <addr> [--force]
 
   Target ops:
     medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
@@ -1171,7 +1173,12 @@ cmd_deploy() {
     require_clean_for_deploy
     if [[ "${1:-}" == "--check" ]]; then
         run_logged deploy-check \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff"
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff" \
+            || fail "deploy --check failed"
+        # NixOS hosts deploy beside the Ansible path (T-075). The render above
+        # already refreshed the flake, so refresh=0. dry-activate mirrors the
+        # Ansible --check. No-op on an all-Debian fleet (empty deploy plan).
+        _nixos_apply_run dry-activate 0
     else
         require_controller_apply_prereqs deploy \
             || fail "deploy prerequisites failed"
@@ -1183,7 +1190,11 @@ cmd_deploy() {
         # /etc/hosts and fail with 'No route to host', short-circuiting
         # controller-apply via '&&'.
         run_logged deploy \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml"
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml" \
+            || fail "deploy failed"
+        # Reconcile NixOS hosts after the Debian fleet (T-075). refresh=0: the
+        # deploy step just rendered. No-op on an all-Debian fleet.
+        _nixos_apply_run switch 0
     fi
 }
 
@@ -1406,6 +1417,205 @@ REMOTE
         printf "%s✗%s finalize-dns failed (log: %s)\n" "$color_red" "$color_reset" "$log" >&2
         return 1
     fi
+}
+
+# --- NixOS deploy dispatch (T-075) ------------------------------------------
+#
+# The NixOS half of the deploy engine, beside (not replacing) the Ansible path.
+# Debian/Docker hosts deploy via controller-apply + deploy.yml; NixOS hosts
+# reconcile via `nixos-rebuild switch --target-host`. The fleet partition is the
+# tested `medusa nixos-deploy-plan` (Platform Fork Boundary, seam 2): one
+# `<host>\t<user@endpoint>` line per reconcilable NixOS host, empty for an
+# all-Debian fleet. Build happens on the controller and the closure is pushed to
+# the thin target. NixOS atomic activation rolls a bad switch back to the prior
+# generation, so this path needs none of the Debian prove-then-consume guards.
+
+_nixos_apply_run() {
+    # Shared SSH runner for the nixos-rebuild apply. $1 = action
+    # ("switch" | "dry-activate"); $2 = refresh ("1" pulls+renders first, "0"
+    # trusts a render the caller already did, e.g. cmd_deploy). Mirrors
+    # cmd_finalize_dns's remote-script execution (bash -s over SSH).
+    local action=$1 refresh=${2:-1}
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd "$MEDUSA_CONTROLLER_PATH"
+if [[ "${REFRESH:-1}" -eq 1 ]]; then
+    # Same inventory-fresh discipline as deploy: fast-forward then re-render so
+    # the flake we switch to matches what the workstation just pushed.
+    git -C "$MEDUSA_INVENTORY_ROOT" pull --ff-only
+    uv run medusa render
+fi
+plan=$(uv run medusa nixos-deploy-plan)
+if [[ -z "${plan//[[:space:]]/}" ]]; then
+    echo "no NixOS hosts in fleet; nixos-rebuild $ACTION skipped"
+    exit 0
+fi
+if ! command -v nixos-rebuild >/dev/null 2>&1; then
+    echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
+    exit 70
+fi
+rc=0
+while IFS=$'\t' read -r host target; do
+    [[ -n "$host" ]] || continue
+    echo "==> nixos-rebuild $ACTION: $host ($target)"
+    if ! nixos-rebuild "$ACTION" \
+        --flake "$MEDUSA_GENERATED_DIR/nixos#$host" \
+        --target-host "$target" \
+        --use-remote-sudo; then
+        echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
+        rc=1
+    fi
+done <<< "$plan"
+exit $rc
+REMOTE
+)
+    local target ssh_opts log
+    target=$(ssh_target)
+    log=$(log_path "nixos-apply")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s nixos-apply (%s)\n" "$color_blue" "$color_reset" "$action"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    local env_prefix
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q ACTION=%q REFRESH=%q" \
+        "$MEDUSA_CONTROLLER_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH" \
+        "$action" "$refresh")
+
+    local rc=0
+    ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    if [[ "$rc" -eq 0 ]]; then
+        printf "%s✓%s nixos-apply\n" "$color_green" "$color_reset"
+        return 0
+    fi
+    printf "%s✗%s nixos-apply failed (log: %s)\n" "$color_red" "$color_reset" "$log" >&2
+    return 1
+}
+
+cmd_nixos_apply() {
+    load_config
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl nixos-apply [--check] — reconcile NixOS hosts via nixos-rebuild.
+
+Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
+--target-host <user@endpoint> --use-remote-sudo' on the controller for every
+NixOS host in the fleet (the 'medusa nixos-deploy-plan' partition). A no-op on
+an all-Debian fleet. 'medusactl deploy' runs this automatically after the
+Debian deploy; use this command to reconcile NixOS hosts on their own.
+
+  --check   dry-activate (build + show the activation diff) without switching.
+
+Bootstrap a brand-new NixOS box first with 'medusactl install-nixos-target'.
+EOF
+        return 0
+    fi
+    local action="switch"
+    if [[ "${1:-}" == "--check" ]]; then
+        action="dry-activate"
+        shift
+    fi
+    [[ $# -eq 0 ]] || fail "unknown argument to nixos-apply: $1"
+    require_clean_for_deploy
+    _nixos_apply_run "$action" 1
+}
+
+cmd_install_nixos_target() {
+    load_config
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
+        cat <<EOF
+medusactl install-nixos-target <host> --ip <addr> [--force] — first-time NixOS
+                  stand-up via nixos-anywhere + disko.
+
+Installs NixOS onto a FRESH box from the generated flake, partitioning its disks
+declaratively via disko. This is the once-per-host analogue of prep-target for
+the Debian path; ongoing changes use 'medusactl nixos-apply'.
+
+  <host>        flake attribute (generated/nixos#<host>); must already be in
+                inventory as platform: nixos and rendered.
+  --ip <addr>   address of the fresh box, reachable as root@<addr> (the NixOS
+                installer ISO or a kexec'd rescue system).
+  --force       skip the confirmation prompt.
+
+WARNING: nixos-anywhere + disko WIPE the target disk. Point this only at a fresh
+box with no data — never at a host with a live ZFS pool or other real storage.
+EOF
+        return 0
+    fi
+
+    local host="" ip="" force=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ip) shift; [[ $# -gt 0 ]] || fail "--ip requires an address"; ip=$1 ;;
+            --ip=*) ip=${1#--ip=} ;;
+            --force) force=1 ;;
+            -*) fail "unknown argument to install-nixos-target: $1" ;;
+            *) [[ -z "$host" ]] || fail "unexpected argument: $1"; host=$1 ;;
+        esac
+        shift
+    done
+    [[ -n "$host" ]] || fail "install-nixos-target: <host> is required"
+    [[ -n "$ip" ]] || fail "install-nixos-target: --ip <addr> is required"
+
+    warn "nixos-anywhere will ERASE all disks on $ip and install NixOS host '$host'."
+    if [[ "$force" -ne 1 ]]; then
+        confirm "Wipe $ip and install '$host'?" || fail "aborted"
+    fi
+    require_clean_for_deploy
+
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+git -C "$MEDUSA_INVENTORY_ROOT" pull --ff-only
+cd "$MEDUSA_CONTROLLER_PATH"
+uv run medusa render
+if ! command -v nixos-anywhere >/dev/null 2>&1; then
+    echo "nixos-anywhere not found on controller; install it to bootstrap NixOS hosts" >&2
+    exit 70
+fi
+echo "==> nixos-anywhere: installing $HOST onto $TARGET_IP from $MEDUSA_GENERATED_DIR/nixos#$HOST"
+nixos-anywhere --flake "$MEDUSA_GENERATED_DIR/nixos#$HOST" "root@$TARGET_IP"
+REMOTE
+)
+    local target ssh_opts log
+    target=$(ssh_target)
+    log=$(log_path "install-nixos-$host")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s install-nixos-target %s -> %s\n" "$color_blue" "$color_reset" "$host" "$ip"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    local env_prefix
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q HOST=%q TARGET_IP=%q" \
+        "$MEDUSA_CONTROLLER_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH" \
+        "$host" "$ip")
+
+    local rc=0
+    ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    if [[ "$rc" -eq 0 ]]; then
+        printf "%s✓%s install-nixos-target %s (now reconcile with 'medusactl nixos-apply')\n" \
+            "$color_green" "$color_reset" "$host"
+        return 0
+    fi
+    printf "%s✗%s install-nixos-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$host" "$log" >&2
+    return 1
 }
 
 # --- Target ops -------------------------------------------------------------
@@ -3218,6 +3428,14 @@ case "${1:-}" in
     controller-apply)
         shift
         cmd_controller_apply "$@"
+        ;;
+    nixos-apply)
+        shift
+        cmd_nixos_apply "$@"
+        ;;
+    install-nixos-target)
+        shift
+        cmd_install_nixos_target "$@"
         ;;
     finalize-dns)
         shift

@@ -4,6 +4,7 @@ from enum import StrEnum
 from medusa.inventory.services import ServicesInventory
 from medusa.model.dns import DnsModel
 from medusa.model.groups import AnsibleGroupsModel
+from medusa.model.services import ServicesModel
 from medusa.model.volumes import is_bind_source
 
 
@@ -49,6 +50,37 @@ def coredns_target_diagnostics(
         )
         for name in groups_model.coredns_hosts
         if name not in managed
+    )
+
+
+def sops_recipient_diagnostics(
+    dns_model: DnsModel, services_model: ServicesModel
+) -> tuple[Diagnostic, ...]:
+    """Warn when a host references a secret but has no age recipient. Under
+    host-side decryption (T-080) such a host is left out of its secret's
+    generated creation_rule, so it cannot decrypt that secret locally until its
+    ssh host key is harvested (`ssh-to-age`) and set as `age_recipient` in
+    inventory. Warning-only: the render still succeeds (operators remain
+    recipients), but the host's services would be missing their secrets."""
+    has_recipient = {
+        host.name for host in dns_model.hosts if host.age_recipient is not None
+    }
+    missing = sorted(
+        {
+            source.host
+            for source in services_model.secret_sources
+            if source.host not in has_recipient
+        }
+    )
+    return tuple(
+        Diagnostic(
+            Severity.WARNING,
+            f"host '{name}' references secrets but has no age_recipient; it is "
+            f"omitted from those secrets' generated creation_rules and cannot "
+            f"decrypt them host-side until its ssh host key is harvested "
+            f"(ssh-to-age) and set as age_recipient in inventory (T-080).",
+        )
+        for name in missing
     )
 
 

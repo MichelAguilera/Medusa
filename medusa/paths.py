@@ -41,3 +41,11 @@ class ProjectPaths:
     @property
     def homepage_inventory(self) -> Path:
         return self.inventory_dir / "homepage.yaml"
+
+    @property
+    def native_inventory(self) -> Path:
+        return self.inventory_dir / "native.yaml"
+
+    @property
+    def secrets_inventory(self) -> Path:
+        return self.inventory_dir / "secrets.yaml"

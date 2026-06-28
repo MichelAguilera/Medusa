@@ -45,22 +45,13 @@
     reload: true
   become: true
 
-# --- WireGuard interface (operator secret via SOPS) ---
-- name: Decrypt the WireGuard config on the controller
-  ansible.builtin.command:
-    argv:
-      - sops
-      - --decrypt
-      - --extract
-      - '["value"]'
-      - "{{ medusa_secrets_root }}/secrets/{{ medusa_egress.wireguard_secret }}.sops.yaml"
-  delegate_to: localhost
-  become: false
-  changed_when: false
-  check_mode: false
-  no_log: true
-  register: medusa_wg_config
-
+# --- WireGuard interface (operator secret, decrypted host-side via T-080) ---
+# The secret is NOT decrypted on the controller anymore. The `secrets` role runs
+# first in this play and its medusa-secrets unit decrypts the WireGuard config to
+# tmpfs using THIS host's ssh host key (one trust model, T-080). wg-quick reads
+# /etc/wireguard/<iface>.conf, so we point that at the decrypted file with a
+# symlink and make wg-quick wait for the decrypt unit. The plaintext never
+# touches persistent disk or the controller.
 - name: Ensure the WireGuard config directory exists
   ansible.builtin.file:
     path: /etc/wireguard
@@ -70,15 +61,38 @@
     mode: "0700"
   become: true
 
-- name: Install the WireGuard interface config
-  ansible.builtin.copy:
-    content: "{{ medusa_wg_config.stdout }}\n"
+- name: Point wg-quick at the host-decrypted WireGuard config (tmpfs)
+  ansible.builtin.file:
+    src: "{{ medusa_secret_runtime_root }}/{{ medusa_egress.gateway }}/wireguard/{{ medusa_egress.interface }}.conf"
     dest: "/etc/wireguard/{{ medusa_egress.interface }}.conf"
+    state: link
+    force: true
+    follow: false
+  become: true
+  notify: Restart WireGuard interface
+
+- name: Ensure the wg-quick drop-in directory exists
+  ansible.builtin.file:
+    path: "/etc/systemd/system/wg-quick@{{ medusa_egress.interface }}.service.d"
+    state: directory
     owner: root
     group: root
-    mode: "0600"
+    mode: "0755"
   become: true
-  no_log: true
+
+- name: Order wg-quick after the secret-decryption unit
+  # Boot ordering: the tmpfs config does not exist until medusa-secrets.service
+  # has run, so wg-quick must require and follow it.
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/wg-quick@{{ medusa_egress.interface }}.service.d/medusa-secrets.conf"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      After=medusa-secrets.service
+      Requires=medusa-secrets.service
+  become: true
   notify: Restart WireGuard interface
 
 - name: Enable and start the WireGuard interface
@@ -86,6 +100,7 @@
     name: "wg-quick@{{ medusa_egress.interface }}"
     enabled: true
     state: started
+    daemon_reload: true
   become: true
 
 # --- NAT + fail-closed kill-switch (nftables) ---

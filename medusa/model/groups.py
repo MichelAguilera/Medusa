@@ -14,4 +14,8 @@ class AnsibleGroupsModel(BaseModel):
     managed_network_hosts: tuple[str, ...]
     egress_gateway_hosts: tuple[str, ...]
     tunnel_routing_hosts: tuple[str, ...]
+    # Hosts on the NixOS platform. They carry an SSH endpoint (for
+    # nixos-rebuild --target-host, T-075) but are deliberately absent from
+    # every role group above, which drive Ansible roles. See T-073.
+    nixos_hosts: tuple[str, ...]
     groups: tuple[tuple[str, tuple[str, ...]], ...]
