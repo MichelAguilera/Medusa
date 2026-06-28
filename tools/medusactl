@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.18.0"
+VERSION="0.19.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -65,10 +65,10 @@ Usage:
   Render / deploy:
     medusactl check
     medusactl render
-    medusactl deploy [--check]
+    medusactl deploy [--check] [--limit <pattern>]
     medusactl compose <up|down> [--check]
     medusactl controller-apply [--check]
-    medusactl nixos-apply [--check]
+    medusactl nixos-apply [--check] [--limit <pattern>]
     medusactl install-nixos-target <host> --ip <addr> [--force]
 
   Target ops:
@@ -1169,16 +1169,67 @@ cmd_render() {
 }
 
 cmd_deploy() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl deploy [--check] [--limit <pattern>] — render and apply the fleet.
+
+Runs controller-apply.yml then deploy.yml on the controller, then reconciles any
+NixOS hosts (nixos-rebuild). Without --limit this touches every managed host.
+
+  --check            Dry run (ansible --check --diff; NixOS dry-activate).
+  --limit <pattern>  Scope the run to a subset. <pattern> is an Ansible host
+                     pattern: a host (host01), a comma list (host01,host02),
+                     a group (docker_hosts), a glob (web*) or a union/negation
+                     (foo:!bar). The controller plays (preflight staleness gate,
+                     /etc/hosts + ssh-config refresh) always run regardless, so a
+                     targeted host stays resolvable. The NixOS reconcile is
+                     limited to NixOS hosts whose NAME matches the pattern; group
+                     names and negations only affect the Debian deploy.
+
+Examples:
+  medusactl deploy --limit host01
+  medusactl deploy --check --limit host01,host02
+EOF
+        return 0
+    fi
     load_config
+    local check=0 limit=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check) check=1; shift ;;
+            --limit)
+                shift
+                [[ -n "${1:-}" ]] || fail "deploy: --limit requires a host pattern (e.g. --limit host01 or --limit host01,host02)"
+                limit=$1; shift ;;
+            --limit=*)
+                limit=${1#--limit=}
+                [[ -n "$limit" ]] || fail "deploy: --limit requires a host pattern (e.g. --limit host01)"
+                shift ;;
+            *) fail "deploy: unexpected argument '$1' (usage: medusactl deploy [--check] [--limit <pattern>])" ;;
+        esac
+    done
     require_clean_for_deploy
-    if [[ "${1:-}" == "--check" ]]; then
+    # Build the ansible --limit fragment for deploy.yml only. We union in
+    # medusa_control so the controller-side preflight (the staleness gate) and
+    # any controller play still run when the operator targets a single host.
+    # controller-apply.yml is left UNRESTRICTED on purpose: it refreshes the
+    # controller's /etc/hosts + ssh-config so the targeted host stays
+    # resolvable; limiting it to a non-controller host would make it a no-op.
+    # Single-quote the value so the remote shell does not glob '*' or interpret
+    # '!'/'&' before ansible parses the pattern.
+    local deploy_limit=""
+    if [[ -n "$limit" ]]; then
+        deploy_limit=" --limit 'medusa_control:${limit}'"
+        info "limiting deploy to: $limit (controller plays always run)"
+    fi
+    if [[ "$check" -eq 1 ]]; then
         run_logged deploy-check \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff" \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff${deploy_limit}" \
             || fail "deploy --check failed"
         # NixOS hosts deploy beside the Ansible path (T-075). The render above
         # already refreshed the flake, so refresh=0. dry-activate mirrors the
         # Ansible --check. No-op on an all-Debian fleet (empty deploy plan).
-        _nixos_apply_run dry-activate 0
+        _nixos_apply_run dry-activate 0 "$limit"
     else
         require_controller_apply_prereqs deploy \
             || fail "deploy prerequisites failed"
@@ -1190,11 +1241,11 @@ cmd_deploy() {
         # /etc/hosts and fail with 'No route to host', short-circuiting
         # controller-apply via '&&'.
         run_logged deploy \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml" \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml${deploy_limit}" \
             || fail "deploy failed"
         # Reconcile NixOS hosts after the Debian fleet (T-075). refresh=0: the
         # deploy step just rendered. No-op on an all-Debian fleet.
-        _nixos_apply_run switch 0
+        _nixos_apply_run switch 0 "$limit"
     fi
 }
 
@@ -1433,9 +1484,11 @@ REMOTE
 _nixos_apply_run() {
     # Shared SSH runner for the nixos-rebuild apply. $1 = action
     # ("switch" | "dry-activate"); $2 = refresh ("1" pulls+renders first, "0"
-    # trusts a render the caller already did, e.g. cmd_deploy). Mirrors
+    # trusts a render the caller already did, e.g. cmd_deploy); $3 = limit (an
+    # optional host pattern from `deploy --limit` — restricts the reconcile to
+    # NixOS hosts whose NAME matches; empty means all NixOS hosts). Mirrors
     # cmd_finalize_dns's remote-script execution (bash -s over SSH).
-    local action=$1 refresh=${2:-1}
+    local action=$1 refresh=${2:-1} limit=${3:-}
     local remote
     remote=$(cat <<'REMOTE'
 set -euo pipefail
@@ -1451,6 +1504,31 @@ plan=$(uv run medusa nixos-deploy-plan)
 if [[ -z "${plan//[[:space:]]/}" ]]; then
     echo "no NixOS hosts in fleet; nixos-rebuild $ACTION skipped"
     exit 0
+fi
+if [[ -n "${LIMIT:-}" ]]; then
+    # Restrict the reconcile to NixOS hosts named by the deploy --limit pattern.
+    # Split on ',' and ':' into match tokens; keep a plan host if it matches a
+    # token via shell glob. Group names and negations (!foo, &foo) don't name a
+    # NixOS host so they simply won't match here — the Debian deploy still
+    # honors the full ansible pattern; target NixOS hosts by name or glob.
+    IFS=',:' read -r -a _toks <<< "$LIMIT"
+    filtered=""
+    while IFS=$'\t' read -r host target; do
+        [[ -n "$host" ]] || continue
+        for t in "${_toks[@]}"; do
+            [[ -n "$t" && "$t" != '!'* && "$t" != '&'* ]] || continue
+            # shellcheck disable=SC2053  # intentional glob match
+            if [[ "$host" == $t ]]; then
+                filtered+="${host}"$'\t'"${target}"$'\n'
+                break
+            fi
+        done
+    done <<< "$plan"
+    plan=$filtered
+    if [[ -z "${plan//[[:space:]]/}" ]]; then
+        echo "no NixOS hosts matched --limit '$LIMIT'; nixos-rebuild $ACTION skipped"
+        exit 0
+    fi
 fi
 if ! command -v nixos-rebuild >/dev/null 2>&1; then
     echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
@@ -1481,13 +1559,13 @@ REMOTE
     printf "log:    %s\n" "$log"
 
     local env_prefix
-    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q ACTION=%q REFRESH=%q" \
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q ACTION=%q REFRESH=%q LIMIT=%q" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
-        "$action" "$refresh")
+        "$action" "$refresh" "$limit")
 
     local rc=0
     ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
@@ -1505,7 +1583,7 @@ cmd_nixos_apply() {
     load_config
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
-medusactl nixos-apply [--check] — reconcile NixOS hosts via nixos-rebuild.
+medusactl nixos-apply [--check] [--limit <pattern>] — reconcile NixOS hosts.
 
 Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
 --target-host <user@endpoint> --use-remote-sudo' on the controller for every
@@ -1513,20 +1591,31 @@ NixOS host in the fleet (the 'medusa nixos-deploy-plan' partition). A no-op on
 an all-Debian fleet. 'medusactl deploy' runs this automatically after the
 Debian deploy; use this command to reconcile NixOS hosts on their own.
 
-  --check   dry-activate (build + show the activation diff) without switching.
+  --check            dry-activate (build + show the activation diff), no switch.
+  --limit <pattern>  Reconcile only NixOS hosts whose NAME matches <pattern>
+                     (host, comma list, or glob).
 
 Bootstrap a brand-new NixOS box first with 'medusactl install-nixos-target'.
 EOF
         return 0
     fi
-    local action="switch"
-    if [[ "${1:-}" == "--check" ]]; then
-        action="dry-activate"
-        shift
-    fi
-    [[ $# -eq 0 ]] || fail "unknown argument to nixos-apply: $1"
+    local action="switch" limit=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check) action="dry-activate"; shift ;;
+            --limit)
+                shift
+                [[ -n "${1:-}" ]] || fail "nixos-apply: --limit requires a host pattern"
+                limit=$1; shift ;;
+            --limit=*)
+                limit=${1#--limit=}
+                [[ -n "$limit" ]] || fail "nixos-apply: --limit requires a host pattern"
+                shift ;;
+            *) fail "unknown argument to nixos-apply: $1" ;;
+        esac
+    done
     require_clean_for_deploy
-    _nixos_apply_run "$action" 1
+    _nixos_apply_run "$action" 1 "$limit"
 }
 
 cmd_install_nixos_target() {
@@ -2869,7 +2958,10 @@ _medusactl_complete() {
     fi
 
     case "${COMP_WORDS[1]}" in
-        deploy|controller-apply)
+        deploy|nixos-apply)
+            COMPREPLY=( $(compgen -W "--check --limit --help" -- "$cur") )
+            ;;
+        controller-apply)
             COMPREPLY=( $(compgen -W "--check" -- "$cur") )
             ;;
         compose)
@@ -2953,8 +3045,13 @@ _medusactl() {
     fi
 
     case "$words[2]" in
-        deploy|controller-apply)
-            _arguments '--check[run deploy in check mode]'
+        deploy|nixos-apply)
+            _arguments \
+                '--check[dry run without applying]' \
+                '--limit[scope the run to a host pattern]:pattern:'
+            ;;
+        controller-apply)
+            _arguments '--check[run controller-apply in check mode]'
             ;;
         finalize-dns)
             _arguments \
@@ -3034,6 +3131,9 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'ssh-disconnect' -d 'Close t
 complete -c medusactl -n '__fish_use_subcommand' -a 'undo' -d 'Restore inventory from the most recent snapshot'
 complete -c medusactl -n '__fish_use_subcommand' -a 'history' -d 'Show recent inventory commits'
 complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run deploy in check mode'
+complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l limit -d 'Scope the run to a host pattern'
+complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l check -d 'Dry-activate without switching'
+complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l limit -d 'Reconcile only matching NixOS hosts'
 complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down' -a 'up down' -d 'Compose lifecycle action'
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l check -d 'Run compose in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from controller-apply' -l check -d 'Run controller apply in check mode'
