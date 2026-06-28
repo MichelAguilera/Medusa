@@ -1,0 +1,15 @@
+---
+# Pull newer images for Compose stacks and recreate changed containers (T-082,
+# folds T-068). Runtime op like compose-stop.yml: stages the current stack files
+# then applies state=present with pull=always, so a moved 'latest' is fetched
+# and any container whose image digest changed is recreated. Scope to one
+# stack/service with medusa_compose_target / medusa_compose_service.
+- name: Pull Compose stack images
+  hosts: docker_hosts
+  gather_facts: false
+  vars:
+    medusa_compose_apply: true
+    medusa_compose_state: present
+    medusa_compose_pull: always
+  roles:
+    - compose

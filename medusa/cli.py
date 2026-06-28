@@ -452,6 +452,39 @@ def nixos_deploy_plan(
         typer.echo(f"{host.name}\t{host.deploy_target}")
 
 
+@app.command("list-stacks", rich_help_panel=_PIPELINE_PANEL)
+def list_stacks_cmd(
+    root: Path | None = ROOT_OPTION,
+) -> None:
+    """List rendered Compose stacks (Debian docker_hosts), one per line.
+
+    Tab-separated ``<stack>\\t<host>\\t<svc,svc,...>``. ``<stack>`` is the stack's
+    path under generated/compose/ — the identity ``medusactl compose <verb>
+    <stack>`` targets — falling back to the host name for a stackless service
+    group. medusactl renders this for ``compose list`` and to surface valid
+    targets; NixOS hosts are excluded (they have no compose stacks). See T-082.
+    """
+    paths = _paths(root)
+    try:
+        loaded = _load_all(paths, on_diagnostics=lambda _: None)
+    except (ValidationError, ValueError, NotImplementedError) as error:
+        _fail(str(error))
+
+    rows = sorted(
+        (
+            (
+                compose_file.stack or compose_file.host,
+                compose_file.host,
+                ",".join(sorted(service.name for service in compose_file.services)),
+            )
+            for compose_file in loaded.services_model.compose
+        ),
+        key=lambda row: (row[0], row[1]),
+    )
+    for stack, host, services in rows:
+        typer.echo(f"{stack}\t{host}\t{services}")
+
+
 # --- Host inventory ops -----------------------------------------------------
 #
 # Mutate inventory/dns.yaml with comment-preserving round-trip. Each command

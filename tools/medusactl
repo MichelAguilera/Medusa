@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.19.0"
+VERSION="0.20.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -66,7 +66,8 @@ Usage:
     medusactl check
     medusactl render
     medusactl deploy [--check] [--limit <pattern>]
-    medusactl compose <up|down> [--check]
+    medusactl compose <up|down|restart|pull|list> [stack]
+                      [--service <name>] [--host <pattern>] [--check] [--pull]
     medusactl controller-apply [--check]
     medusactl nixos-apply [--check] [--limit <pattern>]
     medusactl install-nixos-target <host> --ip <addr> [--force]
@@ -1252,23 +1253,36 @@ EOF
 cmd_compose() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
         cat <<EOF
-medusactl compose <up|down> [--check] — drive the Compose lifecycle on
-                  docker_hosts. 'up' renders, stages, and brings stacks to
-                  state=present; 'down' brings them to state=stopped. The
-                  default 'deploy' only STAGES stack files
-                  (medusa_compose_apply=false); this is the verb that
-                  actually starts/stops containers.
+medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--check] [--pull]
+                  Drive the Compose lifecycle on docker_hosts. The default
+                  'deploy' only STAGES stack files (medusa_compose_apply=false);
+                  these verbs actually change runtime state.
 
-                  The Docker engine is a Tier-2 dependency Medusa owns
-                  (installs + configures); see architecture-decisions,
-                  "Provisioning boundary: two dependency tiers". The
-                  docker_engine role (run by deploy and compose-up) installs
-                  it when absent, so a fresh host needs no manual Docker
-                  setup; a host that already runs Docker is left untouched.
+Verbs:
+  up        Render, stage, and bring stacks to state=present (start containers).
+  down      Bring stacks to state=stopped.
+  restart   Restart stacks (compose v2 'restarted').
+  pull      Pull newer images and recreate changed containers (state=present,
+            pull=always). 'compose up <stack> --pull' is the same for one stack.
+  list      Print the rendered stacks (stack / host / services) and exit.
 
-Usage:
-  medusactl compose up   [--check]
-  medusactl compose down [--check]
+Targeting (T-082):
+  [stack]            Act on one stack only — its path under generated/compose/
+                     (e.g. 'media/immich'); omit to act on every stack. Run
+                     'medusactl compose list' for valid names.
+  --service <name>   Act on one service within the stack (requires [stack]).
+  --host <pattern>   Limit to docker hosts matching an Ansible host pattern.
+  --pull             (up only) force an image re-pull on apply.
+  --check            Dry run (ansible --check --diff).
+
+The Docker engine is a Tier-2 dependency Medusa owns; the docker_engine role
+(run by 'up') installs it when absent and leaves an existing install untouched.
+
+Examples:
+  medusactl compose up
+  medusactl compose up media/immich --pull
+  medusactl compose restart gitea --host host01
+  medusactl compose list
 
 Exit codes: 0 success, non-zero on failure.
 EOF
@@ -1277,24 +1291,80 @@ EOF
     load_config
     local action=$1
     shift
-    local play
-    case "$action" in
-        up)   play=compose-up.yml ;;
-        down) play=compose-stop.yml ;;
-        *) fail "compose: unknown action '$action' (expected 'up' or 'down')" ;;
-    esac
-    local check=""
-    if [[ "${1:-}" == "--check" ]]; then
-        check=" --check --diff"
-        shift
+
+    # 'list' is a read-only inspector. It runs on the controller (like every
+    # other compose verb), NOT on the workstation: the controller is where
+    # `medusa` reliably runs (uv run) and where the other verbs render the tree,
+    # so the listing matches what they would act on. list-stacks computes stacks
+    # straight from the normalized model (no render needed); we read the
+    # controller's current inventory without a pull, so it's a fast plain read.
+    if [[ "$action" == "list" ]]; then
+        [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]] || { echo "medusactl compose list — print rendered stacks (stack / host / services)."; return 0; }
+        [[ $# -eq 0 ]] || fail "compose list: unexpected argument '$1'"
+        local target out
+        local -a ssh_opts
+        target=$(ssh_target)
+        mapfile -t ssh_opts < <(ssh_base_opts)
+        [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
+        local remote
+        remote=$(cat <<'REMOTE'
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+uv run --quiet medusa list-stacks
+REMOTE
+)
+        out=$(ssh "${ssh_opts[@]}" "$target" \
+            "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
+             MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory") \
+             MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets") \
+             bash -s" <<< "$remote") \
+            || fail "compose list: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
+        { printf 'STACK\tHOST\tSERVICES\n'; printf '%s\n' "$out"; } \
+            | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
+        return 0
     fi
-    [[ $# -eq 0 ]] || fail "compose: unexpected argument '$1'"
-    # 'up' applies host config (renders + brings stacks present), so it
-    # follows the deploy clean-tree discipline. 'down' is a runtime stop and
-    # must work even mid-edit, so it does not require a clean tree.
-    [[ "$action" == "up" ]] && require_clean_for_deploy
+
+    local play mutating=1
+    case "$action" in
+        up)      play=compose-up.yml ;;
+        down)    play=compose-stop.yml; mutating=0 ;;
+        restart) play=compose-restart.yml ;;
+        pull)    play=compose-pull.yml ;;
+        *) fail "compose: unknown verb '$action' (expected up|down|restart|pull|list)" ;;
+    esac
+
+    local check="" stack="" service="" host="" pull=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --check) check=" --check --diff"; shift ;;
+            --service) shift; [[ -n "${1:-}" ]] || fail "compose: --service requires a name"; service=$1; shift ;;
+            --service=*) service=${1#--service=}; [[ -n "$service" ]] || fail "compose: --service requires a name"; shift ;;
+            --host) shift; [[ -n "${1:-}" ]] || fail "compose: --host requires a host pattern"; host=$1; shift ;;
+            --host=*) host=${1#--host=}; [[ -n "$host" ]] || fail "compose: --host requires a host pattern"; shift ;;
+            --pull) pull=1; shift ;;
+            -*) fail "compose: unknown flag '$1'" ;;
+            *) [[ -z "$stack" ]] || fail "compose: unexpected argument '$1' (stack already set to '$stack')"; stack=$1; shift ;;
+        esac
+    done
+    [[ -z "$service" || -n "$stack" ]] || fail "compose: --service requires a [stack] target"
+    [[ "$pull" -eq 0 || "$action" == "up" ]] || fail "compose: --pull is only valid with 'up' (use the 'pull' verb otherwise)"
+
+    # Mutating verbs (up/restart/pull) follow the deploy clean-tree discipline;
+    # 'down' is a runtime stop and must work even mid-edit.
+    [[ "$mutating" -eq 1 ]] && require_clean_for_deploy
+
+    # Assemble extra-vars + host limit. Single-quote values so the remote shell
+    # leaves stack slashes and pattern chars intact for ansible. --host unions in
+    # medusa_control so compose-up's preflight play still runs (as deploy does).
+    local extra=""
+    [[ -n "$stack" ]]   && extra+=" -e medusa_compose_target='${stack}'"
+    [[ -n "$service" ]] && extra+=" -e medusa_compose_service='${service}'"
+    [[ "$pull" -eq 1 ]] && extra+=" -e medusa_compose_pull=always"
+    local limit=""
+    [[ -n "$host" ]] && limit=" --limit 'medusa_control:${host}'"
+
     run_logged "compose-$action" \
-        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check"
+        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check$extra$limit"
 }
 
 cmd_controller_apply() {
@@ -2966,9 +3036,9 @@ _medusactl_complete() {
             ;;
         compose)
             if [[ "$COMP_CWORD" -eq 2 ]]; then
-                COMPREPLY=( $(compgen -W "up down" -- "$cur") )
+                COMPREPLY=( $(compgen -W "up down restart pull list" -- "$cur") )
             else
-                COMPREPLY=( $(compgen -W "--check --help" -- "$cur") )
+                COMPREPLY=( $(compgen -W "--service --host --check --pull --help" -- "$cur") )
             fi
             ;;
         finalize-dns)
@@ -3053,6 +3123,17 @@ _medusactl() {
         controller-apply)
             _arguments '--check[run controller-apply in check mode]'
             ;;
+        compose)
+            if (( CURRENT == 3 )); then
+                _values 'verb' up down restart pull list
+            else
+                _arguments \
+                    '--service[act on one service within the stack]:service:' \
+                    '--host[limit to docker hosts matching a pattern]:pattern:' \
+                    '--check[dry run without applying]' \
+                    '--pull[force image re-pull (up only)]'
+            fi
+            ;;
         finalize-dns)
             _arguments \
                 '--check[show what would be removed without writing]' \
@@ -3134,8 +3215,11 @@ complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run d
 complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l limit -d 'Scope the run to a host pattern'
 complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l check -d 'Dry-activate without switching'
 complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l limit -d 'Reconcile only matching NixOS hosts'
-complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down' -a 'up down' -d 'Compose lifecycle action'
+complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down restart pull list' -a 'up down restart pull list' -d 'Compose verb'
+complete -c medusactl -n '__fish_seen_subcommand_from compose' -l service -d 'Act on one service within the stack'
+complete -c medusactl -n '__fish_seen_subcommand_from compose' -l host -d 'Limit to docker hosts matching a pattern'
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l check -d 'Run compose in check mode'
+complete -c medusactl -n '__fish_seen_subcommand_from compose' -l pull -d 'Force image re-pull (up only)'
 complete -c medusactl -n '__fish_seen_subcommand_from controller-apply' -l check -d 'Run controller apply in check mode'
 complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l check -d 'Show what would be removed without writing'
 complete -c medusactl -n '__fish_seen_subcommand_from finalize-dns' -l force -d 'Skip resolver validation and remove the block'

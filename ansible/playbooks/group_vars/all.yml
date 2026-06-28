@@ -48,3 +48,11 @@ medusa_traefik_service_name: traefik
 # to intentionally change runtime state.
 medusa_compose_apply: false
 medusa_compose_state: present
+
+# Compose targeting (T-082). Empty = fleet-wide / whole-stack default; the
+# medusactl compose verbs set these per invocation. medusa_compose_target is a
+# stack path under generated/compose/ (e.g. 'media/immich'); medusa_compose_service
+# narrows to one service; medusa_compose_pull ('always') forces image re-pulls.
+medusa_compose_target: ""
+medusa_compose_service: ""
+medusa_compose_pull: ""

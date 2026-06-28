@@ -9,6 +9,29 @@
   become: false
   register: medusa_compose_files
 
+# Stack targeting (T-082): when an operator scopes the run to one stack
+# (`medusactl compose <verb> <stack>`), narrow the stack file list to the
+# matching stack so every downstream loop — staging, externals, apply — acts on
+# that stack alone. Stack identity is its path under generated/compose/ (e.g.
+# 'gitea', 'media/immich'); an empty target keeps the fleet-wide default.
+- name: Narrow stack files to the targeted stack
+  ansible.builtin.set_fact:
+    medusa_compose_files: >-
+      {{ medusa_compose_files | combine({'files':
+         medusa_compose_files.files
+         | selectattr('path', 'search', '/compose/' ~ (medusa_compose_target | regex_escape) ~ '/docker-compose.yml$')
+         | list }) }}
+  when: medusa_compose_target | default('') | length > 0
+
+- name: Fail when the targeted stack matched no rendered stack
+  ansible.builtin.fail:
+    msg: >-
+      compose target '{{ medusa_compose_target }}' matched no rendered stack on
+      {{ inventory_hostname }}. Run 'medusactl compose list' for valid names.
+  when:
+    - medusa_compose_target | default('') | length > 0
+    - medusa_compose_files.files | length == 0
+
 # The whole stacks tree is owned by the medusa service-runtime user (it runs
 # Compose); ansible writes it via sudo. See architecture-decisions, "Service
 # runtime identity".
@@ -49,6 +72,17 @@
   delegate_to: localhost
   become: false
   register: medusa_compose_env_files
+
+# Mirror the stack-file narrowing (above) for env files so a targeted run only
+# stages its own stack's env files.
+- name: Narrow env files to the targeted stack
+  ansible.builtin.set_fact:
+    medusa_compose_env_files: >-
+      {{ medusa_compose_env_files | combine({'files':
+         medusa_compose_env_files.files
+         | selectattr('path', 'search', '/compose/' ~ (medusa_compose_target | regex_escape) ~ '/')
+         | list }) }}
+  when: medusa_compose_target | default('') | length > 0
 
 - name: Ensure generated managed environment directories exist
   # 2770 (not 2775): an env dir can also hold secret env files (the secrets
@@ -164,7 +198,11 @@
        | selectattr('host', 'equalto', inventory_hostname) | list }}
   loop_control:
     label: "{{ item.path }} -> {{ item.owner }}:{{ item.group }}"
-  when: medusa_compose_apply | bool
+  when:
+    - medusa_compose_apply | bool
+    - >-
+      medusa_compose_target | default('') | length == 0
+      or (item.path ~ '/') is match('^' ~ (medusa_compose_target | regex_escape) ~ '/')
 
 - name: Apply Compose stack state
   # Runs as the medusa service-runtime user, NOT the ansible deployment user:
@@ -176,6 +214,13 @@
       {{ medusa_compose_stacks_root }}/{{ item.path
       | regex_replace('^.*/compose/(.*)/docker-compose.yml$', '\1') }}
     state: "{{ medusa_compose_state }}"
+    # Service targeting (T-082): scope the action to one service within the
+    # stack when set; omit to act on the whole stack (the default).
+    services: "{{ [medusa_compose_service] if (medusa_compose_service | default('')) else omit }}"
+    # Image pull policy (T-082, folds T-068): omit by default to keep the
+    # module's behavior; `--pull` / the `pull` verb set this to 'always' so a
+    # moved 'latest' is re-pulled and changed containers recreated.
+    pull: "{{ medusa_compose_pull if (medusa_compose_pull | default('')) else omit }}"
   become: true
   become_user: "{{ medusa_deploy_owner }}"
   loop: "{{ medusa_compose_files.files }}"
