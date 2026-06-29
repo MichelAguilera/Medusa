@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.20.0"
+VERSION="0.21.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1250,6 +1250,91 @@ EOF
     fi
 }
 
+# Interactive compose passthrough (T-083). Runs `docker compose <verb>` on the
+# host a stack lives on, with the terminal attached end-to-end so streaming
+# (`logs -f`), Ctrl-C, and `exec -it` work. Path: workstation -tt-> controller
+# -t-> stack host -> `sudo -iu medusa docker compose`. The controller resolves
+# stack->host from `medusa list-stacks` and reaches the host via its ~/.ssh/config
+# aliases. Deliberately NOT a generic exec fabric: the verb set is closed.
+_compose_interactive() {
+    local verb=$1; shift
+    local stack="" service="" host=""
+    local -a rest=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --) shift; rest=("$@"); break ;;
+            --service) shift; [[ -n "${1:-}" ]] || fail "compose $verb: --service requires a name"; service=$1; shift ;;
+            --service=*) service=${1#--service=}; [[ -n "$service" ]] || fail "compose $verb: --service requires a name"; shift ;;
+            --host) shift; [[ -n "${1:-}" ]] || fail "compose $verb: --host requires a host name"; host=$1; shift ;;
+            --host=*) host=${1#--host=}; [[ -n "$host" ]] || fail "compose $verb: --host requires a host name"; shift ;;
+            -*) fail "compose $verb: unknown flag '$1' (forward docker flags after --, e.g. -- -f)" ;;
+            *) [[ -z "$stack" ]] || fail "compose $verb: unexpected argument '$1' (stack already '$stack'; forward docker args after --)"; stack=$1; shift ;;
+        esac
+    done
+    [[ -n "$stack" ]] || fail "compose $verb: a <stack> is required (run 'medusactl compose list')"
+    [[ "$verb" != "exec" || -n "$service" ]] || fail "compose exec: --service <name> is required"
+    [[ "$verb" != "exec" || ${#rest[@]} -gt 0 ]] || fail "compose exec: a command is required after -- (e.g. -- bash)"
+
+    # Assemble the docker compose argv (host side). logs/ps: [forwarded flags...]
+    # [service]; exec: service [command...].
+    local -a dcargs=("$verb")
+    case "$verb" in
+        logs|ps)
+            dcargs+=("${rest[@]}")
+            [[ -n "$service" ]] && dcargs+=("$service")
+            ;;
+        exec)
+            dcargs+=("$service" "${rest[@]}")
+            ;;
+    esac
+
+    # Inner script runs as the medusa runtime user (login shell => its $HOME and
+    # docker-group membership). $HOME is kept LITERAL so it expands there, to
+    # medusa's home, where medusa-stacks/<stack> lives (T-047/T-048 deploy root).
+    local dc_quoted="" tok
+    for tok in "${dcargs[@]}"; do dc_quoted+=" $(printf %q "$tok")"; done
+    local inner="cd \"\$HOME/medusa-stacks/$(printf %q "$stack")\" && exec docker compose${dc_quoted}"
+    local hostcmd="sudo -iu medusa bash -c $(printf %q "$inner")"
+
+    # Controller-side: resolve stack->host (unless --host) then hop with a TTY.
+    # Passed as the ssh COMMAND (no stdin heredoc) so the terminal stays attached.
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+cd "$MEDUSA_CONTROLLER_PATH"
+host="$HOST"
+if [ -z "$host" ]; then
+    matches=$(uv run --quiet medusa list-stacks | awk -F'\t' -v s="$STACK" '$1==s{print $2}')
+    n=$(printf '%s' "$matches" | grep -c . || true)
+    if [ "$n" -eq 0 ]; then
+        echo "compose: stack '$STACK' not found on any host (run 'medusactl compose list')" >&2
+        exit 3
+    fi
+    if [ "$n" -gt 1 ]; then
+        echo "compose: stack '$STACK' is on multiple hosts; pass --host <name>:" >&2
+        printf '  %s\n' $matches >&2
+        exit 4
+    fi
+    host="$matches"
+fi
+exec ssh -t "$host" "$HOSTCMD"
+REMOTE
+)
+
+    local target
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    printf "%s==>%s compose %s %s%s\n" "$color_blue" "$color_reset" \
+        "$verb" "$stack" "${service:+ /$service}" >&2
+    ssh -tt "${ssh_opts[@]}" "$target" \
+        "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
+         STACK=$(printf %q "$stack") \
+         HOST=$(printf %q "$host") \
+         HOSTCMD=$(printf %q "$hostcmd") \
+         bash -c $(printf %q "$remote")"
+}
+
 cmd_compose() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
         cat <<EOF
@@ -1258,7 +1343,7 @@ medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--check]
                   'deploy' only STAGES stack files (medusa_compose_apply=false);
                   these verbs actually change runtime state.
 
-Verbs:
+Lifecycle verbs (ansible-routed, run on docker_hosts):
   up        Render, stage, and bring stacks to state=present (start containers).
   down      Bring stacks to state=stopped.
   restart   Restart stacks (compose v2 'restarted').
@@ -1266,14 +1351,21 @@ Verbs:
             pull=always). 'compose up <stack> --pull' is the same for one stack.
   list      Print the rendered stacks (stack / host / services) and exit.
 
-Targeting (T-082):
-  [stack]            Act on one stack only — its path under generated/compose/
-                     (e.g. 'media/immich'); omit to act on every stack. Run
-                     'medusactl compose list' for valid names.
-  --service <name>   Act on one service within the stack (requires [stack]).
-  --host <pattern>   Limit to docker hosts matching an Ansible host pattern.
+Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
+  logs      Stream a stack's logs (pass -f to follow, via -- ).
+  ps        Show a stack's container status.
+  exec      Run a command in a service's container (interactive TTY).
+
+Targeting:
+  [stack]            Lifecycle: act on one stack (its path under
+                     generated/compose/, e.g. 'media/immich'); omit for all.
+                     Interactive verbs REQUIRE a <stack>. 'compose list' lists names.
+  --service <name>   Act on one service within the stack (REQUIRED for exec).
+  --host <pattern>   Lifecycle: limit to docker hosts matching an Ansible pattern.
+                     Interactive: the host a stack lives on, when it is on >1 host.
   --pull             (up only) force an image re-pull on apply.
-  --check            Dry run (ansible --check --diff).
+  --check            (lifecycle only) dry run (ansible --check --diff).
+  -- <args...>       (interactive only) forward args verbatim to 'docker compose'.
 
 The Docker engine is a Tier-2 dependency Medusa owns; the docker_engine role
 (run by 'up') installs it when absent and leaves an existing install untouched.
@@ -1283,6 +1375,10 @@ Examples:
   medusactl compose up media/immich --pull
   medusactl compose restart gitea --host host01
   medusactl compose list
+  medusactl compose logs media/immich -- -f --tail=100
+  medusactl compose logs gitea --service gitea
+  medusactl compose ps arr
+  medusactl compose exec gitea --service gitea -- bash
 
 Exit codes: 0 success, non-zero on failure.
 EOF
@@ -1324,13 +1420,25 @@ REMOTE
         return 0
     fi
 
+    # Interactive passthrough verbs (T-083): logs / ps / exec. These do NOT fit
+    # the ansible path — they need a live TTY (stream follow, Ctrl-C, exec -it),
+    # which run_logged's log-only capture can't give. Instead we open a real,
+    # terminal-attached SSH: workstation -t-> controller -t-> the stack's host,
+    # then `docker compose <verb>` as the medusa runtime user (it owns the stacks
+    # tree and is in the docker group). The controller resolves stack->host from
+    # `medusa list-stacks` and reaches the host via its ~/.ssh/config aliases.
+    if [[ "$action" == "logs" || "$action" == "ps" || "$action" == "exec" ]]; then
+        _compose_interactive "$action" "$@"
+        return $?
+    fi
+
     local play mutating=1
     case "$action" in
         up)      play=compose-up.yml ;;
         down)    play=compose-stop.yml; mutating=0 ;;
         restart) play=compose-restart.yml ;;
         pull)    play=compose-pull.yml ;;
-        *) fail "compose: unknown verb '$action' (expected up|down|restart|pull|list)" ;;
+        *) fail "compose: unknown verb '$action' (expected up|down|restart|pull|logs|ps|exec|list)" ;;
     esac
 
     local check="" stack="" service="" host="" pull=0
@@ -3036,7 +3144,7 @@ _medusactl_complete() {
             ;;
         compose)
             if [[ "$COMP_CWORD" -eq 2 ]]; then
-                COMPREPLY=( $(compgen -W "up down restart pull list" -- "$cur") )
+                COMPREPLY=( $(compgen -W "up down restart pull logs ps exec list" -- "$cur") )
             else
                 COMPREPLY=( $(compgen -W "--service --host --check --pull --help" -- "$cur") )
             fi
@@ -3125,7 +3233,7 @@ _medusactl() {
             ;;
         compose)
             if (( CURRENT == 3 )); then
-                _values 'verb' up down restart pull list
+                _values 'verb' up down restart pull logs ps exec list
             else
                 _arguments \
                     '--service[act on one service within the stack]:service:' \
@@ -3215,7 +3323,7 @@ complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l check -d 'Run d
 complete -c medusactl -n '__fish_seen_subcommand_from deploy' -l limit -d 'Scope the run to a host pattern'
 complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l check -d 'Dry-activate without switching'
 complete -c medusactl -n '__fish_seen_subcommand_from nixos-apply' -l limit -d 'Reconcile only matching NixOS hosts'
-complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down restart pull list' -a 'up down restart pull list' -d 'Compose verb'
+complete -c medusactl -n '__fish_seen_subcommand_from compose; and not __fish_seen_subcommand_from up down restart pull logs ps exec list' -a 'up down restart pull logs ps exec list' -d 'Compose verb'
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l service -d 'Act on one service within the stack'
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l host -d 'Limit to docker hosts matching a pattern'
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l check -d 'Run compose in check mode'
