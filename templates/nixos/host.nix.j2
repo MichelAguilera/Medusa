@@ -104,6 +104,9 @@
 {% for staged in host.staged_secrets %}
     "medusa-secrets-enc/{{ staged.staged }}".source = ../secrets-enc/{{ staged.staged }};
 {% endfor %}
+{% for cfg in host.deploy_configs %}
+    "medusa-deploy-src/{{ cfg.dest }}".source = ../deploy/{{ host.name }}/{{ cfg.dest }};
+{% endfor %}
   };
 {% endif %}
 {% if host.stacks or host.sftp_users %}
@@ -136,7 +139,7 @@
     medusa-stacks-sync = {
       description = "Materialize Medusa compose stacks from the generation";
       wantedBy = [ "multi-user.target" ];
-      restartTriggers = [{% for stack in host.stacks %} ../stacks/{{ stack.name }}{% endfor %} ];
+      restartTriggers = [{% for stack in host.stacks %} ../stacks/{{ stack.name }}{% endfor %}{% if host.deploy_configs %} ../deploy/{{ host.name }}{% endif %} ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -153,6 +156,15 @@
         (cd "$src" && find . -type f -exec install -o medusa -g medusa -m 0664 {} "$dst/{}" \;)
         [ ! -d "$dst/env" ] || chmod 2770 "$dst/env"
 {% endfor %}
+{% if host.deploy_configs %}
+        # Deploy-root configs (Debian monitoring-role parity): materialize
+        # under /home/medusa/medusa with the same dir/file modes as the role.
+        install -d -o medusa -g medusa -m 2775 /home/medusa/medusa
+{% for cfg in host.deploy_configs %}
+        install -d -o medusa -g medusa -m 2775 "/home/medusa/medusa/{{ cfg.dest.rsplit('/', 1)[0] }}"
+        install -o medusa -g medusa -m 0664 "/etc/medusa-deploy-src/{{ cfg.dest }}" "/home/medusa/medusa/{{ cfg.dest }}"
+{% endfor %}
+{% endif %}
       '';
     };
 {% for stack in host.stacks %}

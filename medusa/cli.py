@@ -89,7 +89,7 @@ from medusa.render.hosts import render_hosts
 from medusa.render.monitoring import render_monitoring
 from medusa.render.network import render_network
 from medusa.render.nginx import render_nginx
-from medusa.render.nixos import render_nixos
+from medusa.render.nixos import render_nixos, stage_nixos_configs
 from medusa.render.secrets import render_secrets_manifest
 from medusa.render.sops import render_sops_config
 from medusa.render.storage import render_storage_manifest
@@ -188,6 +188,8 @@ def _load_all(
         native_model,
         _load_disko_sources(dns_model, paths),
         _load_nixos_secret_ciphertexts(dns_model, services_model, paths),
+        homepage_model=homepage_model,
+        monitoring_model=monitoring_model,
     )
     sops_model = normalize_sops(
         dns_model,
@@ -286,7 +288,7 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
     templates_dir = paths.templates_dir
     generated_dir = paths.generated_dir
 
-    return {
+    files = {
         **render_coredns(loaded.coredns_model, templates_dir, generated_dir),
         **render_homepage(loaded.homepage_model, templates_dir, generated_dir),
         **render_traefik(services_model, templates_dir, generated_dir),
@@ -310,6 +312,11 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
             generated_dir,
         ),
     }
+    # Copy the per-host traefik/homepage/monitoring artifacts into the NixOS
+    # staging trees from the entries above -- byte-identical to what the
+    # Debian roles ship, by construction (T-087 config-staging slice).
+    stage_nixos_configs(files, loaded.nixos_model, generated_dir)
+    return files
 
 
 def _diagnostic_handler(show_warnings: bool) -> DiagnosticHandler:

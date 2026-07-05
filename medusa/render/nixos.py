@@ -66,3 +66,44 @@ def render_nixos(
                 staged.ciphertext
             )
     return files
+
+
+def stage_nixos_configs(
+    files: dict[Path, str],
+    model: NixosModel,
+    generated_dir: Path,
+) -> None:
+    """Copy the per-host traefik/homepage/monitoring artifacts into the NixOS
+    staging trees (T-087 config-staging slice).
+
+    Runs AFTER all renderers, over the assembled files dict: each staged config
+    names its source under ``generated/`` (the exact artifact the Debian role
+    ships) and the bytes are copied from the dict entry -- byte-identical to
+    the Debian delivery by construction, never re-rendered. Stack configs land
+    inside ``generated/nixos/stacks/<stack>/`` where the existing etc staging,
+    sync unit, and restart triggers already cover them; deploy configs land in
+    ``generated/nixos/deploy/<host>/`` for the host module's deploy-src block."""
+    for host in model.hosts:
+        for stack in host.stacks:
+            for config in stack.config_files:
+                source = generated_dir / config.source
+                if source not in files:
+                    raise ValueError(
+                        f"staged config source '{config.source}' for host "
+                        f"'{host.name}' was not rendered -- normalize and "
+                        f"render disagree about this host's delivery set"
+                    )
+                files[
+                    generated_dir / "nixos" / "stacks" / stack.name / config.dest
+                ] = files[source]
+        for config in host.deploy_configs:
+            source = generated_dir / config.source
+            if source not in files:
+                raise ValueError(
+                    f"staged config source '{config.source}' for host "
+                    f"'{host.name}' was not rendered -- normalize and "
+                    f"render disagree about this host's delivery set"
+                )
+            files[
+                generated_dir / "nixos" / "deploy" / host.name / config.dest
+            ] = files[source]

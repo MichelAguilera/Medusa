@@ -37,6 +37,26 @@ class NixosMount(BaseModel):
     options: tuple[str, ...]
 
 
+class NixosStagedConfig(BaseModel):
+    """One per-host config artifact a Debian role would copy onto the host
+    (traefik dynamic config, homepage services config, prometheus targets),
+    staged into the flake tree instead (T-087 config-staging slice).
+
+    ``source`` is the artifact's path under ``generated/`` as emitted by the
+    platform-neutral renderer (e.g. ``traefik/<host>/dynamic.yaml``); the
+    staging step copies those exact bytes -- it never re-renders, so the file
+    is byte-identical to what the Debian role ships. ``dest`` is where the
+    file materializes on the host, relative to the stack project dir (stack
+    configs, e.g. ``traefik/dynamic/medusa-dynamic.yaml`` -- the path the
+    container binds relatively) or to the deploy root ``/home/medusa/medusa``
+    (deploy configs, e.g. ``monitoring/prometheus-targets.yaml``)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: str
+    dest: str
+
+
 class NixosStack(BaseModel):
     """One compose stack this NixOS host runs (T-087, compose-on-NixOS).
 
@@ -60,6 +80,11 @@ class NixosStack(BaseModel):
     # (mirror of the Debian compose role's external-resources step).
     external_networks: tuple[str, ...]
     external_volumes: tuple[str, ...]
+    # Per-host configs staged INTO this stack's tree (traefik/homepage): the
+    # containers bind them relatively (./traefik/dynamic, ./homepage/config),
+    # so placing them in the staged stack dir gives sync, restart triggers,
+    # and generation rollback with no extra machinery. Empty for most stacks.
+    config_files: tuple[NixosStagedConfig, ...] = ()
 
 
 class NixosStagedSecret(BaseModel):
@@ -127,6 +152,11 @@ class NixosHost(BaseModel):
     # owned before compose up (same derivation the Debian role consumes from
     # compose-data-dirs.yaml; here they render to tmpfiles rules).
     data_dirs: tuple[ComposeDataDir, ...]
+    # Per-host configs materialized under the deploy root /home/medusa/medusa
+    # (currently the prometheus targets file, mirroring the Debian monitoring
+    # role's medusa_deploy_root destination). Staged via the generation's
+    # deploy-src tree and synced by medusa-stacks-sync. Empty for most hosts.
+    deploy_configs: tuple[NixosStagedConfig, ...] = ()
     # Host-side-decrypted secrets this host's services reference (T-087 port of
     # the T-080 seam). staged_secrets drives ciphertext staging + etc entries;
     # the env/file groupings drive the medusa-secrets decrypt script. All empty

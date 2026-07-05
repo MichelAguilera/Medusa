@@ -39,6 +39,7 @@ from medusa.model.nixos import (
     NixosSecretFile,
     NixosSecretSetting,
     NixosStack,
+    NixosStagedConfig,
     NixosStagedSecret,
 )
 from medusa.model.services import (
@@ -302,6 +303,8 @@ def normalize_nixos(
     native_model: NativeModel | None = None,
     disko_sources: dict[str, str] | None = None,
     secret_ciphertexts: dict[str, str] | None = None,
+    homepage_model: HomepageModel | None = None,
+    monitoring_model: MonitoringModel | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
     Nix renderer formats. Crosscuts dns + storage + services + native services
@@ -390,6 +393,78 @@ def normalize_nixos(
             )
         )
 
+    # T-087 config-staging slice: the per-host artifacts the Debian traefik /
+    # homepage / monitoring roles copy onto the host ride the flake tree
+    # instead. Sources are the SAME rendered files those roles ship (the
+    # staging step copies bytes, never re-renders). traefik/homepage configs
+    # live inside the stack project dir on both platforms -- the containers
+    # bind them relatively (./traefik/dynamic, ./homepage/config) -- so they
+    # stage into the stack tree; the prometheus targets file mirrors the
+    # Debian medusa_deploy_root destination (/home/medusa/medusa/monitoring)
+    # via the host's deploy-src tree. Host derivations mirror the
+    # ansible-groups builder (service NAME, the convention the Debian plays
+    # target), so a host migrating platforms keeps the same delivery set.
+    def _stack_with_service(host_name: str, service_name: str) -> str:
+        for stack in stacks_by_host.get(host_name, ()):
+            if any(
+                service.name == service_name
+                for service in stack.compose_file.services
+            ):
+                return stack.name
+        raise ValueError(
+            f"host '{host_name}' should receive the {service_name} config "
+            f"but no stack on it contains a service named '{service_name}' "
+            f"-- the config is delivered relative to that service's stack "
+            f"(T-087)"
+        )
+
+    homepage_hosts = set(homepage_model.hosts) if homepage_model else set()
+    monitoring_hosts = set(monitoring_model.hosts) if monitoring_model else set()
+    stack_configs: dict[tuple[str, str], list[NixosStagedConfig]] = {}
+    deploy_configs_by_host: dict[str, list[NixosStagedConfig]] = {}
+    for host_name in sorted(nixos_names):
+        engine = services_model.proxies.get(host_name)
+        if engine is not None and engine != "traefik":
+            raise ValueError(
+                f"host '{host_name}' declares proxy engine '{engine}' but "
+                f"only traefik has a NixOS config delivery path -- keep this "
+                f"host on debian until that engine is ported (T-087)"
+            )
+        if engine == "traefik":
+            stack_name = _stack_with_service(host_name, "traefik")
+            stack_configs.setdefault((host_name, stack_name), []).append(
+                NixosStagedConfig(
+                    source=f"traefik/{host_name}/dynamic.yaml",
+                    dest="traefik/dynamic/medusa-dynamic.yaml",
+                )
+            )
+        if host_name in homepage_hosts:
+            stack_name = _stack_with_service(host_name, "homepage")
+            stack_configs.setdefault((host_name, stack_name), []).append(
+                NixosStagedConfig(
+                    source=f"homepage/{host_name}/services.yaml",
+                    dest="homepage/config/services.yaml",
+                )
+            )
+        if host_name in monitoring_hosts:
+            deploy_configs_by_host.setdefault(host_name, []).append(
+                NixosStagedConfig(
+                    source=f"monitoring/{host_name}/prometheus-targets.yaml",
+                    dest="monitoring/prometheus-targets.yaml",
+                )
+            )
+    for (host_name, stack_name), configs in stack_configs.items():
+        stacks_by_host[host_name] = [
+            (
+                stack.model_copy(
+                    update={"config_files": tuple(sorted(configs, key=lambda c: c.dest))}
+                )
+                if stack.name == stack_name
+                else stack
+            )
+            for stack in stacks_by_host[host_name]
+        ]
+
     data_dirs_by_host: dict[str, list] = {}
     for data_dir in services_model.data_dirs:
         data_dirs_by_host.setdefault(data_dir.host, []).append(data_dir)
@@ -440,6 +515,7 @@ def normalize_nixos(
                 )
             ),
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
+            deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
             staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],
             secret_env_files=secrets_by_host.get(host.name, _NO_SECRETS)[1],
             secret_files=secrets_by_host.get(host.name, _NO_SECRETS)[2],
