@@ -8,6 +8,24 @@ class NfsExport(BaseModel):
     server: str
     path: str
     options: tuple[str, ...]
+    # Declared ownership of the export dir (T-085); enforced by the role every
+    # deploy and cross-checked against the sftp consumers in normalize_native.
+    owner: int
+    group: int
+    mode: str
+
+
+class ExportDirectory(BaseModel):
+    """One directory the nfs_exports role creates/repairs, with the ownership
+    it must converge to. The export path itself carries the export's declared
+    owner/group/mode; intermediate dirs keep the ansible-owned default."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    owner: int
+    group: int
+    mode: str
 
 
 class NfsExportClient(BaseModel):
@@ -33,11 +51,12 @@ class NfsServerExport(BaseModel):
     clients: tuple[NfsExportClient, ...]
     # Path-provisioning plan for the export source (T-071). `dataset`, when set,
     # is the ZFS dataset NAME the nfs_exports role ensures (state=present) before
-    # `exportfs -ra`; `directories` are the absolute paths to create+chown (the
-    # dataset mountpoint plus any deeper plain dirs, or the bare export path when
-    # the server has no ZFS pool root). Empty `dataset` means "no dataset".
+    # `exportfs -ra`; `directories` are the paths to create with their declared
+    # ownership (T-085) -- the dataset mountpoint plus any deeper plain dirs, or
+    # the bare export path when the server has no ZFS pool root. Empty `dataset`
+    # means "no dataset".
     dataset: str | None = None
-    directories: tuple[str, ...] = ()
+    directories: tuple[ExportDirectory, ...] = ()
 
 
 class NfsMount(BaseModel):

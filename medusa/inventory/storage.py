@@ -1,3 +1,4 @@
+import re
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -12,6 +13,15 @@ class NfsExportInventory(BaseModel):
     options: list[str] = Field(
         default_factory=lambda: ["rw", "sync", "no_subtree_check", "no_root_squash"]
     )
+    # Declared ownership of the export directory itself (T-085). The
+    # nfs_exports role applies this on every deploy, so deploys CONVERGE to the
+    # declared state -- an export consumed by an sftp user (uid) or shared
+    # space (gid + setgid) declares it here instead of relying on a manual
+    # chown that the next deploy would clobber. Defaults preserve the
+    # historical behavior (ansible-owned, 0755).
+    owner: int = 1000
+    group: int = 1000
+    mode: str = "0755"
 
     @field_validator("id", "server")
     @classmethod
@@ -39,6 +49,23 @@ class NfsExportInventory(BaseModel):
             raise ValueError("export options cannot contain empty values")
         if len(set(normalized)) != len(normalized):
             raise ValueError("export options cannot contain duplicates")
+        return normalized
+
+    @field_validator("owner", "group")
+    @classmethod
+    def validate_ids(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("export owner/group must be a non-negative uid/gid")
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def validate_mode(cls, value: str) -> str:
+        normalized = value.strip()
+        if not re.fullmatch(r"[0-7]{3,4}", normalized):
+            raise ValueError(
+                "export mode must be an octal string like '0755' or '2775'"
+            )
         return normalized
 
 

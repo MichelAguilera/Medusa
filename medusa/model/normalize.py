@@ -47,12 +47,23 @@ from medusa.model.services import (
 from medusa.model.settings import generated_env_files, secret_sources
 from medusa.model.sops import SopsConfigModel, SopsRule
 from medusa.model.storage import (
+    ExportDirectory,
     NfsExport,
     NfsExportClient,
     NfsMount,
     NfsServerExport,
     StorageModel,
 )
+
+# Ownership the nfs_exports role applies to intermediate export directories
+# and, by default, to export paths that declare nothing (T-085). Matches the
+# ansible automation uid/gid contract (T-048).
+DEFAULT_EXPORT_OWNER = 1000
+DEFAULT_EXPORT_GROUP = 1000
+DEFAULT_EXPORT_MODE = "0755"
+# Mode a shared-space export must declare: setgid + group-write, so files
+# created through any member's mount inherit the share group (T-084/T-085).
+SFTP_SHARED_EXPORT_MODE = "2775"
 
 
 def _derive_managed_mode(
@@ -380,6 +391,7 @@ def normalize_native(
     inventory data (T-078 resolution). See T-076."""
     hosts_by_name = {host.name: host for host in dns_model.hosts}
     mounts_by_host = dict(storage_model.mounts_by_host)
+    exports_by_id = {export.id: export for export in storage_model.exports}
 
     services: list[NativeSftpService] = []
     for service in inventory.native_services:
@@ -415,6 +427,19 @@ def normalize_native(
                     f"Mount it under {chroot}/ so the writable area sits inside the "
                     f"root-owned chroot."
                 )
+            # A pinned uid is a promise about the export's file ownership --
+            # cross-check it so a mismatch fails at render time instead of as
+            # a runtime Permission denied after a deploy re-owns the dir
+            # (T-085).
+            if user.uid is not None:
+                export = exports_by_id[mount.export_id]
+                if export.owner != user.uid:
+                    raise ValueError(
+                        f"sftp user '{user.name}' has uid {user.uid} but export "
+                        f"'{export.id}' declares owner {export.owner}; set "
+                        f"owner: {user.uid} on the export in storage.yaml so "
+                        f"deploys converge the directory to the user"
+                    )
             users.append(
                 NativeSftpUser(
                     name=user.name,
@@ -469,6 +494,19 @@ def normalize_native(
                     f"storage.yaml mounts shared space '{share.name}' into the "
                     f"chroot of non-member(s): {formatted}. Add them to the "
                     f"share's members or drop the mount."
+                )
+            # Mutual writability rides the export's group + setgid: the export
+            # must declare the share's gid and mode 2775, or every write fails
+            # at runtime with Permission denied (T-085).
+            export = exports_by_id[next(iter(member_exports))]
+            if export.group != share.gid or export.mode != SFTP_SHARED_EXPORT_MODE:
+                raise ValueError(
+                    f"sftp shared space '{share.name}' (gid {share.gid}) is "
+                    f"backed by export '{export.id}' declaring group "
+                    f"{export.group}, mode {export.mode}; set group: "
+                    f"{share.gid} and mode: \"{SFTP_SHARED_EXPORT_MODE}\" on "
+                    f"the export in storage.yaml (setgid + group-write is what "
+                    f"makes members able to edit each other's files)"
                 )
             shares.append(
                 NativeSftpShare(name=share.name, gid=share.gid, members=members)
@@ -609,6 +647,9 @@ def normalize_storage(
             server=export.server,
             path=export.path,
             options=tuple(export.options),
+            owner=export.owner,
+            group=export.group,
+            mode=export.mode,
         )
         for export in inventory.exports
     }
@@ -677,8 +718,20 @@ def normalize_storage(
             )
             for host in client_hosts
         )
-        dataset, directories = _export_path_plan(
+        dataset, directory_paths = _export_path_plan(
             export.path, zfs_root_by_server.get(export.server)
+        )
+        # The export path itself converges to the declared ownership; any
+        # intermediate dirs (dataset mountpoint above a deeper export) stay
+        # ansible-owned (T-085).
+        directories = tuple(
+            ExportDirectory(
+                path=path,
+                owner=export.owner if path == export.path else DEFAULT_EXPORT_OWNER,
+                group=export.group if path == export.path else DEFAULT_EXPORT_GROUP,
+                mode=export.mode if path == export.path else DEFAULT_EXPORT_MODE,
+            )
+            for path in directory_paths
         )
         exports_by_server.setdefault(export.server, []).append(
             NfsServerExport(

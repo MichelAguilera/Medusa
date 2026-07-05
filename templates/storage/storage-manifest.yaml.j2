@@ -32,7 +32,17 @@ servers:
 {% if export.clients %}
   - path: {{ export.path }}
     dataset: {{ export.dataset if export.dataset else "" }}
-    directories: [{{ export.directories | join(", ") }}]
+{% if export.directories %}
+    directories:
+{% for dir in export.directories %}
+    - path: {{ dir.path }}
+      owner: "{{ dir.owner }}"
+      group: "{{ dir.group }}"
+      mode: "{{ dir.mode }}"
+{% endfor %}
+{% else %}
+    directories: []
+{% endif %}
 {% endif %}
 {% endfor %}
 {% endif %}

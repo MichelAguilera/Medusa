@@ -43,17 +43,21 @@
   loop_control:
     label: "{{ item.dataset }}"
 
+# Ownership comes from the manifest (T-085): the export path converges to its
+# declared owner/group/mode on every run, so an sftp uid chown or a shared
+# space's setgid group survives deploys instead of being clobbered back to the
+# automation user.
 - name: Ensure export directories exist with managed ownership
   ansible.builtin.file:
-    path: "{{ item.1 }}"
+    path: "{{ item.1.path }}"
     state: directory
-    owner: "1000"
-    group: "1000"
-    mode: "0755"
+    owner: "{{ item.1.owner }}"
+    group: "{{ item.1.group }}"
+    mode: "{{ item.1.mode }}"
   become: true
   loop: "{{ medusa_server_exports | subelements('directories') }}"
   loop_control:
-    label: "{{ item.1 }}"
+    label: "{{ item.1.path }}"
 
 # Orphan detection (T-072): warn -- never destroy -- about datasets under the
 # pool root that back no declared export. Medusa is create-only for ZFS; the
