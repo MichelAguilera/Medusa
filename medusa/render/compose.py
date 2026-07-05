@@ -30,7 +30,26 @@ def render_compose(
             {"data_dirs": model.data_dirs},
         )
     }
-    return {**compose_files, **env_files, **data_dirs}
+    # Stack->host manifest: generated/compose/ now carries every platform's
+    # stacks (T-087), so the Debian role needs to know which are its own.
+    # Sorted purely for stable output.
+    stacks = {
+        generated_dir / "compose-stacks.yaml": render_template(
+            templates_dir,
+            "compose/stacks.yaml.j2",
+            {
+                "stacks": sorted(
+                    (
+                        {"stack": c.stack, "host": c.host}
+                        for c in model.compose
+                        if c.stack is not None
+                    ),
+                    key=lambda item: item["stack"],
+                )
+            },
+        )
+    }
+    return {**compose_files, **env_files, **data_dirs, **stacks}
 
 
 def _compose_path(generated_dir: Path, compose_file: ComposeFile) -> Path:

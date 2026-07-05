@@ -31,14 +31,17 @@ from medusa.model.native import (
 )
 from medusa.model.network import NetworkHost, NetworkModel
 from medusa.model.nixos import (
-    NixosContainer,
     NixosHost,
     NixosModel,
     NixosMount,
     NixosNetwork,
+    NixosSecretEnvFile,
+    NixosSecretFile,
+    NixosSecretSetting,
+    NixosStack,
+    NixosStagedSecret,
 )
 from medusa.model.services import (
-    ComposeService,
     EgressGateway,
     ServiceRecord,
     ServicesModel,
@@ -294,17 +297,74 @@ def normalize_nixos(
     services_model: ServicesModel,
     native_model: NativeModel | None = None,
     disko_sources: dict[str, str] | None = None,
+    secret_ciphertexts: dict[str, str] | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
     Nix renderer formats. Crosscuts dns + storage + services + native services
     the way the Debian path is split across compose/fstab/networkd, but gathered
     here so the renderer stays formatting-only (renderer contract). Empty when no
-    host is on the NixOS platform. See T-073, T-074, T-076."""
+    host is on the NixOS platform. See T-073, T-074, T-076, T-087."""
     mounts_by_host = dict(storage_model.mounts_by_host)
-    containers_by_host: dict[str, list[ComposeService]] = {}
-    for compose in services_model.nixos_compose:
-        for service in compose.services:
-            containers_by_host.setdefault(service.host, []).append(service)
+    nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
+
+    # T-087/D6 guard: `egress: tunnel` services must not land on a NixOS host
+    # until the client-side tunnel-routing slice is kill-switch-proven there.
+    # Compose would start such a service with DIRECT egress -- a silent
+    # kill-switch violation, the failure shape the tunnel exists to prevent.
+    tunneled_on_nixos = tuple(
+        f"'{name}' (host '{host}')"
+        for host, names in sorted(services_model.tunnel_services_by_host.items())
+        if host in nixos_names
+        for name in names
+    )
+    if tunneled_on_nixos:
+        raise ValueError(
+            f"services with egress: tunnel cannot run on a NixOS host until "
+            f"the tunnel-routing client is kill-switch-validated there "
+            f"(T-087/D6): {'; '.join(tunneled_on_nixos)} -- keep these stacks "
+            f"on a debian-docker host"
+        )
+
+    stacks_by_host: dict[str, list[NixosStack]] = {}
+    env_by_stack: dict[str, list] = {}
+    for env_file in services_model.env_files:
+        if env_file.stack is not None:
+            env_by_stack.setdefault(env_file.stack, []).append(env_file)
+    for compose_file in services_model.compose:
+        if compose_file.host not in nixos_names:
+            continue
+        if compose_file.stack is None:
+            # Stackless per-host compose files predate the stack layout; no
+            # NixOS host has ever carried one and the sync/unit naming assumes
+            # a stack dir. Reject loudly rather than guess a layout.
+            raise ValueError(
+                f"host '{compose_file.host}' has compose services without a "
+                f"stack; NixOS hosts require stacked services (T-087)"
+            )
+        stacks_by_host.setdefault(compose_file.host, []).append(
+            NixosStack(
+                name=compose_file.stack,
+                unit_suffix=compose_file.stack.replace("/", "-"),
+                compose_file=compose_file,
+                env_files=tuple(
+                    sorted(
+                        env_by_stack.get(compose_file.stack, ()),
+                        key=lambda item: item.path,
+                    )
+                ),
+                external_networks=_external_names(compose_file.networks),
+                external_volumes=_external_names(compose_file.volumes),
+            )
+        )
+
+    data_dirs_by_host: dict[str, list] = {}
+    for data_dir in services_model.data_dirs:
+        data_dirs_by_host.setdefault(data_dir.host, []).append(data_dir)
+
+    secret_ciphertexts = secret_ciphertexts or {}
+    secrets_by_host = _nixos_secrets_by_host(
+        services_model, nixos_names, secret_ciphertexts
+    )
 
     sftp_users_by_host: dict[str, tuple[NativeSftpUser, ...]] = {}
     sftp_shares_by_host: dict[str, tuple[NativeSftpShare, ...]] = {}
@@ -340,14 +400,16 @@ def normalize_nixos(
                 )
                 for mount in mounts_by_host.get(host.name, ())
             ),
-            container_backend="docker",
-            containers=tuple(
-                _nixos_container(service)
-                for service in sorted(
-                    containers_by_host.get(host.name, ()),
+            stacks=tuple(
+                sorted(
+                    stacks_by_host.get(host.name, ()),
                     key=lambda item: item.name,
                 )
             ),
+            data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
+            staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],
+            secret_env_files=secrets_by_host.get(host.name, _NO_SECRETS)[1],
+            secret_files=secrets_by_host.get(host.name, _NO_SECRETS)[2],
             sftp_users=sftp_users_by_host.get(host.name, ()),
             sftp_shares=sftp_shares_by_host.get(host.name, ()),
             sftp_chroot_root=(
@@ -364,11 +426,6 @@ def normalize_nixos(
             disko_source=(
                 disko_sources.get(host.name) if host.nixos_disko else None
             ),
-            # No producer today: SFTP authorized keys became plain inventory
-            # data (T-078 resolution), so nothing on a nixos host references a
-            # sops secret yet. The NixosSecret seam (model, template block,
-            # per-host sops-nix flake module) stays for the next real consumer.
-            secrets=(),
             deploy_target=_nixos_deploy_target(host),
         )
         for host in dns_model.hosts_by_platform("nixos")
@@ -543,19 +600,86 @@ def _nixos_network(host: HostRecord) -> NixosNetwork | None:
     )
 
 
-def _nixos_container(service: ComposeService) -> NixosContainer:
-    if service.image is None:
-        raise ValueError(
-            f"service {service.id} targets a NixOS host but has no image; "
-            f"oci-containers needs an image (build-from-source is not supported "
-            f"on the NixOS path)"
+_NO_SECRETS: tuple[tuple, tuple, tuple] = ((), (), ())
+
+
+def _nixos_secrets_by_host(
+    services_model: ServicesModel,
+    nixos_names: set[str],
+    secret_ciphertexts: dict[str, str],
+) -> dict[str, tuple]:
+    """Reshape SecretSource records into the render-ready host-side-decryption
+    shapes (T-087): staged ciphertexts, env files grouped by destination (the
+    grouping the Debian decrypt script template does with Ansible vars), and
+    whole-file secrets. Owner maps here: "service" -> the medusa runtime user,
+    "system" -> root (same mapping as the Debian secrets role)."""
+    by_host: dict[str, tuple] = {}
+    for host in sorted({s.host for s in services_model.secret_sources}):
+        if host not in nixos_names:
+            continue
+        entries = sorted(
+            (s for s in services_model.secret_sources if s.host == host),
+            key=lambda item: (item.destination, item.setting),
         )
-    return NixosContainer(
-        name=service.name,
-        image=service.image,
-        ports=service.ports,
-        volumes=service.volumes,
-        environment=tuple(sorted(service.managed_environment.items())),
+        staged_map: dict[str, str] = {}
+        for entry in entries:
+            if entry.source not in secret_ciphertexts:
+                raise ValueError(
+                    f"secret source '{entry.source}' (host '{host}') was not "
+                    f"staged for the NixOS render -- the encrypted file must "
+                    f"exist under the secrets dir (T-087)"
+                )
+            staged_map[entry.source.removeprefix("secrets/")] = (
+                secret_ciphertexts[entry.source]
+            )
+        env_files: list[NixosSecretEnvFile] = []
+        for destination in sorted({e.destination for e in entries if e.mode == "env"}):
+            grouped = [e for e in entries if e.destination == destination]
+            env_files.append(
+                NixosSecretEnvFile(
+                    destination=destination,
+                    owner_user="medusa" if grouped[0].owner == "service" else "root",
+                    settings=tuple(
+                        NixosSecretSetting(
+                            setting=e.setting,
+                            staged=e.source.removeprefix("secrets/"),
+                        )
+                        for e in grouped
+                    ),
+                )
+            )
+        secret_files = tuple(
+            NixosSecretFile(
+                destination=e.destination,
+                owner_user="medusa" if e.owner == "service" else "root",
+                staged=e.source.removeprefix("secrets/"),
+            )
+            for e in entries
+            if e.mode == "file"
+        )
+        by_host[host] = (
+            tuple(
+                NixosStagedSecret(staged=staged, ciphertext=ciphertext)
+                for staged, ciphertext in sorted(staged_map.items())
+            ),
+            tuple(env_files),
+            secret_files,
+        )
+    return by_host
+
+
+def _external_names(resources: dict) -> tuple[str, ...]:
+    """Names of stack-level networks/volumes declared ``external: true``.
+
+    Same discovery the Debian compose role performs on the rendered files;
+    derived here from the model so the NixOS stack unit's pre-create step stays
+    template-formatting only."""
+    return tuple(
+        sorted(
+            name
+            for name, value in resources.items()
+            if isinstance(value, dict) and value.get("external")
+        )
     )
 
 
@@ -834,13 +958,12 @@ def normalize_services(
     compose_files = normalize_compose_files(inventory, compose_services, egress)
     compose_data_dirs = normalize_compose_data_dirs(compose_services)
 
-    # Partition compose by host platform at the source (not in render_compose):
-    # Debian hosts render to compose files, NixOS hosts to oci-containers via
-    # normalize_nixos. Each host lands in exactly one bucket. See the Platform
-    # Fork Boundary ADR and T-074's deferred double-render note.
-    nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
-    debian_compose = tuple(c for c in compose_files if c.host not in nixos_names)
-    nixos_compose = tuple(c for c in compose_files if c.host in nixos_names)
+    # Compose is deliberately NOT partitioned by platform (T-087): compose
+    # files are the platform-neutral container layer, rendered identically for
+    # every docker-running host. NixOS hosts consume the same ComposeFile
+    # models again in normalize_nixos to derive delivery (stacks staged into
+    # the flake) -- the SUBSTRATE forks per platform, the container layer does
+    # not. See the Platform Fork Boundary ADR.
     proxies = _validate_proxy_engines(services, traefik_routes)
     _validate_proxy_network_membership(services)
 
@@ -867,8 +990,7 @@ def normalize_services(
         services=service_records,
         traefik=traefik_routes,
         traefik_routes_by_host=traefik_routes_by_host,
-        compose=debian_compose,
-        nixos_compose=nixos_compose,
+        compose=compose_files,
         env_files=generated_env_files(compose_services),
         data_dirs=compose_data_dirs,
         secret_sources=secret_sources(services, egress),
