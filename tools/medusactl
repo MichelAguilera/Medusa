@@ -1717,10 +1717,12 @@ rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
     echo "==> nixos-rebuild $ACTION: $host ($target)"
+    # </dev/null: nixos-rebuild's underlying ssh must not inherit the loop's
+    # stdin or it swallows the remaining plan lines (second host never applies).
     if ! nixos-rebuild "$ACTION" \
         --flake "$MEDUSA_GENERATED_DIR/nixos#$host" \
         --target-host "$target" \
-        --use-remote-sudo; then
+        --use-remote-sudo < /dev/null; then
         echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
         rc=1
     fi

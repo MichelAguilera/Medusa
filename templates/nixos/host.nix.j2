@@ -148,7 +148,9 @@
         src=/etc/medusa-stacks-src/{{ stack.name }}
         dst=/home/medusa/medusa-stacks/{{ stack.name }}
         (cd "$src" && find . -type d -exec install -d -o medusa -g medusa -m 2775 "$dst/{}" \;)
-        (cd "$src" && find . -type f -exec sh -c 'install -o medusa -g medusa -m 0664 "$1" "$2/$1"' _ {} "$dst" \;)
+        # No sh here: the unit's PATH has no shell, so a `find -exec sh` dies
+        # with "find: 'sh': No such file or directory" and no file is copied.
+        (cd "$src" && find . -type f -exec install -o medusa -g medusa -m 0664 {} "$dst/{}" \;)
         [ ! -d "$dst/env" ] || chmod 2770 "$dst/env"
 {% endfor %}
       '';
