@@ -31,7 +31,6 @@ from medusa.model.nixos import (
     NixosModel,
     NixosMount,
     NixosNetwork,
-    NixosSecret,
 )
 from medusa.model.services import (
     ComposeService,
@@ -337,7 +336,11 @@ def normalize_nixos(
             disko_source=(
                 disko_sources.get(host.name) if host.nixos_disko else None
             ),
-            secrets=_nixos_secrets(sftp_users_by_host.get(host.name, ())),
+            # No producer today: SFTP authorized keys became plain inventory
+            # data (T-078 resolution), so nothing on a nixos host references a
+            # sops secret yet. The NixosSecret seam (model, template block,
+            # per-host sops-nix flake module) stays for the next real consumer.
+            secrets=(),
             deploy_target=_nixos_deploy_target(host),
         )
         for host in dns_model.hosts_by_platform("nixos")
@@ -356,8 +359,8 @@ def normalize_native(
     (the explicit not-implemented boundary). Each user's storage ref resolves
     against storage.yaml and must sit under the derived, root-owned chroot so the
     writable area is inside the ChrootDirectory (OpenSSH correctness, derived not
-    asked). Authorized keys become secret references delivered by sops-nix
-    (T-077). See T-076."""
+    asked). Authorized keys are public-key material carried verbatim as plain
+    inventory data (T-078 resolution). See T-076."""
     hosts_by_name = {host.name: host for host in dns_model.hosts}
     mounts_by_host = dict(storage_model.mounts_by_host)
 
@@ -401,39 +404,11 @@ def normalize_native(
                     chroot=chroot,
                     home=mount.mountpoint,
                     uid=user.uid,
-                    key_names=tuple(user.keys),
-                    key_sources=tuple(
-                        f"secrets/{ref}.sops.yaml" for ref in user.keys
-                    ),
-                    key_files=tuple(f"/run/secrets/{ref}" for ref in user.keys),
+                    authorized_keys=tuple(user.authorized_keys),
                 )
             )
         services.append(NativeSftpService(host=service.host, users=tuple(users)))
     return NativeModel(sftp=tuple(services))
-
-
-def _nixos_secrets(
-    sftp_users: tuple[NativeSftpUser, ...],
-) -> tuple[NixosSecret, ...]:
-    """sops-nix secret declarations a host's services reference (T-077). Today
-    that is the SFTP authorized-key secrets: each materializes at
-    ``/run/secrets/<ref>``, owned by root (sshd reads ``authorizedKeys.keyFiles``
-    as root before the chroot). Deduplicated by name and sorted for stable
-    output. The reference model is unchanged -- only the on-host deliverer (sops-
-    nix vs the Ansible secrets role) differs by platform."""
-    by_name: dict[str, NixosSecret] = {}
-    for user in sftp_users:
-        for name in user.key_names:
-            by_name.setdefault(
-                name,
-                NixosSecret(
-                    name=name,
-                    sops_file=f"../secrets/{name}.sops.yaml",
-                    owner="root",
-                    mode="0400",
-                ),
-            )
-    return tuple(by_name[name] for name in sorted(by_name))
 
 
 def _nixos_deploy_target(host: HostRecord) -> str | None:

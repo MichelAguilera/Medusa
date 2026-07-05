@@ -126,7 +126,7 @@
     uid = {{ user.uid }};
 {% endif %}
     home = "{{ user.home }}";
-    openssh.authorizedKeys.keyFiles = [{% for key_file in user.key_files %} "{{ key_file }}"{% endfor %} ];
+    openssh.authorizedKeys.keys = [{% for key in user.authorized_keys %} "{{ key }}"{% endfor %} ];
   };
 {% endfor %}
 {% endif %}

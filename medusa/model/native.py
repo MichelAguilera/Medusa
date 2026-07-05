@@ -1,8 +1,9 @@
 """Normalized host-native services (T-076). A platform-neutral, fully-derived
 form of the "daemon with users" concept; NixOS hosts reshape it into their
 per-host module (T-074), and a Debian renderer can consume the same model later.
-Authorized keys are carried as secret *references* (sops sources delivered by
-T-077), never key material -- Medusa is not a secret manager."""
+Authorized keys are SSH *public* keys carried verbatim as plain inventory data
+(the T-078 resolution, mirroring `nixos_admin_keys`) -- public keys are not
+secret, and Medusa is not a secret manager."""
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,13 +20,9 @@ class NativeSftpUser(BaseModel):
     # under ``chroot`` (enforced in normalize). The NFS bind is the writable part.
     home: str
     uid: int | None
-    # Bare authorized-key secret reference names (the sops.secrets.<name> keys).
-    key_names: tuple[str, ...]
-    # sops source files T-077 must decrypt + deliver (one per key ref).
-    key_sources: tuple[str, ...]
-    # Where the rendered NixOS config reads the delivered public keys
-    # (authorizedKeys.keyFiles). sops-nix places each source here (T-077).
-    key_files: tuple[str, ...]
+    # Authorized SSH public keys, verbatim from inventory. The renderer emits
+    # them as `openssh.authorizedKeys.keys`; no sops-nix delivery is involved.
+    authorized_keys: tuple[str, ...]
 
 
 class NativeSftpService(BaseModel):
