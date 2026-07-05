@@ -1302,6 +1302,7 @@ _compose_interactive() {
     local remote
     remote=$(cat <<'REMOTE'
 set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
 cd "$MEDUSA_CONTROLLER_PATH"
 host="$HOST"
 if [ -z "$host" ]; then
@@ -1330,6 +1331,9 @@ REMOTE
         "$verb" "$stack" "${service:+ /$service}" >&2
     ssh -tt "${ssh_opts[@]}" "$target" \
         "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
+         MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory") \
+         MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets") \
+         MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH") \
          STACK=$(printf %q "$stack") \
          HOST=$(printf %q "$host") \
          HOSTCMD=$(printf %q "$hostcmd") \
