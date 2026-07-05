@@ -13,36 +13,29 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 
 class SftpSharedInventory(BaseModel):
-    """A shared space (T-084): one NFS export mounted inside the chroot of every
-    member at ``/srv/sftp/<member>/shared/<name>``, made mutually writable via a
-    pinned-gid group + server-side setgid + the sftp umask. ``storage`` names an
-    *export* id (not a mount id): a single authored mount carries exactly one
-    mountpoint, but a share needs the same export at N member mountpoints, so
-    the per-member mounts are synthesized (``synthesize_sftp_shared_mounts``)."""
+    """A shared space (T-084): a group-writable common area visible inside every
+    member's chroot at ``shared/<name>``. This block declares ONLY the group
+    concept (name, pinned gid, members); the storage itself -- the export and
+    one mount per member at ``/srv/sftp/<member>/shared/<name>`` -- is authored
+    in storage.yaml like every other export/mount (storage declarations never
+    live anywhere else). Normalize cross-checks the two files."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    # Export id from storage.yaml. The export dir on the server must be
-    # group-owned by ``gid`` with setgid (mode 2775) -- same operator step as
-    # chowning a private export to its user's uid.
-    storage: str
     # Pinned numeric gid, mirroring SftpUserInventory.uid: NFS sec=sys checks
-    # numeric ids, so the group's gid must agree with the server-side chgrp.
+    # numeric ids, so the group's gid must agree with the server-side chgrp of
+    # the export dir (2775, setgid).
     gid: int
     # Member user names (from this service's ``users``). Empty means every user.
     members: list[str] = Field(default_factory=list)
-    # Client mount type/options for the synthesized per-member mounts, same
-    # shape and defaults as a storage.yaml mount entry.
-    type: Literal["nfs", "nfs4"] = "nfs"
-    options: list[str] = Field(default_factory=lambda: ["defaults"])
 
-    @field_validator("name", "storage")
+    @field_validator("name")
     @classmethod
     def _nonempty_lower(cls, value: str) -> str:
         normalized = value.strip().lower()
         if not normalized:
-            raise ValueError("shared space name and storage ref cannot be empty")
+            raise ValueError("shared space name cannot be empty")
         return normalized
 
     @field_validator("name")
@@ -70,16 +63,6 @@ class SftpSharedInventory(BaseModel):
             raise ValueError("shared space members cannot be empty strings")
         if len(set(normalized)) != len(normalized):
             raise ValueError("shared space members cannot contain duplicates")
-        return normalized
-
-    @field_validator("options")
-    @classmethod
-    def _normalize_options(cls, value: list[str]) -> list[str]:
-        normalized = [item.strip() for item in value]
-        if any(not item for item in normalized):
-            raise ValueError("shared space options cannot contain empty values")
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("shared space options cannot contain duplicates")
         return normalized
 
 

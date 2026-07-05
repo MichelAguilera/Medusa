@@ -10,7 +10,7 @@ from medusa.inventory.homepage import HomepageInventory
 from medusa.inventory.native import NativeServicesInventory
 from medusa.inventory.secrets import SecretsInventory
 from medusa.inventory.services import ServicesInventory, resolve_egress
-from medusa.inventory.storage import NfsMountInventory, StorageInventory
+from medusa.inventory.storage import StorageInventory
 from medusa.model.compose import (
     normalize_compose_data_dirs,
     normalize_compose_files,
@@ -277,53 +277,6 @@ def _shared_mountpoint(member: str, share_name: str) -> str:
     return f"{SFTP_CHROOT_ROOT}/{member}/{SFTP_SHARED_SUBDIR}/{share_name}"
 
 
-def synthesize_sftp_shared_mounts(
-    storage_inventory: StorageInventory,
-    native_inventory: NativeServicesInventory,
-) -> StorageInventory:
-    """Expand sftp shared spaces (T-084) into real storage mounts -- the same
-    export at one mountpoint per member, inside that member's chroot. Runs at
-    the inventory level, BEFORE ``normalize_storage``, so everything derived
-    from mounts stays consistent for free: the server's export authorizes the
-    sftp host as a client, the NixOS host emits one fileSystems/automount entry
-    per member, and `medusa check` tracks all of it. Re-validating the combined
-    StorageInventory keeps the authored uniqueness guarantees (ids,
-    per-host mountpoints) loud across the synthesized entries too."""
-    if not any(service.shared for service in native_inventory.native_services):
-        return storage_inventory
-
-    known_exports = {export.id for export in storage_inventory.exports}
-    synthesized: list[NfsMountInventory] = []
-    for service in native_inventory.native_services:
-        user_names = [user.name for user in service.users]
-        for share in service.shared:
-            if share.storage not in known_exports:
-                raise ValueError(
-                    f"sftp shared space '{share.name}' on '{service.host}' "
-                    f"references storage '{share.storage}', which is not a "
-                    f"declared export in storage.yaml (shared spaces reference "
-                    f"an export id, not a mount id)"
-                )
-            members = share.members or user_names
-            synthesized.extend(
-                NfsMountInventory(
-                    id=f"sftp-shared-{share.name}-{member}",
-                    host=[service.host],
-                    export=share.storage,
-                    mountpoint=_shared_mountpoint(member, share.name),
-                    type=share.type,
-                    options=list(share.options),
-                )
-                for member in members
-            )
-
-    return StorageInventory(
-        exports=storage_inventory.exports,
-        mounts=[*storage_inventory.mounts, *synthesized],
-        servers=storage_inventory.servers,
-    )
-
-
 def normalize_nixos(
     dns_model: DnsModel,
     storage_model: StorageModel,
@@ -472,26 +425,50 @@ def normalize_native(
                 )
             )
 
-        host_mountpoints = {mount.mountpoint for mount in host_mounts.values()}
+        # Storage declarations live ONLY in storage.yaml: a share's per-member
+        # mounts are authored there (same export, one mountpoint per member,
+        # exactly like the private per-user mounts). The share block here only
+        # declares the group concept; normalize cross-checks the two files.
+        mounts_by_mountpoint = {
+            mount.mountpoint: mount for mount in host_mounts.values()
+        }
         shares: list[NativeSftpShare] = []
         for share in service.shared:
             members = tuple(share.members or (user.name for user in service.users))
-            # The per-member mounts are synthesized into the storage inventory
-            # (synthesize_sftp_shared_mounts) so exports/fileSystems derive from
-            # one source. Guard the seam: a storage model built without the
-            # synthesis step would silently render a share with no mounts.
-            missing = sorted(
-                member
-                for member in members
-                if _shared_mountpoint(member, share.name) not in host_mountpoints
-            )
-            if missing:
-                formatted = ", ".join(missing)
+            member_exports: set[str] = set()
+            for member in members:
+                mountpoint = _shared_mountpoint(member, share.name)
+                mount = mounts_by_mountpoint.get(mountpoint)
+                if mount is None:
+                    raise ValueError(
+                        f"sftp shared space '{share.name}' on '{service.host}' "
+                        f"has no mount for member '{member}': author one in "
+                        f"storage.yaml with mountpoint {mountpoint} (one mount "
+                        f"per member, all referencing the share's export)"
+                    )
+                member_exports.add(mount.export_id)
+            if len(member_exports) > 1:
+                formatted = ", ".join(sorted(member_exports))
                 raise ValueError(
-                    f"sftp shared space '{share.name}' on '{service.host}' has "
-                    f"no synthesized mount for member(s): {formatted}. Pass the "
-                    f"storage inventory through synthesize_sftp_shared_mounts() "
-                    f"before normalize_storage()."
+                    f"sftp shared space '{share.name}' on '{service.host}' "
+                    f"mixes exports across members ({formatted}); a shared "
+                    f"space is ONE directory, so every member's mount must "
+                    f"reference the same export"
+                )
+            # A share-shaped mount for a non-member would hand out the shared
+            # directory without the group membership that governs it.
+            non_members = [u.name for u in service.users if u.name not in members]
+            intruders = sorted(
+                user
+                for user in non_members
+                if _shared_mountpoint(user, share.name) in mounts_by_mountpoint
+            )
+            if intruders:
+                formatted = ", ".join(intruders)
+                raise ValueError(
+                    f"storage.yaml mounts shared space '{share.name}' into the "
+                    f"chroot of non-member(s): {formatted}. Add them to the "
+                    f"share's members or drop the mount."
                 )
             shares.append(
                 NativeSftpShare(name=share.name, gid=share.gid, members=members)
