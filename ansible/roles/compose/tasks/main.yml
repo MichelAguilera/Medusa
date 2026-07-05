@@ -9,6 +9,33 @@
   become: false
   register: medusa_compose_files
 
+# Per-host stack scoping (T-087): generated/compose/ carries EVERY platform's
+# stacks -- compose is the platform-neutral container layer, and NixOS hosts'
+# stacks are delivered through the flake instead of this role. Keep only the
+# stacks the manifest assigns to this host.
+- name: Load the stack->host manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/compose-stacks.yaml"
+    name: medusa_stack_manifest
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Compute this host's stack path pattern
+  ansible.builtin.set_fact:
+    medusa_host_stack_pattern: >-
+      /compose/({{ medusa_stack_manifest.stacks | default([])
+         | selectattr('host', 'equalto', inventory_hostname)
+         | map(attribute='stack') | map('regex_escape') | join('|') }})/
+
+- name: Narrow stack files to this host
+  ansible.builtin.set_fact:
+    medusa_compose_files: >-
+      {{ medusa_compose_files | combine({'files':
+         medusa_compose_files.files
+         | selectattr('path', 'search', medusa_host_stack_pattern ~ 'docker-compose.yml$')
+         | list }) }}
+
 # Stack targeting (T-082): when an operator scopes the run to one stack
 # (`medusactl compose <verb> <stack>`), narrow the stack file list to the
 # matching stack so every downstream loop — staging, externals, apply — acts on
@@ -72,6 +99,15 @@
   delegate_to: localhost
   become: false
   register: medusa_compose_env_files
+
+# Mirror the per-host stack scoping (T-087) for env files.
+- name: Narrow env files to this host
+  ansible.builtin.set_fact:
+    medusa_compose_env_files: >-
+      {{ medusa_compose_env_files | combine({'files':
+         medusa_compose_env_files.files
+         | selectattr('path', 'search', medusa_host_stack_pattern)
+         | list }) }}
 
 # Mirror the stack-file narrowing (above) for env files so a targeted run only
 # stages its own stack's env files.

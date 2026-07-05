@@ -5,8 +5,6 @@
 
   inputs = {
     nixpkgs.url = "{{ nixos.nixpkgs_ref }}";
-    sops-nix.url = "github:Mic92/sops-nix";
-    sops-nix.inputs.nixpkgs.follows = "nixpkgs";
     # disko -- declarative partitioning consumed by nixos-anywhere on first
     # install (T-078). Wired into a host's module list only when it opts in via
     # nixos_disko.
@@ -14,7 +12,7 @@
     disko.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, sops-nix, disko, ... }:
+  outputs = { self, nixpkgs, disko, ... }:
     let
       system = "x86_64-linux";
     in
@@ -23,9 +21,20 @@
 {% for host in nixos.hosts %}
         {{ host.name }} = nixpkgs.lib.nixosSystem {
           inherit system;
-          modules = [ ./hosts/{{ host.name }}.nix{% if host.disko_module %} disko.nixosModules.disko{% endif %}{% if host.secrets %} sops-nix.nixosModules.sops{% endif %} ];
+          modules = [ ./hosts/{{ host.name }}.nix{% if host.disko_module %} disko.nixosModules.disko{% endif %} ];
         };
 {% endfor %}
       };
+{% if nixos.installer_keys %}
+
+      # Medusa installer ISO (T-089): `nix build <flake>#installer` (or
+      # `medusactl build-installer`). Separate output namespace -- does not
+      # affect nixos-rebuild's nixosConfigurations resolution.
+      packages.${system}.installer =
+        (nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [ ./installer.nix ];
+        }).config.system.build.isoImage;
+{% endif %}
     };
 }

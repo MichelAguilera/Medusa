@@ -187,6 +187,7 @@ def _load_all(
         services_model,
         native_model,
         _load_disko_sources(dns_model, paths),
+        _load_nixos_secret_ciphertexts(dns_model, services_model, paths),
     )
     sops_model = normalize_sops(
         dns_model,
@@ -233,6 +234,28 @@ def _load_disko_sources(
         if path.is_file():
             sources[host.name] = path.read_text(encoding="utf-8")
     return sources
+
+
+def _load_nixos_secret_ciphertexts(
+    dns_model: DnsModel, services_model: ServicesModel, paths: ProjectPaths
+) -> dict[str, str]:
+    """Read the encrypted SOPS sources referenced by NixOS hosts' services,
+    verbatim, for staging into the flake tree (T-087). Ciphertext only -- the
+    render never sees plaintext (Secrets ADR); decryption happens on the host
+    (the medusa-secrets unit, the T-080 seam). Missing files are left out;
+    normalize_nixos turns that into a clear diagnostic."""
+    nixos_names = {host.name for host in dns_model.hosts_by_platform("nixos")}
+    ciphertexts: dict[str, str] = {}
+    for source in services_model.secret_sources:
+        if source.host not in nixos_names or source.source in ciphertexts:
+            continue
+        # `source` is always "secrets/<ref>.sops.yaml" (settings.py); on disk
+        # the file is secrets_dir/<ref>.sops.yaml -- the two differ when
+        # MEDUSA_SECRETS_DIR overrides the default root/secrets location.
+        path = paths.secrets_dir / source.source.removeprefix("secrets/")
+        if path.is_file():
+            ciphertexts[source.source] = path.read_text(encoding="utf-8")
+    return ciphertexts
 
 
 def _validate_secret_sources(

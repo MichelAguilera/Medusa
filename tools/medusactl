@@ -71,6 +71,7 @@ Usage:
     medusactl controller-apply [--check]
     medusactl nixos-apply [--check] [--limit <pattern>]
     medusactl install-nixos-target <host> --ip <addr> [--force]
+    medusactl build-installer
 
   Target ops:
     medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
@@ -1882,6 +1883,75 @@ REMOTE
         return 0
     fi
     printf "%s✗%s install-nixos-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$host" "$log" >&2
+    return 1
+}
+
+cmd_build_installer() {
+    load_config
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<USAGE
+medusactl build-installer — build the Medusa installer ISO (T-089).
+
+Builds a minimal NixOS live image with the inventory's nixos_installer_keys
+authorized on root, so a freshly booted target is immediately reachable for
+'medusactl install-nixos-target' — no console password, no key paste. One
+generic image serves every host; rebuild only when a key rotates. Upload the
+printed ISO to hypervisor storage manually (the hypervisor stays operator
+territory).
+USAGE
+        return 0
+    fi
+    [[ -z "${1:-}" ]] || fail "unknown argument to build-installer: $1"
+
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+git -C "$MEDUSA_INVENTORY_ROOT" pull --ff-only
+cd "$MEDUSA_CONTROLLER_PATH"
+uv run medusa render
+if [[ ! -f "$MEDUSA_GENERATED_DIR/nixos/installer.nix" ]]; then
+    echo "no installer module rendered; set nixos_installer_keys in dns.yaml (T-089)" >&2
+    exit 70
+fi
+if ! command -v nix >/dev/null 2>&1; then
+    echo "nix not found on controller; install Nix to build the installer ISO" >&2
+    exit 70
+fi
+echo "==> nix build installer ISO (first build downloads + compresses the live image; takes a while)"
+out=$(nix --extra-experimental-features 'nix-command flakes' build \
+    "$MEDUSA_GENERATED_DIR/nixos#installer" --print-out-paths --no-link)
+iso=$(find "$out/iso" -name '*.iso' | head -1)
+echo "ISO: $iso"
+echo "next: copy it to hypervisor ISO storage and boot new NixOS targets from it"
+REMOTE
+)
+    local target ssh_opts log
+    target=$(ssh_target)
+    log=$(log_path "build-installer")
+    mapfile -t ssh_opts < <(ssh_base_opts)
+
+    printf "%s==>%s build-installer\n" "$color_blue" "$color_reset"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    printf "log:    %s\n" "$log"
+
+    local env_prefix
+    env_prefix=$(printf "MEDUSA_CONTROLLER_PATH=%q MEDUSA_INVENTORY_ROOT=%q MEDUSA_INVENTORY_DIR=%q MEDUSA_SECRETS_DIR=%q MEDUSA_GENERATED_DIR=%q" \
+        "$MEDUSA_CONTROLLER_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
+        "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
+        "$MEDUSA_CONTROLLER_GENERATED_PATH")
+
+    local rc=0
+    ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
+        || rc=${PIPESTATUS[0]}
+    sanitize_log "$log"
+    if [[ "$rc" -eq 0 ]]; then
+        printf "%s✓%s build-installer\n" "$color_green" "$color_reset"
+        return 0
+    fi
+    printf "%s✗%s build-installer failed (log: %s)\n" "$color_red" "$color_reset" "$log" >&2
     return 1
 }
 
@@ -3728,6 +3798,10 @@ case "${1:-}" in
     install-nixos-target)
         shift
         cmd_install_nixos_target "$@"
+        ;;
+    build-installer)
+        shift
+        cmd_build_installer "$@"
         ;;
     finalize-dns)
         shift

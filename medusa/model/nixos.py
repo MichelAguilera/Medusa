@@ -1,6 +1,11 @@
 from pydantic import BaseModel, ConfigDict
 
 from medusa.model.native import NativeSftpShare, NativeSftpUser
+from medusa.model.services import (
+    ComposeDataDir,
+    ComposeFile,
+    GeneratedEnvFile,
+)
 
 
 class NixosNetwork(BaseModel):
@@ -32,39 +37,79 @@ class NixosMount(BaseModel):
     options: tuple[str, ...]
 
 
-class NixosContainer(BaseModel):
-    """One ``virtualisation.oci-containers.containers.<name>`` entry, derived
-    from the same ComposeService model the Debian Compose renderer consumes.
-    Minimal but real (T-074): image, ports, volumes, environment -- enough to
-    prove Docker-on-NixOS hosts are reachable. Richer fields land when a
-    container service actually targets a NixOS host."""
+class NixosStack(BaseModel):
+    """One compose stack this NixOS host runs (T-087, compose-on-NixOS).
+
+    The stack's compose file and managed env files are the SAME platform-neutral
+    models the Debian compose renderer consumes; ``render_nixos`` formats them
+    with the same templates and stages the results into the flake tree
+    (``generated/nixos/stacks/<name>/``). On the host, the ``medusa-stacks-sync``
+    unit materializes the staged tree into the writable Debian-identical stacks
+    root (``/home/medusa/medusa-stacks/<name>``) and a per-stack systemd unit
+    runs compose up against it. ``unit_suffix`` is the stack name made
+    unit-safe (``media/immich`` -> ``media-immich``)."""
 
     model_config = ConfigDict(frozen=True)
 
     name: str
-    image: str
-    ports: tuple[str, ...]
-    volumes: tuple[str, ...]
-    environment: tuple[tuple[str, str], ...]
+    unit_suffix: str
+    compose_file: ComposeFile
+    env_files: tuple[GeneratedEnvFile, ...]
+    # Resources declared `external: true` in the stack: `docker compose up`
+    # refuses to create them, so the stack unit pre-creates them idempotently
+    # (mirror of the Debian compose role's external-resources step).
+    external_networks: tuple[str, ...]
+    external_volumes: tuple[str, ...]
 
 
-class NixosSecret(BaseModel):
-    """One ``sops.secrets.<name>`` entry delivered by sops-nix at activation
-    (T-077). The reference model is unchanged from the Debian path: the encrypted
-    SOPS file is referenced, never its plaintext (Secrets ADR). The host decrypts
-    with its own ssh host key (the sops-nix age idiom), so no recipient changes
-    are needed beyond listing the host key in `.sops.yaml`. The secret
-    materializes at ``/run/secrets/<name>``."""
+class NixosStagedSecret(BaseModel):
+    """One encrypted SOPS file staged into the flake tree (T-087 port of the
+    T-080 Debian seam). Store-safe: it is ciphertext; the host's
+    ``medusa-secrets`` unit decrypts it to tmpfs with its own ssh host key
+    (ssh-to-age), exactly as on Debian. ``staged`` is the path both under
+    ``generated/nixos/secrets-enc/`` and ``/etc/medusa-secrets-enc/`` on the
+    host. ``ciphertext`` is read verbatim at the inventory boundary (cli) and
+    carried on the model so the renderer stays a pure formatter (the
+    disko_source precedent)."""
 
     model_config = ConfigDict(frozen=True)
 
-    name: str
-    # Nix path literal to the encrypted file, relative to the host module
-    # (hosts/<host>.nix -> ../secrets/<name>.sops.yaml). The deploy stages the
-    # encrypted secrets there so the path stays inside the flake tree (T-078).
-    sops_file: str
-    owner: str
-    mode: str
+    staged: str
+    ciphertext: str
+
+
+class NixosSecretSetting(BaseModel):
+    """One KEY=value line of a decrypted env-mode secret file: the setting name
+    and the staged encrypted source its value is extracted from."""
+
+    model_config = ConfigDict(frozen=True)
+
+    setting: str
+    staged: str
+
+
+class NixosSecretEnvFile(BaseModel):
+    """One env file the medusa-secrets unit assembles in tmpfs at
+    ``/run/medusa-secrets/<destination>`` -- the exact path the generated
+    compose files reference on every platform. Grouping of settings into files
+    happens here (normalization), not in the template."""
+
+    model_config = ConfigDict(frozen=True)
+
+    destination: str
+    owner_user: str  # "medusa" (service) | "root" (system)
+    settings: tuple[NixosSecretSetting, ...]
+
+
+class NixosSecretFile(BaseModel):
+    """One file-mode secret decrypted whole to
+    ``/run/medusa-secrets/<destination>``."""
+
+    model_config = ConfigDict(frozen=True)
+
+    destination: str
+    owner_user: str
+    staged: str
 
 
 class NixosHost(BaseModel):
@@ -74,8 +119,21 @@ class NixosHost(BaseModel):
     hostname: str  # networking.hostName
     network: NixosNetwork | None
     file_systems: tuple[NixosMount, ...]
-    container_backend: str  # oci-containers backend, "docker" for fleet parity
-    containers: tuple[NixosContainer, ...]
+    # Compose stacks this host runs (T-087). Empty when the host is
+    # native-services-only (the charon shape). Non-empty enables docker, the
+    # medusa runtime user, the stacks sync unit, and one unit per stack.
+    stacks: tuple[NixosStack, ...]
+    # Bind-mount data dirs under the stacks root for this host, created and
+    # owned before compose up (same derivation the Debian role consumes from
+    # compose-data-dirs.yaml; here they render to tmpfiles rules).
+    data_dirs: tuple[ComposeDataDir, ...]
+    # Host-side-decrypted secrets this host's services reference (T-087 port of
+    # the T-080 seam). staged_secrets drives ciphertext staging + etc entries;
+    # the env/file groupings drive the medusa-secrets decrypt script. All empty
+    # when the host references no secrets (no unit emitted).
+    staged_secrets: tuple[NixosStagedSecret, ...]
+    secret_env_files: tuple[NixosSecretEnvFile, ...]
+    secret_files: tuple[NixosSecretFile, ...]
     # Host-native SFTP users reshaped into this host's module (T-076). Empty when
     # the host runs no native sftp service. The renderer emits the openssh
     # Match Group + per-user chroot/keys from these.
@@ -119,8 +177,6 @@ class NixosHost(BaseModel):
     # reading any file. None when the host opts out of disko. Disk layout is
     # operator territory (T-071/T-072): Medusa never derives a partition scheme.
     disko_source: str | None
-    # sops-nix secrets this host's services reference (T-077). Empty when none.
-    secrets: tuple[NixosSecret, ...]
     # SSH endpoint for `nixos-rebuild switch --target-host`, as "<user>@<host>".
     # None when the host has no ansible_user (no managed SSH endpoint) -- such a
     # host can be rendered but not reconciled; the deploy plan warns and skips
@@ -140,3 +196,8 @@ class NixosModel(BaseModel):
 
     nixpkgs_ref: str
     hosts: tuple[NixosHost, ...]
+    # SSH public keys baked into the generated installer ISO's live root
+    # (T-089). Non-empty emits generated/nixos/installer.nix and the flake's
+    # `packages.<system>.installer` output (`nix build <flake>#installer`).
+    # One generic image serves every host -- it carries only these keys.
+    installer_keys: tuple[str, ...] = ()

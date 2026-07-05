@@ -107,6 +107,9 @@ class DnsModel(BaseModel):
 
     zones: tuple[DnsZone, ...]
     hosts: tuple[HostRecord, ...]
+    # Public keys for the generated installer ISO's live root (T-089); empty
+    # disables the installer image.
+    installer_keys: tuple[str, ...] = ()
 
     def hosts_by_platform(self, platform: str) -> tuple[HostRecord, ...]:
         """Hosts on the given deploy platform, in declared order. The render
