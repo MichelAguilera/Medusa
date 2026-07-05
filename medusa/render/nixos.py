@@ -40,6 +40,12 @@ def render_nixos(
             templates_dir, "nixos/flake.nix.j2", {"nixos": model}
         )
     }
+    if model.installer_keys:
+        # Installer ISO module (T-089): built via the flake's packages output;
+        # one generic image per fleet, carrying only the installer keys.
+        files[generated_dir / "nixos" / "installer.nix"] = render_template(
+            templates_dir, "nixos/installer.nix.j2", {"nixos": model}
+        )
     for host in model.hosts:
         files[generated_dir / "nixos" / "hosts" / f"{host.name}.nix"] = (
             render_template(templates_dir, "nixos/host.nix.j2", {"host": host})

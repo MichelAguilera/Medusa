@@ -1,6 +1,6 @@
 [project]
 name = "medusa"
-version = "0.13.0"
+version = "0.14.0"
 description = "Homelab infrastructure source-of-truth and config generator."
 readme = "README.md"
 requires-python = ">=3.12"

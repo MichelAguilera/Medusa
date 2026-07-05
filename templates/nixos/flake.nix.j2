@@ -25,5 +25,16 @@
         };
 {% endfor %}
       };
+{% if nixos.installer_keys %}
+
+      # Medusa installer ISO (T-089): `nix build <flake>#installer` (or
+      # `medusactl build-installer`). Separate output namespace -- does not
+      # affect nixos-rebuild's nixosConfigurations resolution.
+      packages.${system}.installer =
+        (nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [ ./installer.nix ];
+        }).config.system.build.isoImage;
+{% endif %}
     };
 }

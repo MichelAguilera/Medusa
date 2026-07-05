@@ -383,6 +383,32 @@ class DnsInventory(BaseModel):
     # override individual fields. Typically sets interface, prefix, gateway,
     # and nameservers (the CoreDNS host IP). See T-055.
     network: NetworkConfig | None = None
+    # SSH public keys baked into the generated Medusa installer ISO's live
+    # root (T-089): boot the ISO and the controller reaches the target
+    # immediately -- no console bootstrap. Fleet-level and explicit (NOT
+    # derived from any host's nixos_admin_keys) so key rotation stays
+    # deliberate. Empty = no installer image is emitted. Public keys only.
+    nixos_installer_keys: list[str] = Field(default_factory=list)
+
+    @field_validator("nixos_installer_keys")
+    @classmethod
+    def _validate_installer_keys(cls, value: list[str]) -> list[str]:
+        normalized = [key.strip() for key in value]
+        if any(not key for key in normalized):
+            raise ValueError("nixos_installer_keys cannot contain empty values")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("nixos_installer_keys cannot contain duplicates")
+        for key in normalized:
+            # Same plaintext-transport guard as sftp authorized keys: catch a
+            # pasted private key or multi-line blob before it lands in an
+            # installer image.
+            if "\n" in key or not key.startswith(("ssh-", "ecdsa-", "sk-")):
+                raise ValueError(
+                    f"nixos installer key {key[:32]!r}... does not look like "
+                    f"an SSH public key (expected 'ssh-...', 'ecdsa-...' or "
+                    f"'sk-...'). Only public keys belong in inventory."
+                )
+        return normalized
 
     @model_validator(mode="after")
     def validate_managed_network(self) -> Self:

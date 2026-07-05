@@ -143,7 +143,11 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
         for host in inventory.hosts
     )
 
-    return DnsModel(zones=zones, hosts=hosts)
+    return DnsModel(
+        zones=zones,
+        hosts=hosts,
+        installer_keys=tuple(inventory.nixos_installer_keys),
+    )
 
 
 def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
@@ -430,7 +434,11 @@ def normalize_nixos(
         )
         for host in dns_model.hosts_by_platform("nixos")
     )
-    return NixosModel(nixpkgs_ref=NIXPKGS_REF, hosts=hosts)
+    return NixosModel(
+        nixpkgs_ref=NIXPKGS_REF,
+        hosts=hosts,
+        installer_keys=dns_model.installer_keys,
+    )
 
 
 def normalize_native(

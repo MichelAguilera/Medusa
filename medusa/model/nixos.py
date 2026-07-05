@@ -196,3 +196,8 @@ class NixosModel(BaseModel):
 
     nixpkgs_ref: str
     hosts: tuple[NixosHost, ...]
+    # SSH public keys baked into the generated installer ISO's live root
+    # (T-089). Non-empty emits generated/nixos/installer.nix and the flake's
+    # `packages.<system>.installer` output (`nix build <flake>#installer`).
+    # One generic image serves every host -- it carries only these keys.
+    installer_keys: tuple[str, ...] = ()
