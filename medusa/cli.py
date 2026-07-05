@@ -73,6 +73,7 @@ from medusa.model.normalize import (
     normalize_services,
     normalize_sops,
     normalize_storage,
+    synthesize_sftp_shared_mounts,
 )
 from medusa.model.services import ServicesModel
 from medusa.model.sops import SopsConfigModel
@@ -148,8 +149,17 @@ def _load_all(
     on_diagnostics: DiagnosticHandler = lambda _: None,
 ) -> _Inventory:
     dns_model = normalize_dns(parse_dns_inventory(load_yaml(paths.dns_inventory)))
+    # Native inventory is parsed before storage so sftp shared spaces can
+    # synthesize their per-member mounts into the storage inventory (T-084);
+    # exports, fileSystems, and check all derive from the combined result.
+    native_inventory = parse_native_inventory(
+        load_optional_yaml(paths.native_inventory)
+    )
     storage_model = normalize_storage(
-        parse_storage_inventory(load_optional_yaml(paths.storage_inventory)),
+        synthesize_sftp_shared_mounts(
+            parse_storage_inventory(load_optional_yaml(paths.storage_inventory)),
+            native_inventory,
+        ),
         dns_model,
     )
 
@@ -177,7 +187,7 @@ def _load_all(
     ansible_inventory_model = normalize_ansible_inventory(dns_model)
     network_model = normalize_network(dns_model)
     native_model = normalize_native(
-        parse_native_inventory(load_optional_yaml(paths.native_inventory)),
+        native_inventory,
         dns_model,
         storage_model,
     )

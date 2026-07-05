@@ -25,11 +25,28 @@ class NativeSftpUser(BaseModel):
     authorized_keys: tuple[str, ...]
 
 
+class NativeSftpShare(BaseModel):
+    """A shared space (T-084): a named group-writable area visible inside every
+    member's chroot at ``shared/<name>``. The actual per-member NFS mounts ride
+    the storage model (synthesized from the share declaration); this carries
+    what the renderer additionally needs -- the group (name + pinned gid) and
+    who belongs to it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    # Pinned numeric gid: NFS sec=sys checks numeric ids, so this must agree
+    # with the server-side chgrp of the export dir (mirrors NativeSftpUser.uid).
+    gid: int
+    members: tuple[str, ...]
+
+
 class NativeSftpService(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     host: str
     users: tuple[NativeSftpUser, ...]
+    shares: tuple[NativeSftpShare, ...] = ()
 
 
 class NativeModel(BaseModel):

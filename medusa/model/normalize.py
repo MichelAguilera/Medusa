@@ -10,7 +10,7 @@ from medusa.inventory.homepage import HomepageInventory
 from medusa.inventory.native import NativeServicesInventory
 from medusa.inventory.secrets import SecretsInventory
 from medusa.inventory.services import ServicesInventory, resolve_egress
-from medusa.inventory.storage import StorageInventory
+from medusa.inventory.storage import NfsMountInventory, StorageInventory
 from medusa.model.compose import (
     normalize_compose_data_dirs,
     normalize_compose_files,
@@ -23,7 +23,12 @@ from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
 from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
-from medusa.model.native import NativeModel, NativeSftpService, NativeSftpUser
+from medusa.model.native import (
+    NativeModel,
+    NativeSftpService,
+    NativeSftpShare,
+    NativeSftpUser,
+)
 from medusa.model.network import NetworkHost, NetworkModel
 from medusa.model.nixos import (
     NixosContainer,
@@ -263,6 +268,60 @@ NIXPKGS_REF = "github:NixOS/nixpkgs/nixos-25.05"
 # A host can override per-host via nixos_state_version. See T-078.
 DEFAULT_NIXOS_STATE_VERSION = "25.05"
 SFTP_CHROOT_ROOT = "/srv/sftp"
+# Subdir inside each member's chroot where shared spaces mount (T-084):
+# /srv/sftp/<member>/shared/<share-name>.
+SFTP_SHARED_SUBDIR = "shared"
+
+
+def _shared_mountpoint(member: str, share_name: str) -> str:
+    return f"{SFTP_CHROOT_ROOT}/{member}/{SFTP_SHARED_SUBDIR}/{share_name}"
+
+
+def synthesize_sftp_shared_mounts(
+    storage_inventory: StorageInventory,
+    native_inventory: NativeServicesInventory,
+) -> StorageInventory:
+    """Expand sftp shared spaces (T-084) into real storage mounts -- the same
+    export at one mountpoint per member, inside that member's chroot. Runs at
+    the inventory level, BEFORE ``normalize_storage``, so everything derived
+    from mounts stays consistent for free: the server's export authorizes the
+    sftp host as a client, the NixOS host emits one fileSystems/automount entry
+    per member, and `medusa check` tracks all of it. Re-validating the combined
+    StorageInventory keeps the authored uniqueness guarantees (ids,
+    per-host mountpoints) loud across the synthesized entries too."""
+    if not any(service.shared for service in native_inventory.native_services):
+        return storage_inventory
+
+    known_exports = {export.id for export in storage_inventory.exports}
+    synthesized: list[NfsMountInventory] = []
+    for service in native_inventory.native_services:
+        user_names = [user.name for user in service.users]
+        for share in service.shared:
+            if share.storage not in known_exports:
+                raise ValueError(
+                    f"sftp shared space '{share.name}' on '{service.host}' "
+                    f"references storage '{share.storage}', which is not a "
+                    f"declared export in storage.yaml (shared spaces reference "
+                    f"an export id, not a mount id)"
+                )
+            members = share.members or user_names
+            synthesized.extend(
+                NfsMountInventory(
+                    id=f"sftp-shared-{share.name}-{member}",
+                    host=[service.host],
+                    export=share.storage,
+                    mountpoint=_shared_mountpoint(member, share.name),
+                    type=share.type,
+                    options=list(share.options),
+                )
+                for member in members
+            )
+
+    return StorageInventory(
+        exports=storage_inventory.exports,
+        mounts=[*storage_inventory.mounts, *synthesized],
+        servers=storage_inventory.servers,
+    )
 
 
 def normalize_nixos(
@@ -284,9 +343,13 @@ def normalize_nixos(
             containers_by_host.setdefault(service.host, []).append(service)
 
     sftp_users_by_host: dict[str, tuple[NativeSftpUser, ...]] = {}
+    sftp_shares_by_host: dict[str, tuple[NativeSftpShare, ...]] = {}
     if native_model is not None:
         sftp_users_by_host = {
             service.host: service.users for service in native_model.sftp
+        }
+        sftp_shares_by_host = {
+            service.host: service.shares for service in native_model.sftp
         }
 
     disko_sources = disko_sources or {}
@@ -322,6 +385,7 @@ def normalize_nixos(
                 )
             ),
             sftp_users=sftp_users_by_host.get(host.name, ()),
+            sftp_shares=sftp_shares_by_host.get(host.name, ()),
             sftp_chroot_root=(
                 SFTP_CHROOT_ROOT if sftp_users_by_host.get(host.name) else None
             ),
@@ -407,7 +471,36 @@ def normalize_native(
                     authorized_keys=tuple(user.authorized_keys),
                 )
             )
-        services.append(NativeSftpService(host=service.host, users=tuple(users)))
+
+        host_mountpoints = {mount.mountpoint for mount in host_mounts.values()}
+        shares: list[NativeSftpShare] = []
+        for share in service.shared:
+            members = tuple(share.members or (user.name for user in service.users))
+            # The per-member mounts are synthesized into the storage inventory
+            # (synthesize_sftp_shared_mounts) so exports/fileSystems derive from
+            # one source. Guard the seam: a storage model built without the
+            # synthesis step would silently render a share with no mounts.
+            missing = sorted(
+                member
+                for member in members
+                if _shared_mountpoint(member, share.name) not in host_mountpoints
+            )
+            if missing:
+                formatted = ", ".join(missing)
+                raise ValueError(
+                    f"sftp shared space '{share.name}' on '{service.host}' has "
+                    f"no synthesized mount for member(s): {formatted}. Pass the "
+                    f"storage inventory through synthesize_sftp_shared_mounts() "
+                    f"before normalize_storage()."
+                )
+            shares.append(
+                NativeSftpShare(name=share.name, gid=share.gid, members=members)
+            )
+        services.append(
+            NativeSftpService(
+                host=service.host, users=tuple(users), shares=tuple(shares)
+            )
+        )
     return NativeModel(sftp=tuple(services))
 
 
@@ -590,22 +683,22 @@ def normalize_storage(
             (mount for mount in inventory.mounts if mount.export == export.id),
             key=lambda item: item.id,
         )
+        # Deduped by host: the export authorizes a CLIENT, however many times
+        # that client mounts it (an sftp shared space mounts one export at N
+        # member mountpoints, T-084; duplicate entries would trip exportfs).
+        client_hosts = sorted(
+            {host for mount in export_mounts for host in mount.host}
+        )
         clients = tuple(
-            sorted(
-                (
-                    NfsExportClient(
-                        host=host,
-                        fqdn=hosts_by_name[host].fqdns[0],
-                        # Canonical IP, never bootstrap_ip -- the export must
-                        # not carry a host's temporary cutover address (T-059).
-                        ip=hosts_by_name[host].ip,
-                        options=export.options,
-                    )
-                    for mount in export_mounts
-                    for host in mount.host
-                ),
-                key=lambda item: item.host,
+            NfsExportClient(
+                host=host,
+                fqdn=hosts_by_name[host].fqdns[0],
+                # Canonical IP, never bootstrap_ip -- the export must
+                # not carry a host's temporary cutover address (T-059).
+                ip=hosts_by_name[host].ip,
+                options=export.options,
             )
+            for host in client_hosts
         )
         dataset, directories = _export_path_plan(
             export.path, zfs_root_by_server.get(export.server)

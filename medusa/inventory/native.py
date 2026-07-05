@@ -12,6 +12,77 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+class SftpSharedInventory(BaseModel):
+    """A shared space (T-084): one NFS export mounted inside the chroot of every
+    member at ``/srv/sftp/<member>/shared/<name>``, made mutually writable via a
+    pinned-gid group + server-side setgid + the sftp umask. ``storage`` names an
+    *export* id (not a mount id): a single authored mount carries exactly one
+    mountpoint, but a share needs the same export at N member mountpoints, so
+    the per-member mounts are synthesized (``synthesize_sftp_shared_mounts``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    # Export id from storage.yaml. The export dir on the server must be
+    # group-owned by ``gid`` with setgid (mode 2775) -- same operator step as
+    # chowning a private export to its user's uid.
+    storage: str
+    # Pinned numeric gid, mirroring SftpUserInventory.uid: NFS sec=sys checks
+    # numeric ids, so the group's gid must agree with the server-side chgrp.
+    gid: int
+    # Member user names (from this service's ``users``). Empty means every user.
+    members: list[str] = Field(default_factory=list)
+    # Client mount type/options for the synthesized per-member mounts, same
+    # shape and defaults as a storage.yaml mount entry.
+    type: Literal["nfs", "nfs4"] = "nfs"
+    options: list[str] = Field(default_factory=lambda: ["defaults"])
+
+    @field_validator("name", "storage")
+    @classmethod
+    def _nonempty_lower(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("shared space name and storage ref cannot be empty")
+        return normalized
+
+    @field_validator("name")
+    @classmethod
+    def _reserved_name(cls, value: str) -> str:
+        if value == "sftp":
+            raise ValueError(
+                "shared space cannot be named 'sftp' (collides with the group "
+                "that routes users into the chroot Match block)"
+            )
+        return value
+
+    @field_validator("gid")
+    @classmethod
+    def _positive_gid(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("shared space gid must be a positive integer")
+        return value
+
+    @field_validator("members")
+    @classmethod
+    def _normalize_members(cls, value: list[str]) -> list[str]:
+        normalized = [member.strip().lower() for member in value]
+        if any(not member for member in normalized):
+            raise ValueError("shared space members cannot be empty strings")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("shared space members cannot contain duplicates")
+        return normalized
+
+    @field_validator("options")
+    @classmethod
+    def _normalize_options(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if any(not item for item in normalized):
+            raise ValueError("shared space options cannot contain empty values")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("shared space options cannot contain duplicates")
+        return normalized
+
+
 class SftpUserInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -68,6 +139,7 @@ class SftpServiceInventory(BaseModel):
     type: Literal["sftp"]
     host: str
     users: list[SftpUserInventory]
+    shared: list[SftpSharedInventory] = Field(default_factory=list)
 
     @field_validator("host")
     @classmethod
@@ -88,6 +160,30 @@ class SftpServiceInventory(BaseModel):
         if len(names) != len(set(names)):
             raise ValueError("sftp user names must be unique within a service")
         return value
+
+    @model_validator(mode="after")
+    def _validate_shared(self) -> Self:
+        share_names = [share.name for share in self.shared]
+        if len(share_names) != len(set(share_names)):
+            raise ValueError("shared space names must be unique within a service")
+        gids = [share.gid for share in self.shared]
+        if len(gids) != len(set(gids)):
+            raise ValueError("shared space gids must be unique within a service")
+        user_names = {user.name for user in self.users}
+        for share in self.shared:
+            if share.name in user_names:
+                raise ValueError(
+                    f"shared space '{share.name}' collides with an sftp user "
+                    f"name; pick a distinct name (it becomes a Unix group)"
+                )
+            unknown = sorted(set(share.members) - user_names)
+            if unknown:
+                formatted = ", ".join(unknown)
+                raise ValueError(
+                    f"shared space '{share.name}' lists members that are not "
+                    f"sftp users on this service: {formatted}"
+                )
+        return self
 
 
 class NativeServicesInventory(BaseModel):

@@ -113,6 +113,14 @@
 {% if host.sftp_users %}
 
   users.groups.sftp = { };
+{% if host.sftp_shares %}
+  # Shared-space groups (T-084): pinned gids because NFS sec=sys checks numeric
+  # ids -- the gid must match the server-side chgrp of the export dir (2775,
+  # setgid, so files created in the share inherit the group).
+{% for share in host.sftp_shares %}
+  users.groups."{{ share.name }}".gid = {{ share.gid }};
+{% endfor %}
+{% endif %}
   # Root-owned chroot dirs (OpenSSH requires ChrootDirectory to be root-owned and
   # not writable by the chrooted user); the writable area is the storage bind
   # mounted beneath each one.
@@ -121,10 +129,16 @@
     "d {{ user.chroot }} 0755 root root -"
 {% endfor %}
   ];
+{% if host.sftp_shares %}
+  # -u 0002: uploads land group-writable so shared-space members can edit each
+  # other's files. Private silos are unaffected (their dirs are 0700). Emitted
+  # only when a share exists so share-free hosts render byte-identical (T-084).
+{% endif %}
   services.openssh.extraConfig = ''
     Match Group sftp
       ChrootDirectory {{ host.sftp_chroot_root }}/%u
-      ForceCommand internal-sftp
+      ForceCommand internal-sftp{% if host.sftp_shares %} -u 0002{% endif %}
+
       AllowTcpForwarding no
       X11Forwarding no
   '';
@@ -132,7 +146,7 @@
   users.users."{{ user.name }}" = {
     isNormalUser = true;
     group = "sftp";
-    extraGroups = [ "sftp" ];
+    extraGroups = [ "sftp"{% for share in host.sftp_shares %}{% if user.name in share.members %} "{{ share.name }}"{% endif %}{% endfor %} ];
 {% if user.uid is not none %}
     uid = {{ user.uid }};
 {% endif %}

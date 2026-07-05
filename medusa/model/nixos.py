@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict
 
-from medusa.model.native import NativeSftpUser
+from medusa.model.native import NativeSftpShare, NativeSftpUser
 
 
 class NixosNetwork(BaseModel):
@@ -80,6 +80,11 @@ class NixosHost(BaseModel):
     # the host runs no native sftp service. The renderer emits the openssh
     # Match Group + per-user chroot/keys from these.
     sftp_users: tuple[NativeSftpUser, ...]
+    # Shared spaces (T-084): pinned-gid groups whose members see a common
+    # group-writable mount at shared/<name> inside their chroots. The mounts
+    # themselves arrive via file_systems (synthesized into the storage model);
+    # this drives the group definitions, memberships, and the sftp umask.
+    sftp_shares: tuple[NativeSftpShare, ...] = ()
     # Base dir for the per-user chroots ("<root>/%u" in the Match block). None
     # when the host runs no sftp service. Kept on the model so the template stays
     # formatting-only.
