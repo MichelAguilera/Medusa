@@ -329,6 +329,35 @@ def normalize_nixos(
             f"on a debian-docker host"
         )
 
+    # Same guard class as D6 for the Debian-only infrastructure roles: the
+    # coredns, wireguard_gateway, and nfs_exports Ansible roles have no NixOS
+    # delivery path and the plays skip NixOS hosts, so flipping one of these
+    # hosts to platform: nixos would silently stop delivering the role. The
+    # host derivations mirror the ansible-groups builder exactly.
+    coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
+        host.name for host in dns_model.hosts if host.name == "coredns"
+    )
+    infra_on_nixos = [
+        f"'{name}' runs coredns" for name in coredns_hosts if name in nixos_names
+    ]
+    if services_model.egress and services_model.egress.gateway in nixos_names:
+        infra_on_nixos.append(
+            f"'{services_model.egress.gateway}' is the WireGuard egress gateway"
+        )
+    infra_on_nixos.extend(
+        f"'{server}' serves NFS exports"
+        for server, _ in storage_model.exports_by_server
+        if server in nixos_names
+    )
+    if infra_on_nixos:
+        raise ValueError(
+            f"hosts serving Debian-only infrastructure roles cannot be "
+            f"platform: nixos -- coredns, wireguard_gateway, and nfs_exports "
+            f"have no NixOS delivery path yet, so the role would be silently "
+            f"dropped: {'; '.join(sorted(infra_on_nixos))} -- keep these "
+            f"hosts on debian until the role is ported"
+        )
+
     stacks_by_host: dict[str, list[NixosStack]] = {}
     env_by_stack: dict[str, list] = {}
     for env_file in services_model.env_files:
