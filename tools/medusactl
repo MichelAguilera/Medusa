@@ -1255,7 +1255,7 @@ EOF
 # Interactive compose passthrough (T-083). Runs `docker compose <verb>` on the
 # host a stack lives on, with the terminal attached end-to-end so streaming
 # (`logs -f`), Ctrl-C, and `exec -it` work. Path: workstation -tt-> controller
-# -t-> stack host -> `sudo -iu medusa docker compose`. The controller resolves
+# -t-> stack host -> `sudo -Hu medusa docker compose`. The controller resolves
 # stack->host from `medusa list-stacks` and reaches the host via its ~/.ssh/config
 # aliases. Deliberately NOT a generic exec fabric: the verb set is closed.
 _compose_interactive() {
@@ -1290,13 +1290,16 @@ _compose_interactive() {
             ;;
     esac
 
-    # Inner script runs as the medusa runtime user (login shell => its $HOME and
-    # docker-group membership). $HOME is kept LITERAL so it expands there, to
-    # medusa's home, where medusa-stacks/<stack> lives (T-047/T-048 deploy root).
+    # Inner script runs as the medusa runtime user. -H (not -i): the Debian
+    # medusa user is a nologin system account, so a login shell (-i) dies with
+    # "This account is currently not available"; -H still sets HOME to
+    # medusa's home and `bash -c` runs regardless of the account shell.
+    # $HOME is kept LITERAL so it expands there, to medusa's home, where
+    # medusa-stacks/<stack> lives (T-047/T-048 deploy root).
     local dc_quoted="" tok
     for tok in "${dcargs[@]}"; do dc_quoted+=" $(printf %q "$tok")"; done
     local inner="cd \"\$HOME/medusa-stacks/$(printf %q "$stack")\" && exec docker compose${dc_quoted}"
-    local hostcmd="sudo -iu medusa bash -c $(printf %q "$inner")"
+    local hostcmd="sudo -Hu medusa bash -c $(printf %q "$inner")"
 
     # Controller-side: resolve stack->host (unless --host) then hop with a TTY.
     # Passed as the ssh COMMAND (no stdin heredoc) so the terminal stays attached.
