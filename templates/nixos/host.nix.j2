@@ -344,6 +344,10 @@
         RemainAfterExit = true;
         User = "medusa";
         WorkingDirectory = "/home/medusa/medusa-stacks/{{ stack.name }}";
+        # First deploy pulls every image in the stack; the systemd default
+        # (90s) would kill a multi-GB pull mid-flight. Matches the Debian
+        # path, where ansible imposes no timeout on compose up.
+        TimeoutStartSec = "60min";
       };
       script = ''
         set -eu
