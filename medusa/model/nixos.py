@@ -37,6 +37,27 @@ class NixosMount(BaseModel):
     options: tuple[str, ...]
 
 
+class NixosTunnelClient(BaseModel):
+    """Tunnel-routing client config for a NixOS host that runs `egress: tunnel`
+    services (T-087/D6 client slice; the T-066 mechanism). The gateway host and
+    its WireGuard machinery are untouched -- this is the same split policy
+    routing the Debian tunnel_routing role installs: mark traffic from the
+    pinned tunnel docker subnet in nftables PREROUTING, policy-route marked
+    LAN-bound traffic direct and everything else into a table whose ONLY route
+    is the default via the gateway (fail-closed: gateway down = drop, never a
+    leak via the main default route). Values come from the resolved
+    EgressGateway so both platforms route identically."""
+
+    model_config = ConfigDict(frozen=True)
+
+    network_name: str  # the external tunnel docker network (pinned subnet)
+    tunnel_subnet: str
+    gateway_address: str
+    fwmark: int
+    table: int
+    lan_subnets: tuple[str, ...]
+
+
 class NixosStagedConfig(BaseModel):
     """One per-host config artifact a Debian role would copy onto the host
     (traefik dynamic config, homepage services config, prometheus targets),
@@ -152,6 +173,12 @@ class NixosHost(BaseModel):
     # owned before compose up (same derivation the Debian role consumes from
     # compose-data-dirs.yaml; here they render to tmpfiles rules).
     data_dirs: tuple[ComposeDataDir, ...]
+    # Tunnel-routing client (T-087/D6): set when this host runs at least one
+    # `egress: tunnel` service. Emits the nft marking + policy-routing units,
+    # loose reverse-path filtering, and the pinned-subnet tunnel network
+    # pre-create; stack units hard-require the tunnel units so a container
+    # can never start before the fail-closed routing is in place.
+    tunnel: NixosTunnelClient | None = None
     # Per-host configs materialized under the deploy root /home/medusa/medusa
     # (currently the prometheus targets file, mirroring the Debian monitoring
     # role's medusa_deploy_root destination). Staged via the generation's

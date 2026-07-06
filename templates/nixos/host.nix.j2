@@ -81,6 +81,23 @@
   # substrate beneath it. Containers are supervised by the docker daemon
   # (restart policies), exactly as on Debian -- the units below only reconcile.
   virtualisation.docker.enable = true;
+{% if host.tunnel %}
+
+  # ---- Tunnel-routing client (T-087/D6, the T-066 mechanism) ----------------
+  # Split policy routing for `egress: tunnel` containers: marked LAN-bound
+  # traffic stays direct, everything else routes via a table whose ONLY route
+  # is the default through the gateway -- fail-closed (gateway down = drop,
+  # never a leak out the main default route).
+  # Asymmetric policy routing needs loose reverse-path filtering (Debian role
+  # parity), and the NixOS firewall's own reverse-path check shares the
+  # nftables backend with docker's rules -- "loose" keeps it from dropping
+  # marked flows whose return path differs from the main table's expectation.
+  networking.firewall.checkReversePath = "loose";
+  boot.kernel.sysctl = {
+    "net.ipv4.conf.all.rp_filter" = 2;
+    "net.ipv4.conf.default.rp_filter" = 2;
+  };
+{% endif %}
 
   # Service runtime identity (Debian-fleet parity): medusa owns the stacks tree
   # and runs compose; docker-group membership grants the socket.
@@ -134,6 +151,41 @@
 {% if host.stacks %}
 
   systemd.services = {
+{% if host.tunnel %}
+    # Tunnel packet marking: our own oneshot loading a dedicated nft table
+    # (never the distro nftables service, whose `flush ruleset` would wipe
+    # docker's rules). The staged file is interpolated into the store, so a
+    # content change changes the unit and NixOS restarts it on switch.
+    medusa-tunnel-firewall = {
+      description = "Medusa tunnel packet marking";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-pre.target" ];
+      wants = [ "network-pre.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.nftables}/bin/nft -f ${../egress/tunnel-routing.nft}";
+      };
+    };
+
+    # Fail-closed policy routing for marked traffic (same generated script the
+    # Debian role installs at /usr/local/sbin/medusa-tunnel-routes.sh).
+    medusa-tunnel-routes = {
+      description = "Medusa tunnel policy routing";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      path = [ pkgs.iproute2 ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        exec ${pkgs.bash}/bin/bash ${../egress/tunnel-routes.sh}
+      '';
+    };
+
+{% endif %}
     # Materialize the staged stack trees into the writable stacks root. Only
     # staged files are copied; data dirs beneath the tree are never touched.
     medusa-stacks-sync = {
@@ -172,8 +224,8 @@
     "medusa-stack-{{ stack.unit_suffix }}" = {
       description = "Medusa compose stack {{ stack.name }}";
       wantedBy = [ "multi-user.target" ];
-      after = [ "docker.service" "medusa-stacks-sync.service" "network-online.target" "remote-fs.target"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %} ];
-      requires = [ "docker.service" "medusa-stacks-sync.service"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %} ];
+      after = [ "docker.service" "medusa-stacks-sync.service" "network-online.target" "remote-fs.target"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %}{% if host.tunnel %} "medusa-tunnel-firewall.service" "medusa-tunnel-routes.service"{% endif %} ];
+      requires = [ "docker.service" "medusa-stacks-sync.service"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %}{% if host.tunnel %} "medusa-tunnel-firewall.service" "medusa-tunnel-routes.service"{% endif %} ];
       wants = [ "network-online.target" ];
       restartTriggers = [ ../stacks/{{ stack.name }} ];
       # Runs as medusa (docker group) -- the same identity that runs compose on
@@ -188,8 +240,14 @@
         set -eu
 {% for net in stack.external_networks %}
         # `compose up` refuses to create external resources; pre-create them
-        # (mirror of the Debian role's external-resources step).
+        # (mirror of the Debian role's external-resources step). The tunnel
+        # network carries its pinned subnet -- the nft marking and policy
+        # routing key on it, so an unpinned subnet would break the tunnel.
+{% if host.tunnel and net == host.tunnel.network_name %}
+        ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create --subnet {{ host.tunnel.tunnel_subnet }} {{ net }}
+{% else %}
         ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create {{ net }}
+{% endif %}
 {% endfor %}
 {% for vol in stack.external_volumes %}
         ${pkgs.docker}/bin/docker volume inspect {{ vol }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker volume create {{ vol }}

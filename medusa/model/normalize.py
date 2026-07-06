@@ -41,6 +41,7 @@ from medusa.model.nixos import (
     NixosStack,
     NixosStagedConfig,
     NixosStagedSecret,
+    NixosTunnelClient,
 )
 from medusa.model.services import (
     EgressGateway,
@@ -314,22 +315,31 @@ def normalize_nixos(
     mounts_by_host = dict(storage_model.mounts_by_host)
     nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
 
-    # T-087/D6 guard: `egress: tunnel` services must not land on a NixOS host
-    # until the client-side tunnel-routing slice is kill-switch-proven there.
-    # Compose would start such a service with DIRECT egress -- a silent
-    # kill-switch violation, the failure shape the tunnel exists to prevent.
-    tunneled_on_nixos = tuple(
-        f"'{name}' (host '{host}')"
-        for host, names in sorted(services_model.tunnel_services_by_host.items())
-        if host in nixos_names
-        for name in names
-    )
-    if tunneled_on_nixos:
-        raise ValueError(
-            f"services with egress: tunnel cannot run on a NixOS host until "
-            f"the tunnel-routing client is kill-switch-validated there "
-            f"(T-087/D6): {'; '.join(tunneled_on_nixos)} -- keep these stacks "
-            f"on a debian-docker host"
+    # T-087/D6 client slice: a NixOS host running `egress: tunnel` services
+    # gets the tunnel-routing client (nft marking + fail-closed policy
+    # routing), derived from the same resolved EgressGateway the Debian
+    # tunnel_routing role consumes via the egress manifest. The former D6
+    # guard is lifted; what remains guarded is the GATEWAY host itself
+    # (wireguard_gateway has no NixOS port -- see the infra-role guard below).
+    tunnel_by_host: dict[str, NixosTunnelClient] = {}
+    for host_name in services_model.tunnel_services_by_host:
+        if host_name not in nixos_names:
+            continue
+        egress = services_model.egress
+        if egress is None:
+            # normalize_services resolves the gateway whenever a tunneled
+            # service exists; this is a consistency failure, not a user error.
+            raise ValueError(
+                f"host '{host_name}' runs tunneled services but no egress "
+                f"gateway was resolved"
+            )
+        tunnel_by_host[host_name] = NixosTunnelClient(
+            network_name=egress.network_name,
+            tunnel_subnet=egress.tunnel_subnet,
+            gateway_address=egress.gateway_address,
+            fwmark=egress.fwmark,
+            table=egress.table,
+            lan_subnets=egress.lan_subnets,
         )
 
     # Same guard class as D6 for the Debian-only infrastructure roles: the
@@ -515,6 +525,7 @@ def normalize_nixos(
                 )
             ),
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
+            tunnel=tunnel_by_host.get(host.name),
             deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
             staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],
             secret_env_files=secrets_by_host.get(host.name, _NO_SECRETS)[1],

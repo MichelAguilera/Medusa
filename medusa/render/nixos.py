@@ -107,3 +107,16 @@ def stage_nixos_configs(
             files[
                 generated_dir / "nixos" / "deploy" / host.name / config.dest
             ] = files[source]
+    # Tunnel-routing client artifacts (T-087/D6): fleet-level, staged once.
+    # A flake cannot reference paths outside its own tree, so the host module
+    # interpolates these from generated/nixos/egress/ rather than reading
+    # generated/egress/ directly. Same bytes the Debian role deploys.
+    if any(host.tunnel is not None for host in model.hosts):
+        for artifact in ("tunnel-routing.nft", "tunnel-routes.sh"):
+            source = generated_dir / "egress" / artifact
+            if source not in files:
+                raise ValueError(
+                    f"tunnel artifact 'egress/{artifact}' was not rendered "
+                    f"but a NixOS host runs tunneled services"
+                )
+            files[generated_dir / "nixos" / "egress" / artifact] = files[source]
