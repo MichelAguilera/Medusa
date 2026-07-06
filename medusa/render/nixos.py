@@ -120,6 +120,17 @@ def stage_nixos_configs(
                     f"but a NixOS host runs tunneled services"
                 )
             files[generated_dir / "nixos" / "egress" / artifact] = files[source]
+    # CoreDNS artifacts (T-056 port): the Corefile + lan.hosts the Debian role
+    # deploys to /etc/coredns, staged for the DNS host's module. Same bytes.
+    if any(host.coredns for host in model.hosts):
+        for artifact in ("Corefile", "lan.hosts"):
+            source = generated_dir / "coredns" / artifact
+            if source not in files:
+                raise ValueError(
+                    f"coredns artifact 'coredns/{artifact}' was not rendered "
+                    f"but a NixOS host serves CoreDNS"
+                )
+            files[generated_dir / "nixos" / "coredns" / artifact] = files[source]
     # Egress gateway artifacts (T-066 port): the NAT + kill-switch ruleset and
     # split-DNS resolver config the Debian wireguard_gateway role deploys,
     # staged for the gateway host's module to interpolate. Same bytes.

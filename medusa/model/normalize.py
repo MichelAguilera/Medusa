@@ -351,18 +351,22 @@ def normalize_nixos(
     coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
+    # CoreDNS on NixOS (T-056 port): the DNS host gets the coredns unit on
+    # the same generated Corefile + lan.hosts the Debian role deploys.
+    # Derivation mirrors the ansible-groups builder (coredns_hosts above).
+    nixos_coredns_hosts = {
+        name for name in coredns_hosts if name in nixos_names
+    }
+
     infra_on_nixos = [
-        f"'{name}' runs coredns" for name in coredns_hosts if name in nixos_names
-    ]
-    infra_on_nixos.extend(
         f"'{server}' serves NFS exports"
         for server, _ in storage_model.exports_by_server
         if server in nixos_names
-    )
+    ]
     if infra_on_nixos:
         raise ValueError(
             f"hosts serving Debian-only infrastructure roles cannot be "
-            f"platform: nixos -- coredns and nfs_exports have no NixOS "
+            f"platform: nixos -- nfs_exports has no NixOS "
             f"delivery path yet, so the role would be silently "
             f"dropped: {'; '.join(sorted(infra_on_nixos))} -- keep these "
             f"hosts on debian until the role is ported"
@@ -550,6 +554,7 @@ def normalize_nixos(
             ),
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
             egress_gateway=egress_gateway_by_host.get(host.name),
+            coredns=host.name in nixos_coredns_hosts,
             tunnel=tunnel_by_host.get(host.name),
             deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
             staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],

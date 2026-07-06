@@ -122,10 +122,22 @@
   # the distro's rp_filter=0 default -- this is parity, not a loosening).
   boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
   networking.firewall.checkReversePath = false;
+{% endif %}
+{% if host.coredns %}
+
+  # ---- CoreDNS (T-056 port) --------------------------------------------------
+  # The LIVE resolver for the whole LAN, on the same generated Corefile +
+  # lan.hosts the Debian role deploys (staged in-generation, byte-identical).
+  # The Debian role's backup/health-check/restore guard is NixOS-native here:
+  # a bad config is a generation rollback.
+{% endif %}
+{% if host.egress_gateway or host.coredns %}
+
+  # DNS service ports (the gateway's split resolver / the fleet resolver).
   networking.firewall.allowedTCPPorts = [ 53 ];
   networking.firewall.allowedUDPPorts = [ 53 ];
 {% endif %}
-{% if host.stacks or host.staged_secrets or host.deploy_configs %}
+{% if host.stacks or host.staged_secrets or host.deploy_configs or host.coredns %}
 
   # Staged, in-generation sources: this host's stack trees and encrypted secret
   # files, copied into the store with the flake. The sync unit materializes the
@@ -133,6 +145,10 @@
   # (relative binds and `medusactl compose` work byte-for-byte); a rollback
   # re-syncs the previous generation's config.
   environment.etc = {
+{% if host.coredns %}
+    # The generated Corefile references /etc/coredns/lan.hosts verbatim.
+    "coredns/lan.hosts".source = ../coredns/lan.hosts;
+{% endif %}
 {% for stack in host.stacks %}
     "medusa-stacks-src/{{ stack.name }}".source = ../stacks/{{ stack.name }};
 {% endfor %}
@@ -166,9 +182,28 @@
 {% endif %}
   ];
 {% endif %}
-{% if host.stacks or host.staged_secrets %}
+{% if host.stacks or host.staged_secrets or host.coredns %}
 
   systemd.services = {
+{% if host.coredns %}
+    # CoreDNS on the generated config. Restart=on-failure self-heals transient
+    # crashes; the hosts plugin re-reads lan.hosts on change, and a Corefile
+    # change changes the interpolated store path, so the unit restarts on
+    # switch. A config CoreDNS rejects at startup = roll back the generation.
+    medusa-coredns = {
+      description = "Medusa CoreDNS resolver";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      restartTriggers = [ ../coredns/lan.hosts ];
+      serviceConfig = {
+        ExecStart = "${pkgs.coredns}/bin/coredns -conf ${../coredns/Corefile}";
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+    };
+
+{% endif %}
 {% if host.egress_gateway %}
     # The WireGuard interface on the host-decrypted tmpfs config (T-080: the
     # plaintext never touches persistent disk or the controller). wg-quick

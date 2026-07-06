@@ -193,6 +193,12 @@ class NixosHost(BaseModel):
     # resolved egress gateway. Mutually exclusive with stacks (dedicated
     # host). None everywhere else.
     egress_gateway: NixosEgressGateway | None = None
+    # CoreDNS host (T-056 port): true when this host is the fleet's DNS
+    # resolver. Runs CoreDNS on the same generated Corefile + lan.hosts the
+    # Debian role deploys (byte-identical, staged in-generation). The Debian
+    # role's backup/health-check/restore guard maps to NixOS generations: a
+    # bad config is a `nixos-rebuild --rollback`.
+    coredns: bool = False
     # Tunnel-routing client (T-087/D6): set when this host runs at least one
     # `egress: tunnel` service. Emits the nft marking + policy-routing units,
     # loose reverse-path filtering, and the pinned-subnet tunnel network
