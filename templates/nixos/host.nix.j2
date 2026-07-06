@@ -130,6 +130,11 @@
   # lan.hosts the Debian role deploys (staged in-generation, byte-identical).
   # The Debian role's backup/health-check/restore guard is NixOS-native here:
   # a bad config is a generation rollback.
+  # systemd-resolved rides in with networkd and its stub listener
+  # (127.0.0.53:53) collides with CoreDNS's wildcard :53 bind -- this host IS
+  # the resolver, so resolved is disabled and the static resolv.conf points
+  # at the network config's nameservers (this host itself).
+  services.resolved.enable = false;
 {% endif %}
 {% if host.egress_gateway or host.coredns %}
 
