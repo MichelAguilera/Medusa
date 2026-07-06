@@ -61,6 +61,9 @@ class HostRecord(BaseModel):
     ansible_user: str | None = None
     ansible_groups: tuple[str, ...] = ()
     managed_mode: ManagedMode = ManagedMode.NONE
+    # IANA timezone; consumed by the NixOS render (time.timeZone). None means
+    # the platform default (UTC, and no /etc/localtime on NixOS).
+    timezone: str | None = None
     # Resolved static-networking config, set only for hosts that opted into
     # managed networking (manage_network: true). None otherwise. See T-055.
     network: HostNetwork | None = None

@@ -251,6 +251,13 @@ class HostInventory(BaseModel):
     # stateful defaults), so it is host data, not derived from the flake's
     # nixpkgs pin. Defaults in normalize to the current release. nixos-only.
     nixos_state_version: str | None = None
+    # IANA timezone for the host (e.g. "America/New_York"). Consumed by the
+    # NixOS render (`time.timeZone`); Debian hosts carry their timezone from
+    # OS install. Matters beyond cosmetics: without it /etc/localtime does
+    # not exist on NixOS, and a compose service binding /etc/localtime makes
+    # docker auto-create the missing source as a DIRECTORY, which then fails
+    # to mount over the container's file.
+    timezone: str | None = None
     # The host's age recipient (public key), derived from its ssh host key via
     # `ssh-to-age`. Public data -- not key material -- so it lives in inventory.
     # When a host references a secret, this recipient is added to that secret's

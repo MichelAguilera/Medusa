@@ -179,6 +179,15 @@ class NixosHost(BaseModel):
 
     name: str
     hostname: str  # networking.hostName
+    # IANA timezone -> time.timeZone. Not cosmetic: without it /etc/localtime
+    # does not exist, and a compose service binding /etc/localtime makes
+    # docker auto-create the missing source as a directory (mount failure).
+    timezone: str | None = None
+    # In-fleet registries served over plain HTTP behind the fleet proxy
+    # (image registry component matches a fleet route host). Debian hosts
+    # carry the same trust in daemon.json; here it renders to
+    # virtualisation.docker.daemon.settings."insecure-registries".
+    insecure_registries: tuple[str, ...] = ()
     network: NixosNetwork | None
     file_systems: tuple[NixosMount, ...]
     # Compose stacks this host runs (T-087). Empty when the host is

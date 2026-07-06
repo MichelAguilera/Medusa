@@ -11,6 +11,12 @@
   imports = [{% if host.qemu_guest_agent %} (modulesPath + "/profiles/qemu-guest.nix"){% endif %}{% if host.disko_module %} {{ host.disko_module }}{% endif %} ];
 {% endif %}
   networking.hostName = "{{ host.hostname }}";
+{% if host.timezone %}
+  # Also materializes /etc/localtime, which compose services bind-mount;
+  # without it docker auto-creates the missing source as a directory and the
+  # mount over the container's file fails.
+  time.timeZone = "{{ host.timezone }}";
+{% endif %}
 {% if host.boot_loader %}
 
   # UEFI boot via systemd-boot; the ESP is the disko-managed /boot partition.
@@ -81,6 +87,12 @@
   # substrate beneath it. Containers are supervised by the docker daemon
   # (restart policies), exactly as on Debian -- the units below only reconcile.
   virtualisation.docker.enable = true;
+{% if host.insecure_registries %}
+  # In-fleet registries served over plain HTTP behind the fleet proxy (the
+  # image's registry component is a fleet route host). Debian hosts carry the
+  # same trust in /etc/docker/daemon.json.
+  virtualisation.docker.daemon.settings."insecure-registries" = [{% for reg in host.insecure_registries %} "{{ reg }}"{% endfor %} ];
+{% endif %}
 {% if host.tunnel %}
 
   # ---- Tunnel-routing client (T-087/D6, the T-066 mechanism) ----------------

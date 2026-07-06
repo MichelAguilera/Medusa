@@ -134,6 +134,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             managed_mode=_derive_managed_mode(
                 host.ansible_user, host.ansible_managed_mode
             ),
+            timezone=host.timezone,
             network=_resolve_network(host, inventory.network),
             wildcard=host.wildcard,
             platform=host.platform,
@@ -431,6 +432,30 @@ def normalize_nixos(
             interface=egress.interface
         )
 
+    # In-fleet insecure registries: a service image whose registry component
+    # is itself a fleet route host (e.g. gitea.<host>.lan/user/app) is served
+    # over plain HTTP behind the fleet proxy, so the PULLING host's docker
+    # daemon must trust it. Derived per host from the images its stacks pull.
+    # TraefikRoute.host is the MACHINE; the routed FQDN lives in the rule
+    # (built as Host(`fqdn`) in _traefik_route, mirrored here).
+    fleet_route_hosts = {
+        route.rule.removeprefix("Host(`").removesuffix("`)")
+        for routes in services_model.traefik_routes_by_host.values()
+        for route in routes
+    }
+    insecure_registries_by_host: dict[str, tuple[str, ...]] = {}
+    for host_name, stacks in stacks_by_host.items():
+        registries = {
+            registry
+            for stack in stacks
+            for service in stack.compose_file.services
+            if service.image is not None
+            for registry in [service.image.split("/", 1)[0]]
+            if registry in fleet_route_hosts
+        }
+        if registries:
+            insecure_registries_by_host[host_name] = tuple(sorted(registries))
+
     # T-087 config-staging slice: the per-host artifacts the Debian traefik /
     # homepage / monitoring roles copy onto the host ride the flake tree
     # instead. Sources are the SAME rendered files those roles ship (the
@@ -536,6 +561,8 @@ def normalize_nixos(
         NixosHost(
             name=host.name,
             hostname=host.name,
+            timezone=host.timezone,
+            insecure_registries=insecure_registries_by_host.get(host.name, ()),
             network=_nixos_network(host),
             file_systems=tuple(
                 NixosMount(
