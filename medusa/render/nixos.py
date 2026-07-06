@@ -120,3 +120,20 @@ def stage_nixos_configs(
                     f"but a NixOS host runs tunneled services"
                 )
             files[generated_dir / "nixos" / "egress" / artifact] = files[source]
+    # Egress gateway artifacts (T-066 port): the NAT + kill-switch ruleset and
+    # split-DNS resolver config the Debian wireguard_gateway role deploys,
+    # staged for the gateway host's module to interpolate. Same bytes.
+    for host in model.hosts:
+        if host.egress_gateway is None:
+            continue
+        for artifact in ("nftables.conf", "resolver.conf"):
+            source = generated_dir / "egress" / host.name / artifact
+            if source not in files:
+                raise ValueError(
+                    f"gateway artifact 'egress/{host.name}/{artifact}' was "
+                    f"not rendered but host '{host.name}' is the NixOS "
+                    f"egress gateway"
+                )
+            files[generated_dir / "nixos" / "egress" / host.name / artifact] = (
+                files[source]
+            )

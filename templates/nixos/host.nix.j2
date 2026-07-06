@@ -108,6 +108,24 @@
     extraGroups = [ "docker" ];
     home = "/home/medusa";
   };
+{% endif %}
+{% if host.egress_gateway %}
+
+  # ---- Shared WireGuard egress gateway (T-066, wireguard_gateway port) ------
+  # This host routes tunneled client traffic into WireGuard behind a
+  # fail-closed kill-switch (the staged nft ruleset: forwarded traffic may
+  # ONLY leave via the tunnel) and answers client DNS on the split resolver.
+  # ip_forward turns the host into a router; the host firewall must admit the
+  # clients' DNS queries. Reverse-path checking is disabled outright: return
+  # traffic arrives on {{ host.egress_gateway.interface }} while the main
+  # table routes those sources via the LAN uplink (Debian gateways run with
+  # the distro's rp_filter=0 default -- this is parity, not a loosening).
+  boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
+  networking.firewall.checkReversePath = false;
+  networking.firewall.allowedTCPPorts = [ 53 ];
+  networking.firewall.allowedUDPPorts = [ 53 ];
+{% endif %}
+{% if host.stacks or host.staged_secrets or host.deploy_configs %}
 
   # Staged, in-generation sources: this host's stack trees and encrypted secret
   # files, copied into the store with the flake. The sync unit materializes the
@@ -148,9 +166,59 @@
 {% endif %}
   ];
 {% endif %}
-{% if host.stacks %}
+{% if host.stacks or host.staged_secrets %}
 
   systemd.services = {
+{% if host.egress_gateway %}
+    # The WireGuard interface on the host-decrypted tmpfs config (T-080: the
+    # plaintext never touches persistent disk or the controller). wg-quick
+    # derives the interface name from the config filename. openresolv covers
+    # a DNS= line in the operator's config.
+    medusa-wireguard = {
+      description = "Medusa egress WireGuard interface ({{ host.egress_gateway.interface }})";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" "medusa-secrets.service" ];
+      requires = [ "medusa-secrets.service" ];
+      wants = [ "network-online.target" ];
+      path = [ pkgs.wireguard-tools pkgs.iproute2 pkgs.nftables pkgs.openresolv ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.wireguard-tools}/bin/wg-quick up /run/medusa-secrets/{{ host.name }}/wireguard/{{ host.egress_gateway.interface }}.conf";
+        ExecStop = "${pkgs.wireguard-tools}/bin/wg-quick down /run/medusa-secrets/{{ host.name }}/wireguard/{{ host.egress_gateway.interface }}.conf";
+      };
+    };
+
+    # NAT + fail-closed kill-switch: our own oneshot loading a dedicated nft
+    # table (same surgical `nft -f` pattern as the client side -- never the
+    # distro nftables service). Forwarded traffic may only leave via the
+    # tunnel; tunnel down = drop, never a fallback to the clear path.
+    medusa-egress-firewall = {
+      description = "Medusa egress NAT + kill-switch";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-pre.target" ];
+      wants = [ "network-pre.target" ];
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+        ExecStart = "${pkgs.nftables}/bin/nft -f ${../egress/{{ host.name }}/nftables.conf}";
+      };
+    };
+
+    # Split-DNS resolver on the generated config (managed zones -> CoreDNS,
+    # everything else -> the in-tunnel upstream; no DNS leak).
+    medusa-egress-resolver = {
+      description = "Medusa split-DNS resolver";
+      wantedBy = [ "multi-user.target" ];
+      after = [ "network-online.target" ];
+      wants = [ "network-online.target" ];
+      serviceConfig = {
+        ExecStart = "${pkgs.dnsmasq}/bin/dnsmasq --keep-in-foreground --conf-file=${../egress/{{ host.name }}/resolver.conf}";
+        Restart = "on-failure";
+      };
+    };
+
+{% endif %}
 {% if host.tunnel %}
     # Tunnel packet marking: our own oneshot loading a dedicated nft table
     # (never the distro nftables service, whose `flush ruleset` would wipe
@@ -186,6 +254,7 @@
     };
 
 {% endif %}
+{% if host.stacks %}
     # Materialize the staged stack trees into the writable stacks root. Only
     # staged files are copied; data dirs beneath the tree are never touched.
     medusa-stacks-sync = {
@@ -256,6 +325,7 @@
       '';
     };
 {% endfor %}
+{% endif %}
 {% if host.staged_secrets %}
 
     # Host-side secret decryption (the T-080 seam, ported for T-087): decrypt

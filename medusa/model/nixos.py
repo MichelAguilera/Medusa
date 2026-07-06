@@ -58,6 +58,22 @@ class NixosTunnelClient(BaseModel):
     lan_subnets: tuple[str, ...]
 
 
+class NixosEgressGateway(BaseModel):
+    """This host IS the shared WireGuard egress gateway (T-066, Debian
+    wireguard_gateway role port). Emits: wg-quick on the host-decrypted tmpfs
+    config (the T-080 seam already stages/decrypts the operator's WireGuard
+    secret to /run/medusa-secrets/<host>/wireguard/<iface>.conf), the
+    generated NAT + fail-closed kill-switch nft ruleset, the dnsmasq split-DNS
+    resolver on the generated config, ip forwarding, and firewall admission
+    for client DNS. A gateway host must be DEDICATED: the kill-switch forward
+    chain has a drop policy, so co-locating compose stacks would silently
+    break their forwarded traffic (enforced in normalize)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    interface: str  # e.g. "wg0"; artifact + secret paths derive from it
+
+
 class NixosStagedConfig(BaseModel):
     """One per-host config artifact a Debian role would copy onto the host
     (traefik dynamic config, homepage services config, prometheus targets),
@@ -173,6 +189,10 @@ class NixosHost(BaseModel):
     # owned before compose up (same derivation the Debian role consumes from
     # compose-data-dirs.yaml; here they render to tmpfiles rules).
     data_dirs: tuple[ComposeDataDir, ...]
+    # Shared WireGuard egress gateway (T-066 port): set when this host is the
+    # resolved egress gateway. Mutually exclusive with stacks (dedicated
+    # host). None everywhere else.
+    egress_gateway: NixosEgressGateway | None = None
     # Tunnel-routing client (T-087/D6): set when this host runs at least one
     # `egress: tunnel` service. Emits the nft marking + policy-routing units,
     # loose reverse-path filtering, and the pinned-subnet tunnel network

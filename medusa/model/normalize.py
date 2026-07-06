@@ -37,6 +37,7 @@ from medusa.model.nixos import (
     NixosNetwork,
     NixosSecretEnvFile,
     NixosSecretFile,
+    NixosEgressGateway,
     NixosSecretSetting,
     NixosStack,
     NixosStagedConfig,
@@ -353,10 +354,6 @@ def normalize_nixos(
     infra_on_nixos = [
         f"'{name}' runs coredns" for name in coredns_hosts if name in nixos_names
     ]
-    if services_model.egress and services_model.egress.gateway in nixos_names:
-        infra_on_nixos.append(
-            f"'{services_model.egress.gateway}' is the WireGuard egress gateway"
-        )
     infra_on_nixos.extend(
         f"'{server}' serves NFS exports"
         for server, _ in storage_model.exports_by_server
@@ -365,8 +362,8 @@ def normalize_nixos(
     if infra_on_nixos:
         raise ValueError(
             f"hosts serving Debian-only infrastructure roles cannot be "
-            f"platform: nixos -- coredns, wireguard_gateway, and nfs_exports "
-            f"have no NixOS delivery path yet, so the role would be silently "
+            f"platform: nixos -- coredns and nfs_exports have no NixOS "
+            f"delivery path yet, so the role would be silently "
             f"dropped: {'; '.join(sorted(infra_on_nixos))} -- keep these "
             f"hosts on debian until the role is ported"
         )
@@ -401,6 +398,33 @@ def normalize_nixos(
                 external_networks=_external_names(compose_file.networks),
                 external_volumes=_external_names(compose_file.volumes),
             )
+        )
+
+    # Shared WireGuard egress gateway (T-066, wireguard_gateway role port):
+    # a NixOS gateway gets wg-quick on the host-decrypted config, the
+    # generated NAT + kill-switch ruleset, and the split-DNS resolver. The
+    # T-080 seam already routes the operator's WireGuard secret to this host
+    # (secret_sources carries it), so staged_secrets/secret_files need no
+    # special-casing. The dedicated-host contract the Debian role only
+    # documents is ENFORCED here: the kill-switch forward chain drops
+    # everything not leaving via the tunnel, which would silently break any
+    # co-located compose stack's forwarded traffic.
+    egress_gateway_by_host: dict[str, NixosEgressGateway] = {}
+    egress = services_model.egress
+    if egress is not None and egress.gateway in nixos_names:
+        if stacks_by_host.get(egress.gateway):
+            stack_names = ", ".join(
+                sorted(stack.name for stack in stacks_by_host[egress.gateway])
+            )
+            raise ValueError(
+                f"host '{egress.gateway}' is the WireGuard egress gateway and "
+                f"must be dedicated: its kill-switch forward chain (policy "
+                f"drop) would break the forwarded traffic of co-located "
+                f"compose stacks ({stack_names}) -- move those stacks to "
+                f"another host"
+            )
+        egress_gateway_by_host[egress.gateway] = NixosEgressGateway(
+            interface=egress.interface
         )
 
     # T-087 config-staging slice: the per-host artifacts the Debian traefik /
@@ -525,6 +549,7 @@ def normalize_nixos(
                 )
             ),
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
+            egress_gateway=egress_gateway_by_host.get(host.name),
             tunnel=tunnel_by_host.get(host.name),
             deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
             staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],
