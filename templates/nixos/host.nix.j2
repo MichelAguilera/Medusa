@@ -410,9 +410,14 @@
         install -d -o root -g root -m 0755 /run/medusa-secrets
 {% for env_file in host.secret_env_files %}
         (umask 022 && mkdir -p "$(dirname '/run/medusa-secrets/{{ env_file.destination }}')")
+        # Decrypt into a variable FIRST: under `set -e` a failing command
+        # substitution inside printf's arguments is silently discarded, which
+        # turned an undecryptable secret into an EMPTY value instead of a
+        # failed unit. A plain assignment propagates the failure.
         {
 {% for setting in env_file.settings %}
-          printf '%s=%s\n' '{{ setting.setting }}' "$(sops --decrypt --extract '["value"]' '/etc/medusa-secrets-enc/{{ setting.staged }}')"
+          value="$(sops --decrypt --extract '["value"]' '/etc/medusa-secrets-enc/{{ setting.staged }}')"
+          printf '%s=%s\n' '{{ setting.setting }}' "$value"
 {% endfor %}
         } > '/run/medusa-secrets/{{ env_file.destination }}'
         chown {{ env_file.owner_user }} '/run/medusa-secrets/{{ env_file.destination }}'
