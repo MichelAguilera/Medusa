@@ -87,6 +87,7 @@ Usage:
     medusactl add-targets-from-file <path>
     medusactl prep-target <name>
     medusactl authorize-target <name>
+    medusactl repin-target <name> [--ip <addr>]
     medusactl migrate-deploy-root <name> --from-user <user> [--apply]
     medusactl finalize-dns [--resolver <ip>] [--check] [--force]
     medusactl undo [--dry-run]
@@ -2671,6 +2672,75 @@ REMOTE
     return 1
 }
 
+cmd_repin_target() {
+    load_config
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
+        cat <<EOF
+medusactl repin-target — refresh the controller's pinned SSH host key after a
+target is reinstalled.
+
+Usage:
+  medusactl repin-target <name> [--ip <addr>]
+
+A reinstalled target (nixos-anywhere, a re-imaged VM) presents a new SSH host
+key, and every controller-side flow then aborts with 'REMOTE HOST
+IDENTIFICATION HAS CHANGED'. This scrubs the stale known_hosts entries on the
+controller (<name>, <name>.lan, and the IP), re-pins the target's current
+ed25519 key via ssh-keyscan, and prints the key + fingerprint. Verify the
+fingerprint out-of-band (the target's console) when the reinstall was not
+your own doing. --ip skips the DNS lookup -- required when repinning the DNS
+host itself.
+EOF
+        return 0
+    fi
+    local host=$1; shift
+    local ip=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ip) shift; [[ -n "${1:-}" ]] || fail "repin-target: --ip requires an address"; ip=$1; shift ;;
+            --ip=*) ip=${1#--ip=}; [[ -n "$ip" ]] || fail "repin-target: --ip requires an address"; shift ;;
+            *) fail "unknown argument to repin-target: $1" ;;
+        esac
+    done
+
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+name="$REPIN_NAME"
+ip="$REPIN_IP"
+if [ -z "$ip" ]; then
+    ip=$(getent hosts "${name}.lan" | awk '{print $1; exit}') || true
+fi
+for h in "$name" "${name}.lan" $ip; do
+    ssh-keygen -f "$HOME/.ssh/known_hosts" -R "$h" >/dev/null 2>&1 || true
+done
+scan_host="${ip:-${name}.lan}"
+key=$(ssh-keyscan -T 5 -t ed25519 "$scan_host" 2>/dev/null | awk '{print $2" "$3; exit}')
+if [ -z "$key" ]; then
+    echo "repin-target: no ed25519 key from $scan_host (host down? wrong --ip?)" >&2
+    exit 1
+fi
+{
+    printf '%s %s\n' "${name}.lan" "$key"
+    printf '%s %s\n' "$name" "$key"
+    if [ -n "$ip" ]; then
+        printf '%s %s\n' "$ip" "$key"
+    fi
+} >> "$HOME/.ssh/known_hosts"
+echo "pinned: ${name}, ${name}.lan${ip:+, $ip}"
+echo "key:    $key"
+printf '%s %s\n' "$scan_host" "$key" | ssh-keygen -lf - | sed 's/^/sha256: /'
+REMOTE
+)
+    local target
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    printf "%s==>%s repin-target %s\n" "$color_blue" "$color_reset" "$host"
+    ssh "${ssh_opts[@]}" "$target" \
+        "REPIN_NAME=$(printf %q "$host") REPIN_IP=$(printf %q "$ip") bash -s" <<< "$remote"
+}
+
 cmd_authorize_target() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
@@ -3836,6 +3906,10 @@ case "${1:-}" in
     authorize-target)
         shift
         cmd_authorize_target "$@"
+        ;;
+    repin-target)
+        shift
+        cmd_repin_target "$@"
         ;;
     seed-target)
         shift
