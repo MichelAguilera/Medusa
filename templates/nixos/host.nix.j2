@@ -356,14 +356,17 @@
         # (mirror of the Debian role's external-resources step). The tunnel
         # network carries its pinned subnet -- the nft marking and policy
         # routing key on it, so an unpinned subnet would break the tunnel.
+        # Stack units start in PARALLEL (ansible ran this step serially), so
+        # a shared network races: if create loses, re-inspect -- the resource
+        # existing is success regardless of who created it.
 {% if host.tunnel and net == host.tunnel.network_name %}
-        ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create --subnet {{ host.tunnel.tunnel_subnet }} {{ net }}
+        ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create --subnet {{ host.tunnel.tunnel_subnet }} {{ net }} || ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null
 {% else %}
-        ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create {{ net }}
+        ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker network create {{ net }} || ${pkgs.docker}/bin/docker network inspect {{ net }} >/dev/null
 {% endif %}
 {% endfor %}
 {% for vol in stack.external_volumes %}
-        ${pkgs.docker}/bin/docker volume inspect {{ vol }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker volume create {{ vol }}
+        ${pkgs.docker}/bin/docker volume inspect {{ vol }} >/dev/null 2>&1 || ${pkgs.docker}/bin/docker volume create {{ vol }} || ${pkgs.docker}/bin/docker volume inspect {{ vol }} >/dev/null
 {% endfor %}
         exec ${pkgs.docker-compose}/bin/docker-compose up -d --remove-orphans
       '';
