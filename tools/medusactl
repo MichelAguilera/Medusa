@@ -1414,6 +1414,7 @@ EOF
         local remote
         remote=$(cat <<'REMOTE'
 set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
 cd "$MEDUSA_CONTROLLER_PATH"
 uv run --quiet medusa list-stacks
 REMOTE
