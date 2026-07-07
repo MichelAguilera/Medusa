@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.21.0"
+VERSION="0.22.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -3146,8 +3146,14 @@ cmd_update() {
     load_config
     # Pull both repos. Code first (because uv sync runs there); inventory
     # second so any new schema additions land before the next render.
+    # uv.lock is restored before the pull: uv sync rewrites it whenever a
+    # release ships a lock that drifted from pyproject.toml, and the dirty
+    # file then blocks --ff-only forever. The controller checkout is a pure
+    # consumer — local changes there are never legitimate.
     run_logged update "$(cat <<EOF
 set -e
+echo '==> code: restore uv.lock'
+git -C $(printf %q "$MEDUSA_CONTROLLER_PATH") checkout -- uv.lock
 echo '==> code: git pull'
 git -C $(printf %q "$MEDUSA_CONTROLLER_PATH") pull --ff-only
 echo '==> inventory: git pull'
