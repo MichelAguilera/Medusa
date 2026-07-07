@@ -73,6 +73,7 @@ from medusa.model.normalize import (
     normalize_services,
     normalize_sops,
     normalize_storage,
+    validate_dormant_dependencies,
 )
 from medusa.model.services import ServicesModel
 from medusa.model.sops import SopsConfigModel
@@ -166,7 +167,13 @@ def _load_all(
         parse_homepage_inventory(load_optional_yaml(paths.homepage_inventory)),
         dns_model,
     )
-    monitoring_model = normalize_monitoring(services_inventory)
+    validate_dormant_dependencies(dns_model, storage_model, services_model)
+    monitoring_model = normalize_monitoring(
+        services_inventory,
+        dormant_hosts=frozenset(
+            host.name for host in dns_model.hosts if host.is_dormant
+        ),
+    )
     groups_model = normalize_ansible_groups(
         dns_model, services_model, storage_model, homepage_model, monitoring_model
     )
@@ -472,6 +479,12 @@ def nixos_deploy_plan(
         _fail(str(error))
 
     for host in loaded.nixos_model.hosts:
+        if host.dormant:
+            typer.echo(
+                f"nixos host '{host.name}' skipped (dormant)",
+                err=True,
+            )
+            continue
         if host.deploy_target is None:
             typer.echo(
                 f"nixos host '{host.name}' has no ansible_user; cannot reconcile "

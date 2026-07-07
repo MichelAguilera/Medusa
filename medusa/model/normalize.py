@@ -138,6 +138,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             network=_resolve_network(host, inventory.network),
             wildcard=host.wildcard,
             platform=host.platform,
+            state=host.state,
             nixos_guest=host.nixos_guest,
             nixos_disko=host.nixos_disko,
             nixos_admin_keys=tuple(host.nixos_admin_keys),
@@ -183,6 +184,11 @@ def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
                 )
             )
         if not host.is_ansible_managed:
+            continue
+        # Dormant hosts keep their bootstrap /etc/hosts entry (name resolution
+        # is harmless) but get no connection metadata: absent from hosts.ini,
+        # Ansible cannot target them (T-091).
+        if host.is_dormant:
             continue
         if not host.fqdns:
             raise ValueError(
@@ -257,6 +263,75 @@ def normalize_sops(
         )
 
     return SopsConfigModel(rules=tuple(rules))
+
+
+def validate_dormant_dependencies(
+    dns_model: DnsModel,
+    storage_model: StorageModel,
+    services_model: ServicesModel,
+) -> None:
+    """Reject a dormant host that active hosts still depend on (T-091).
+
+    Dormancy skips deploy dispatch, so these are exactly the cross-host
+    dependencies a runtime skip could never guard: an active host would be
+    deployed against infrastructure that is declared down. A crosscut over
+    dns (state) + storage (exports/mounts) + services (egress, coredns) --
+    documented like render_docs and normalize_sops, kept out of any single
+    normalizer. All-dormant dependents are fine: parking a server together
+    with all its clients is a consistent declaration.
+    """
+    dormant = {host.name for host in dns_model.hosts if host.is_dormant}
+    if not dormant:
+        return
+
+    problems: list[str] = []
+
+    for client, mounts in storage_model.mounts_by_host:
+        if client in dormant:
+            continue
+        for mount in mounts:
+            if mount.server in dormant:
+                problems.append(
+                    f"active host '{client}' mounts export "
+                    f"'{mount.export_id}' from dormant host '{mount.server}'"
+                )
+
+    egress = services_model.egress
+    if egress is not None and egress.gateway in dormant:
+        active_tunnel_hosts = sorted(
+            host
+            for host in services_model.tunnel_services_by_host
+            if host not in dormant
+        )
+        if active_tunnel_hosts:
+            problems.append(
+                f"dormant host '{egress.gateway}' is the egress gateway for "
+                f"tunneled services on active hosts: "
+                f"{', '.join(active_tunnel_hosts)}"
+            )
+
+    # The fleet resolver (layering ADR: DNS before everything). Derivation
+    # mirrors the ansible-groups builder.
+    coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
+        host.name for host in dns_model.hosts if host.name == "coredns"
+    )
+    active_managed = any(
+        (host.is_ansible_managed or host.is_nixos) and not host.is_dormant
+        for host in dns_model.hosts
+    )
+    for name in coredns_hosts:
+        if name in dormant and active_managed:
+            problems.append(
+                f"dormant host '{name}' is the fleet DNS resolver; the "
+                f"active fleet cannot depend on a host declared down"
+            )
+
+    if problems:
+        formatted = "; ".join(problems)
+        raise ValueError(
+            f"dormant hosts still owe the active fleet: {formatted} -- "
+            f"wake the host (drop state: dormant) or park its dependents too"
+        )
 
 
 def normalize_network(dns_model: DnsModel) -> NetworkModel:
@@ -604,6 +679,7 @@ def normalize_nixos(
                 disko_sources.get(host.name) if host.nixos_disko else None
             ),
             deploy_target=_nixos_deploy_target(host),
+            dormant=host.is_dormant,
         )
         for host in dns_model.hosts_by_platform("nixos")
     )
@@ -1437,11 +1513,18 @@ def _build_homepage_card(service) -> HomepageCard:
     return HomepageCard(name=name, fields=tuple(fields))
 
 
-def normalize_monitoring(services_inventory: ServicesInventory) -> MonitoringModel:
+def normalize_monitoring(
+    services_inventory: ServicesInventory,
+    dormant_hosts: frozenset[str] = frozenset(),
+) -> MonitoringModel:
     effective_services = _effective_services(services_inventory)
     targets: list[MonitoringTarget] = []
     for service in effective_services:
         if service.monitoring is None:
+            continue
+        # Services on dormant hosts leave the scrape set (T-091): dormancy IS
+        # the acknowledgment, so prometheus must not alert "down" on them.
+        if service.host in dormant_hosts:
             continue
 
         spec = service.monitoring
@@ -1484,10 +1567,17 @@ def normalize_ansible_groups(
     # NixOS hosts are driven by the Nix path (T-074/T-075), never by Ansible
     # roles. Strip them from every role group so an operator can't point a role
     # at a NixOS box; they appear only in the dedicated nixos_hosts group.
+    # Dormant hosts (T-091) leave every group INCLUDING nixos_hosts: groups are
+    # deploy dispatch, and declared downtime means "do not deploy here".
     nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
+    dormant_names = {host.name for host in dns_model.hosts if host.is_dormant}
 
     def _ansible(names: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(name for name in names if name not in nixos_names)
+        return tuple(
+            name
+            for name in names
+            if name not in nixos_names and name not in dormant_names
+        )
 
     docker_hosts = _ansible(
         tuple(sorted({compose.host for compose in services_model.compose}))
@@ -1514,7 +1604,7 @@ def normalize_ansible_groups(
     # + policy routing applied. These are exactly the keys of the per-host
     # tunnel map.
     tunnel_routing_hosts = _ansible(tuple(sorted(services_model.tunnel_services_by_host)))
-    nixos_hosts = tuple(sorted(nixos_names))
+    nixos_hosts = tuple(sorted(nixos_names - dormant_names))
 
     traefik_hosts = _ansible(_platform_hosts(services_model, {"traefik"}))
     homepage_hosts = _ansible(homepage_model.hosts)

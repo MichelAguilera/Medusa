@@ -77,6 +77,12 @@ class HostRecord(BaseModel):
     # managed_mode. Renderers partition on this; they never branch on it
     # themselves (renderer contract). See T-073.
     platform: Literal["debian-docker", "nixos"] = "debian-docker"
+    # Lifecycle state (T-091). "dormant" = declared expected downtime: DNS
+    # records and artifacts still render, but the host is excluded from every
+    # deploy-facing output (ansible inventory/groups, nixos deploy plan,
+    # monitoring scrape targets). Declared in inventory, never detected at
+    # deploy time.
+    state: Literal["active", "dormant"] = "active"
     # Guest type ("vm" | "lxc" | "physical") for a nixos host. Drives the QEMU
     # guest agent and whether disko applies; normalize_nixos derives both from
     # it. Carried verbatim; default "vm". See T-078.
@@ -103,6 +109,10 @@ class HostRecord(BaseModel):
     @property
     def is_nixos(self) -> bool:
         return self.platform == "nixos"
+
+    @property
+    def is_dormant(self) -> bool:
+        return self.state == "dormant"
 
 
 class DnsModel(BaseModel):

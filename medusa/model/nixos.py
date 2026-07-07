@@ -275,6 +275,10 @@ class NixosHost(BaseModel):
     # it. Derived in normalize_nixos so deploy dispatch stays model-driven
     # (Platform Fork Boundary, seam 2). See T-075.
     deploy_target: str | None
+    # Declared expected downtime (T-091). The host still renders (its flake
+    # config stays a complete picture of intent) but the deploy plan skips it
+    # with a notice instead of failing on an unreachable machine.
+    dormant: bool = False
 
 
 class NixosModel(BaseModel):

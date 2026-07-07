@@ -226,6 +226,16 @@ class HostInventory(BaseModel):
     # independent. Default keeps every existing host on the Debian path. See
     # T-073.
     platform: Literal["debian-docker", "nixos"] = "debian-docker"
+    # Host lifecycle state (T-091). "dormant" declares expected downtime: the
+    # host keeps its DNS records and all its artifacts still render, but deploy
+    # dispatch skips it (absent from ansible inventory/groups, skipped by the
+    # nixos deploy plan, dropped from monitoring scrape targets) and the deploy
+    # stays green. Downtime is DECLARED here, never detected at deploy time --
+    # an unreachable *active* host stays a loud failure. Validation rejects a
+    # dormant host that active hosts still depend on (NFS exports, egress
+    # gateway, coredns). Only meaningful on a deployable host (ansible_user set
+    # or platform: nixos); a DNS-only host is already inert.
+    state: Literal["active", "dormant"] = "active"
     # Guest type for a nixos host. "vm" (Proxmox/KVM) gets the QEMU guest agent
     # (services.qemuGuest.enable) so the hypervisor can read the guest's IP, run
     # graceful shutdown, etc.; "lxc" (Proxmox container) gets no agent and cannot
@@ -337,6 +347,20 @@ class HostInventory(BaseModel):
         if self.ansible_user is None and self.ansible_managed_mode is not None:
             raise ValueError(
                 f"host {self.name}: ansible_managed_mode requires ansible_user"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_dormant_requires_deployable(self) -> Self:
+        if (
+            self.state == "dormant"
+            and self.ansible_user is None
+            and self.platform != "nixos"
+        ):
+            raise ValueError(
+                f"host {self.name}: state 'dormant' has no effect on a "
+                f"DNS-only host (no ansible_user, not platform: nixos); "
+                f"drop the state field"
             )
         return self
 
