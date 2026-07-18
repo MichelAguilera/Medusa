@@ -499,13 +499,15 @@ def nixos_deploy_plan(
 def list_stacks_cmd(
     root: Path | None = ROOT_OPTION,
 ) -> None:
-    """List rendered Compose stacks (Debian docker_hosts), one per line.
+    """List rendered Compose stacks, one per line.
 
     Tab-separated ``<stack>\\t<host>\\t<svc,svc,...>``. ``<stack>`` is the stack's
     path under generated/compose/ — the identity ``medusactl compose <verb>
     <stack>`` targets — falling back to the host name for a stackless service
     group. medusactl renders this for ``compose list`` and to surface valid
-    targets; NixOS hosts are excluded (they have no compose stacks). See T-082.
+    targets. Every platform's stacks are listed (T-087): NixOS hosts' stacks
+    deploy through the flake, but the interactive compose verbs resolve
+    stack->host from this output and reach them over SSH. See T-082.
     """
     paths = _paths(root)
     try:

@@ -4,6 +4,12 @@
 # then applies state=present with pull=always, so a moved 'latest' is fetched
 # and any container whose image digest changed is recreated. Scope to one
 # stack/service with medusa_compose_target / medusa_compose_service.
+- name: Refuse compose dispatch that would act on nothing
+  hosts: medusa_control
+  gather_facts: false
+  roles:
+    - compose_guard
+
 - name: Pull Compose stack images
   hosts: docker_hosts
   gather_facts: false

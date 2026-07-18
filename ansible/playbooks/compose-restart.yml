@@ -2,6 +2,12 @@
 # Restart Compose stacks (runtime op, like compose-stop.yml). Stages the current
 # stack files then asks compose v2 to restart. Scope to one stack/service with
 # medusa_compose_target / medusa_compose_service (T-082).
+- name: Refuse compose dispatch that would act on nothing
+  hosts: medusa_control
+  gather_facts: false
+  roles:
+    - compose_guard
+
 - name: Restart Compose stacks
   hosts: docker_hosts
   gather_facts: false

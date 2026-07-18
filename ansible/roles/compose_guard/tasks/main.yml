@@ -1,0 +1,61 @@
+---
+# Refuse compose dispatch that would act on nothing (T-092). ansible-playbook
+# exits 0 when a play matches zero hosts, so without this guard a compose verb
+# runs green while touching nothing whenever docker_hosts rendered empty or the
+# targeted stack's host was stripped from deploy dispatch (NixOS per T-074,
+# dormant per T-091). The compose role's own "matched no rendered stack" assert
+# cannot catch this: with zero hosts there is nowhere for it to fire. Runs on
+# the controller against the same stack->host manifest the compose role scopes
+# by, before any docker_hosts play.
+
+- name: Load the stack->host manifest
+  ansible.builtin.include_vars:
+    file: "{{ medusa_generated_dir }}/compose-stacks.yaml"
+    name: medusa_guard_manifest
+
+- name: Resolve the targeted stack to its owning hosts
+  ansible.builtin.set_fact:
+    medusa_guard_target_hosts: >-
+      {{ medusa_guard_manifest.stacks | default([])
+         | selectattr('stack', 'equalto', medusa_compose_target)
+         | map(attribute='host') | list }}
+  when: medusa_compose_target | default('') | length > 0
+
+- name: Fail when the target names no rendered stack
+  ansible.builtin.fail:
+    msg: >-
+      compose target '{{ medusa_compose_target }}' is not a rendered stack.
+      Run 'medusactl compose list' for valid names.
+  when:
+    - medusa_compose_target | default('') | length > 0
+    - medusa_guard_target_hosts | length == 0
+
+- name: Fail when every host owning the target is outside compose dispatch
+  ansible.builtin.fail:
+    msg: >-
+      compose target '{{ medusa_compose_target }}' lives on
+      {{ medusa_guard_target_hosts | join(', ') }} -- not in docker_hosts, so
+      this run would match zero hosts and report success while touching
+      nothing.
+      {% for host in medusa_guard_target_hosts %}{{ host }} is
+      {{ 'a NixOS host: its stacks deploy through the flake, and runtime
+      compose ops do not reach it yet (T-092)'
+         if host in groups['nixos_hosts'] | default([])
+         else 'dormant or not ansible-managed (T-091)' }}.
+      {% endfor %}
+  when:
+    - medusa_compose_target | default('') | length > 0
+    - medusa_guard_target_hosts | difference(groups['docker_hosts'] | default([]))
+      | length == medusa_guard_target_hosts | length
+
+- name: Fail when a fleet-wide run has no ansible compose hosts
+  ansible.builtin.fail:
+    msg: >-
+      docker_hosts rendered empty: every compose stack lives on a NixOS or
+      dormant host, so a fleet-wide compose run would match zero hosts and
+      report success while touching nothing. NixOS hosts' stacks deploy
+      through the flake ('medusactl deploy'); runtime compose ops for them
+      are T-092.
+  when:
+    - medusa_compose_target | default('') | length == 0
+    - groups['docker_hosts'] | default([]) | length == 0

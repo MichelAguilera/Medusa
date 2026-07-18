@@ -1,4 +1,10 @@
 ---
+- name: Refuse compose dispatch that would act on nothing
+  hosts: medusa_control
+  gather_facts: false
+  roles:
+    - compose_guard
+
 - name: Stop Compose stacks
   hosts: docker_hosts
   gather_facts: false
