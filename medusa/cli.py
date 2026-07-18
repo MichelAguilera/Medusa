@@ -501,13 +501,13 @@ def list_stacks_cmd(
 ) -> None:
     """List rendered Compose stacks, one per line.
 
-    Tab-separated ``<stack>\\t<host>\\t<svc,svc,...>``. ``<stack>`` is the stack's
-    path under generated/compose/ — the identity ``medusactl compose <verb>
-    <stack>`` targets — falling back to the host name for a stackless service
-    group. medusactl renders this for ``compose list`` and to surface valid
-    targets. Every platform's stacks are listed (T-087): NixOS hosts' stacks
-    deploy through the flake, but the interactive compose verbs resolve
-    stack->host from this output and reach them over SSH. See T-082.
+    Tab-separated ``<stack>\\t<host>\\t<svc,svc,...>\\t<platform>\\t<state>``.
+    ``<stack>`` is the stack's path under generated/compose/ — the identity
+    ``medusactl compose <verb> <stack>`` targets — falling back to the host
+    name for a stackless service group. Every platform's stacks are listed
+    (T-087): NixOS hosts' stacks deploy through the flake, and the compose
+    verbs resolve stack->host from this output to reach them over SSH; the
+    platform/state columns are what medusactl routes on (T-092). See T-082.
     """
     paths = _paths(root)
     try:
@@ -515,19 +515,22 @@ def list_stacks_cmd(
     except (ValidationError, ValueError, NotImplementedError) as error:
         _fail(str(error))
 
+    hosts_by_name = {host.name: host for host in loaded.dns_model.hosts}
     rows = sorted(
         (
             (
                 compose_file.stack or compose_file.host,
                 compose_file.host,
                 ",".join(sorted(service.name for service in compose_file.services)),
+                hosts_by_name[compose_file.host].platform,
+                "dormant" if hosts_by_name[compose_file.host].is_dormant else "active",
             )
             for compose_file in loaded.services_model.compose
         ),
         key=lambda row: (row[0], row[1]),
     )
-    for stack, host, services in rows:
-        typer.echo(f"{stack}\t{host}\t{services}")
+    for stack, host, services, platform, state in rows:
+        typer.echo(f"{stack}\t{host}\t{services}\t{platform}\t{state}")
 
 
 # --- Host inventory ops -----------------------------------------------------

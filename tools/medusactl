@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.22.0"
+VERSION="0.23.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1252,6 +1252,62 @@ EOF
     fi
 }
 
+# Fetch the rendered stack table from the controller: one tab-separated row
+# per stack, 'stack host services platform state'. The platform/state columns
+# are what the runtime-verb routing decides on (T-092); a controller release
+# that predates them emits three columns, and callers degrade to the legacy
+# ansible path (where compose_guard keeps zero-host runs loud). Used by
+# 'compose list' and by cmd_compose routing.
+fetch_stacks() {
+    local target
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
+    local remote
+    remote=$(cat <<'REMOTE'
+set -euo pipefail
+export PATH="$HOME/.local/bin:$PATH"
+cd "$MEDUSA_CONTROLLER_PATH"
+uv run --quiet medusa list-stacks
+REMOTE
+)
+    ssh "${ssh_opts[@]}" "$target" \
+        "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
+         MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory") \
+         MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets") \
+         bash -s" <<< "$remote"
+}
+
+# Non-interactive runtime verb on a NixOS-hosted stack (T-092). No ansible --
+# NixOS hosts are outside docker_hosts by design -- and no TTY; run_logged
+# captures the run like any other op. Path mirrors _compose_interactive:
+# workstation -> controller -> stack host (controller ~/.ssh/config alias) ->
+# 'sudo -Hu medusa docker compose' in the flake-materialized stack dir.
+# Verb mapping keeps parity with the ansible path: 'down' is compose 'stop'
+# (state=stopped), 'pull' is 'up -d --pull always' (state=present +
+# pull=always: fetch moved tags, recreate changed containers).
+_compose_runtime_direct() {
+    local action=$1 target_host=$2 stack=$3 service=${4:-}
+    local -a dcargs
+    case "$action" in
+        down)    dcargs=(stop) ;;
+        restart) dcargs=(restart) ;;
+        pull)    dcargs=(up -d --pull always) ;;
+        *) fail "compose: verb '$action' has no direct NixOS path" ;;
+    esac
+    [[ -n "$service" ]] && dcargs+=("$service")
+    local dc_quoted="" tok
+    for tok in "${dcargs[@]}"; do dc_quoted+=" $(printf %q "$tok")"; done
+    # $HOME stays LITERAL so it expands on the stack host, under the medusa
+    # runtime user, where medusa-stacks/<stack> lives (see _compose_interactive
+    # for the sudo -H rationale).
+    local inner="cd \"\$HOME/medusa-stacks/$(printf %q "$stack")\" && exec docker compose${dc_quoted}"
+    local hostcmd="sudo -Hu medusa bash -c $(printf %q "$inner")"
+    run_logged "compose-$action-${stack//\//-}" \
+        "ssh -o BatchMode=yes $(printf %q "$target_host") $(printf %q "$hostcmd")"
+}
+
 # Interactive compose passthrough (T-083). Runs `docker compose <verb>` on the
 # host a stack lives on, with the terminal attached end-to-end so streaming
 # (`logs -f`), Ctrl-C, and `exec -it` work. Path: workstation -tt-> controller
@@ -1352,13 +1408,24 @@ medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--check]
                   'deploy' only STAGES stack files (medusa_compose_apply=false);
                   these verbs actually change runtime state.
 
-Lifecycle verbs (ansible-routed, run on docker_hosts):
+Lifecycle verbs:
   up        Render, stage, and bring stacks to state=present (start containers).
+            Ansible-routed; refuses NixOS-hosted stacks ('up' is delivery, and
+            NixOS stacks deploy through the flake: 'medusactl deploy').
   down      Bring stacks to state=stopped.
   restart   Restart stacks (compose v2 'restarted').
   pull      Pull newer images and recreate changed containers (state=present,
             pull=always). 'compose up <stack> --pull' is the same for one stack.
-  list      Print the rendered stacks (stack / host / services) and exit.
+  list      Print the rendered stacks (stack / host / services / platform /
+            state) and exit.
+
+Runtime routing (T-092): down/restart/pull resolve the stack on the controller
+first. A stack on an active NixOS host runs 'docker compose' there directly
+over SSH (down->stop, restart->restart, pull->up -d --pull always) -- no
+ansible, no clean-tree requirement, works mid-edit. Debian-hosted stacks keep
+the legacy ansible path (frozen; see architecture-decisions, "New work is
+NixOS-native only"). Fleet-wide runs cover every active NixOS stack and then
+any debian stacks; dormant hosts' stacks are skipped with a notice.
 
 Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
   logs      Stream a stack's logs (pass -f to follow, via -- ).
@@ -1370,10 +1437,12 @@ Targeting:
                      generated/compose/, e.g. 'media/immich'); omit for all.
                      Interactive verbs REQUIRE a <stack>. 'compose list' lists names.
   --service <name>   Act on one service within the stack (REQUIRED for exec).
-  --host <pattern>   Lifecycle: limit to docker hosts matching an Ansible pattern.
+  --host <pattern>   Lifecycle: limit to docker hosts matching an Ansible pattern
+                     (direct NixOS path: exact host name).
                      Interactive: the host a stack lives on, when it is on >1 host.
   --pull             (up only) force an image re-pull on apply.
-  --check            (lifecycle only) dry run (ansible --check --diff).
+  --check            (lifecycle only) dry run (ansible --check --diff); not
+                     supported on the direct NixOS path.
   -- <args...>       (interactive only) forward args verbatim to 'docker compose'.
 
 The Docker engine is a Tier-2 dependency Medusa owns; the docker_engine role
@@ -1404,28 +1473,12 @@ EOF
     # straight from the normalized model (no render needed); we read the
     # controller's current inventory without a pull, so it's a fast plain read.
     if [[ "$action" == "list" ]]; then
-        [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]] || { echo "medusactl compose list — print rendered stacks (stack / host / services)."; return 0; }
+        [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]] || { echo "medusactl compose list — print rendered stacks (stack / host / services / platform / state)."; return 0; }
         [[ $# -eq 0 ]] || fail "compose list: unexpected argument '$1'"
-        local target out
-        local -a ssh_opts
-        target=$(ssh_target)
-        mapfile -t ssh_opts < <(ssh_base_opts)
-        [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
-        local remote
-        remote=$(cat <<'REMOTE'
-set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-cd "$MEDUSA_CONTROLLER_PATH"
-uv run --quiet medusa list-stacks
-REMOTE
-)
-        out=$(ssh "${ssh_opts[@]}" "$target" \
-            "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
-             MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory") \
-             MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets") \
-             bash -s" <<< "$remote") \
+        local out
+        out=$(fetch_stacks) \
             || fail "compose list: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
-        { printf 'STACK\tHOST\tSERVICES\n'; printf '%s\n' "$out"; } \
+        { printf 'STACK\tHOST\tSERVICES\tPLATFORM\tSTATE\n'; printf '%s\n' "$out"; } \
             | { column -t -s "$(printf '\t')" 2>/dev/null || cat; }
         return 0
     fi
@@ -1467,6 +1520,69 @@ REMOTE
     [[ -z "$service" || -n "$stack" ]] || fail "compose: --service requires a [stack] target"
     [[ "$pull" -eq 0 || "$action" == "up" ]] || fail "compose: --pull is only valid with 'up' (use the 'pull' verb otherwise)"
 
+    # NixOS-native routing (T-092): resolve the target against the controller's
+    # stack table BEFORE dispatch. A stack on an active NixOS host takes the
+    # direct SSH path -- the ansible plays never reach it (nixos hosts are
+    # stripped from docker_hosts) -- and debian stacks fall through to the
+    # legacy ansible path, which stays frozen (architecture-decisions, "New
+    # work is NixOS-native only"). Rows missing the platform column (controller
+    # release predates it) fall through wholesale; compose_guard keeps any
+    # zero-host run loud.
+    local stacks_tsv direct_failures=0
+    stacks_tsv=$(fetch_stacks) \
+        || fail "compose $action: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
+    if [[ -n "$stack" ]]; then
+        local matches
+        matches=$(awk -F'\t' -v s="$stack" '$1==s' <<<"$stacks_tsv")
+        [[ -n "$matches" ]] || fail "compose $action: stack '$stack' not found on any host (run 'medusactl compose list')"
+        if [[ -n "$host" ]]; then
+            matches=$(awk -F'\t' -v h="$host" '$2==h' <<<"$matches")
+            [[ -n "$matches" ]] || fail "compose $action: stack '$stack' is not on host '$host' (run 'medusactl compose list')"
+        fi
+        if [[ $(wc -l <<<"$matches") -gt 1 ]]; then
+            fail "compose $action: stack '$stack' is on multiple hosts; pass --host <name>:
+$(awk -F'\t' '{print "  " $2}' <<<"$matches")"
+        fi
+        local row_host row_platform row_state
+        IFS=$'\t' read -r _ row_host _ row_platform row_state <<<"$matches"
+        if [[ "$row_platform" == "nixos" ]]; then
+            [[ "$row_state" != "dormant" ]] || fail "compose $action: '$stack' is on '$row_host', which is declared dormant (T-091); wake it in dns.yaml first"
+            [[ "$action" != "up" ]] || fail "compose up: '$stack' is on NixOS host '$row_host' -- 'up' is delivery, and NixOS stacks deploy through the flake (run 'medusactl deploy', or 'medusactl nixos-apply --limit $row_host')"
+            [[ -z "$check" ]] || fail "compose $action: --check is not supported on the direct NixOS path"
+            _compose_runtime_direct "$action" "$row_host" "$stack" "$service"
+            return $?
+        fi
+    elif [[ "$action" != "up" ]]; then
+        # Fleet-wide runtime verb: every active NixOS-hosted stack over the
+        # direct path first, then the legacy ansible path if any debian stacks
+        # remain. Dormant hosts' stacks are declared downtime (T-091): skipped
+        # with a notice, never an error.
+        local nixos_rows legacy_rows dormant_rows
+        nixos_rows=$(awk -F'\t' '$4=="nixos" && $5!="dormant"' <<<"$stacks_tsv")
+        legacy_rows=$(awk -F'\t' '$4!="" && $4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
+        dormant_rows=$(awk -F'\t' '$5=="dormant"' <<<"$stacks_tsv")
+        if [[ -n "$dormant_rows" ]]; then
+            local d_stack d_host d_rest
+            while IFS=$'\t' read -r d_stack d_host d_rest; do
+                info "skipping $d_stack ($d_host is dormant)"
+            done <<<"$dormant_rows"
+        fi
+        if [[ -n "$nixos_rows" ]]; then
+            local n_stack n_host n_rest
+            while IFS=$'\t' read -r n_stack n_host n_rest; do
+                # </dev/null: run_logged's inner ssh must not eat the rows
+                # this loop is still reading from its own stdin.
+                _compose_runtime_direct "$action" "$n_host" "$n_stack" "" </dev/null \
+                    || direct_failures=$((direct_failures + 1))
+            done <<<"$nixos_rows"
+            if [[ -z "$legacy_rows" ]]; then
+                [[ "$direct_failures" -eq 0 ]] \
+                    || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
+                return 0
+            fi
+        fi
+    fi
+
     # Mutating verbs (up/restart/pull) follow the deploy clean-tree discipline;
     # 'down' is a runtime stop and must work even mid-edit.
     [[ "$mutating" -eq 1 ]] && require_clean_for_deploy
@@ -1482,7 +1598,10 @@ REMOTE
     [[ -n "$host" ]] && limit=" --limit 'medusa_control:${host}'"
 
     run_logged "compose-$action" \
-        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check$extra$limit"
+        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check$extra$limit" \
+        || return 1
+    [[ "$direct_failures" -eq 0 ]] \
+        || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
 }
 
 cmd_controller_apply() {
