@@ -539,9 +539,12 @@ def normalize_nixos(
     # bind them relatively (./traefik/dynamic, ./homepage/config) -- so they
     # stage into the stack tree; the prometheus targets file mirrors the
     # Debian medusa_deploy_root destination (/home/medusa/medusa/monitoring)
-    # via the host's deploy-src tree. Host derivations mirror the
-    # ansible-groups builder (service NAME, the convention the Debian plays
-    # target), so a host migrating platforms keeps the same delivery set.
+    # via the host's deploy-src tree. When the host runs a prometheus service
+    # in a stack, the main config plus a targets copy ALSO stage into that
+    # stack's tree (./prometheus) so the container needs no deploy-root mount
+    # and no hand-seeded config. Host derivations mirror the ansible-groups
+    # builder (service NAME, the convention the Debian plays target), so a
+    # host migrating platforms keeps the same delivery set.
     def _stack_with_service(host_name: str, service_name: str) -> str:
         for stack in stacks_by_host.get(host_name, ()):
             if any(
@@ -591,6 +594,35 @@ def normalize_nixos(
                     dest="monitoring/prometheus-targets.yaml",
                 )
             )
+            # Unlike traefik/homepage this is not an error when absent:
+            # a grafana-only monitoring host has no consumer for the
+            # prometheus main config.
+            prometheus_stack = next(
+                (
+                    stack.name
+                    for stack in stacks_by_host.get(host_name, ())
+                    if any(
+                        service.name == "prometheus"
+                        for service in stack.compose_file.services
+                    )
+                ),
+                None,
+            )
+            if prometheus_stack is not None:
+                stack_configs.setdefault(
+                    (host_name, prometheus_stack), []
+                ).extend(
+                    [
+                        NixosStagedConfig(
+                            source=f"monitoring/{host_name}/prometheus.yml",
+                            dest="prometheus/prometheus.yml",
+                        ),
+                        NixosStagedConfig(
+                            source=f"monitoring/{host_name}/prometheus-targets.yaml",
+                            dest="prometheus/prometheus-targets.yaml",
+                        ),
+                    ]
+                )
     for (host_name, stack_name), configs in stack_configs.items():
         stacks_by_host[host_name] = [
             (

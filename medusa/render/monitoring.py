@@ -9,13 +9,20 @@ def render_monitoring(
     templates_dir: Path,
     generated_dir: Path,
 ) -> dict[Path, str]:
-    return {
-        generated_dir / "monitoring" / host / "prometheus-targets.yaml": (
+    files: dict[Path, str] = {}
+    for host in monitoring_model.hosts:
+        files[
+            generated_dir / "monitoring" / host / "prometheus-targets.yaml"
+        ] = render_template(
+            templates_dir,
+            "monitoring/prometheus-targets.yaml.j2",
+            {"monitoring": monitoring_model},
+        )
+        files[generated_dir / "monitoring" / host / "prometheus.yml"] = (
             render_template(
                 templates_dir,
-                "monitoring/prometheus-targets.yaml.j2",
+                "monitoring/prometheus.yml.j2",
                 {"monitoring": monitoring_model},
             )
         )
-        for host in monitoring_model.hosts
-    }
+    return files

@@ -1285,12 +1285,17 @@ REMOTE
 # workstation -> controller -> stack host (controller ~/.ssh/config alias) ->
 # 'sudo -Hu medusa docker compose' in the flake-materialized stack dir.
 # Verb mapping keeps parity with the ansible path: 'down' is compose 'stop'
-# (state=stopped), 'pull' is 'up -d --pull always' (state=present +
-# pull=always: fetch moved tags, recreate changed containers).
+# (state=stopped), 'up' is 'up -d' (state=present against the stack dir the
+# flake last materialized -- a runtime start, NOT delivery: on NixOS the
+# compose file only changes via nixos-apply, so 'up' here can only reconcile
+# containers to the delivered generation, e.g. revive a stack parked by
+# 'down'), 'pull' is 'up -d --pull always' (state=present + pull=always:
+# fetch moved tags, recreate changed containers).
 _compose_runtime_direct() {
     local action=$1 target_host=$2 stack=$3 service=${4:-}
     local -a dcargs
     case "$action" in
+        up)      dcargs=(up -d) ;;
         down)    dcargs=(stop) ;;
         restart) dcargs=(restart) ;;
         pull)    dcargs=(up -d --pull always) ;;
@@ -1409,9 +1414,12 @@ medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--check]
                   these verbs actually change runtime state.
 
 Lifecycle verbs:
-  up        Render, stage, and bring stacks to state=present (start containers).
-            Ansible-routed; refuses NixOS-hosted stacks ('up' is delivery, and
-            NixOS stacks deploy through the flake: 'medusactl deploy').
+  up        Bring stacks to state=present (start containers). On NixOS hosts
+            this is a RUNTIME start of the flake-materialized generation --
+            the inverse of 'down', e.g. to revive a parked stack; it does NOT
+            deliver config edits (that stays 'medusactl deploy' /
+            'nixos-apply'). On debian hosts it renders, stages, and applies
+            (ansible-routed delivery).
   down      Bring stacks to state=stopped.
   restart   Restart stacks (compose v2 'restarted').
   pull      Pull newer images and recreate changed containers (state=present,
@@ -1419,13 +1427,14 @@ Lifecycle verbs:
   list      Print the rendered stacks (stack / host / services / platform /
             state) and exit.
 
-Runtime routing (T-092): down/restart/pull resolve the stack on the controller
-first. A stack on an active NixOS host runs 'docker compose' there directly
-over SSH (down->stop, restart->restart, pull->up -d --pull always) -- no
-ansible, no clean-tree requirement, works mid-edit. Debian-hosted stacks keep
-the legacy ansible path (frozen; see architecture-decisions, "New work is
-NixOS-native only"). Fleet-wide runs cover every active NixOS stack and then
-any debian stacks; dormant hosts' stacks are skipped with a notice.
+Runtime routing (T-092): up/down/restart/pull resolve the stack on the
+controller first. A stack on an active NixOS host runs 'docker compose' there
+directly over SSH (up->up -d, down->stop, restart->restart, pull->up -d
+--pull always) -- no ansible, no clean-tree requirement, works mid-edit.
+Debian-hosted stacks keep the legacy ansible path (frozen; see
+architecture-decisions, "New work is NixOS-native only"). Fleet-wide runs
+cover every active NixOS stack and then any debian stacks; dormant hosts'
+stacks are skipped with a notice.
 
 Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
   logs      Stream a stack's logs (pass -f to follow, via -- ).
@@ -1520,6 +1529,12 @@ EOF
     [[ -z "$service" || -n "$stack" ]] || fail "compose: --service requires a [stack] target"
     [[ "$pull" -eq 0 || "$action" == "up" ]] || fail "compose: --pull is only valid with 'up' (use the 'pull' verb otherwise)"
 
+    # On the direct NixOS path 'up --pull' and the 'pull' verb are the same
+    # docker command (up -d --pull always); fold them so _compose_runtime_direct
+    # keeps a closed verb set.
+    local direct_action=$action
+    [[ "$action" == "up" && "$pull" -eq 1 ]] && direct_action=pull
+
     # NixOS-native routing (T-092): resolve the target against the controller's
     # stack table BEFORE dispatch. A stack on an active NixOS host takes the
     # direct SSH path -- the ansible plays never reach it (nixos hosts are
@@ -1547,16 +1562,18 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
         IFS=$'\t' read -r _ row_host _ row_platform row_state <<<"$matches"
         if [[ "$row_platform" == "nixos" ]]; then
             [[ "$row_state" != "dormant" ]] || fail "compose $action: '$stack' is on '$row_host', which is declared dormant (T-091); wake it in dns.yaml first"
-            [[ "$action" != "up" ]] || fail "compose up: '$stack' is on NixOS host '$row_host' -- 'up' is delivery, and NixOS stacks deploy through the flake (run 'medusactl deploy', or 'medusactl nixos-apply --limit $row_host')"
             [[ -z "$check" ]] || fail "compose $action: --check is not supported on the direct NixOS path"
-            _compose_runtime_direct "$action" "$row_host" "$stack" "$service"
+            [[ "$action" != "up" ]] || info "nixos: starting '$stack' from the materialized generation (runtime only; config changes deliver via 'medusactl deploy')"
+            _compose_runtime_direct "$direct_action" "$row_host" "$stack" "$service"
             return $?
         fi
-    elif [[ "$action" != "up" ]]; then
-        # Fleet-wide runtime verb: every active NixOS-hosted stack over the
-        # direct path first, then the legacy ansible path if any debian stacks
-        # remain. Dormant hosts' stacks are declared downtime (T-091): skipped
-        # with a notice, never an error.
+    else
+        # Fleet-wide runtime verb (up included: NixOS hosts are stripped from
+        # docker_hosts, so before the direct path a fleet 'up' silently skipped
+        # them): every active NixOS-hosted stack over the direct path first,
+        # then the legacy ansible path if any debian stacks remain. Dormant
+        # hosts' stacks are declared downtime (T-091): skipped with a notice,
+        # never an error.
         local nixos_rows legacy_rows dormant_rows
         nixos_rows=$(awk -F'\t' '$4=="nixos" && $5!="dormant"' <<<"$stacks_tsv")
         legacy_rows=$(awk -F'\t' '$4!="" && $4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
@@ -1572,7 +1589,7 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
             while IFS=$'\t' read -r n_stack n_host n_rest; do
                 # </dev/null: run_logged's inner ssh must not eat the rows
                 # this loop is still reading from its own stdin.
-                _compose_runtime_direct "$action" "$n_host" "$n_stack" "" </dev/null \
+                _compose_runtime_direct "$direct_action" "$n_host" "$n_stack" "" </dev/null \
                     || direct_failures=$((direct_failures + 1))
             done <<<"$nixos_rows"
             if [[ -z "$legacy_rows" ]]; then
