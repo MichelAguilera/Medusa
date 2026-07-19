@@ -194,7 +194,12 @@
     "L+ /usr/local/lib/docker/cli-plugins/docker-compose - - - - ${pkgs.docker-compose}/bin/docker-compose"
 {% for d in host.data_dirs %}
     # Bind-mount data dir owned before compose up (Debian role parity, T-065).
+    # The z line repairs ownership on an EXISTING dir: docker creates missing
+    # bind sources root-owned when a stack unit races ahead of tmpfiles, and
+    # a d line alone never fixes that afterwards (non-recursive on purpose --
+    # the container owns what it writes beneath).
     "d /home/medusa/medusa-stacks/{{ d.path }} 0755 {{ d.owner }} {{ d.group }} -"
+    "z /home/medusa/medusa-stacks/{{ d.path }} 0755 {{ d.owner }} {{ d.group }} -"
 {% endfor %}
 {% endif %}
   ];
