@@ -18,11 +18,20 @@
   time.timeZone = "{{ host.timezone }}";
 {% endif %}
 {% if host.boot_loader %}
+{% if host.boot_bios_device %}
+
+  # Legacy-BIOS boot via GRUB on the raw disk -- this firmware has no UEFI
+  # (cheap KVM VPSes, T-094). The disko layout carries an EF02 BIOS-boot
+  # partition instead of an ESP.
+  boot.loader.grub.enable = true;
+  boot.loader.grub.devices = [ "{{ host.boot_bios_device }}" ];
+{% else %}
 
   # UEFI boot via systemd-boot; the ESP is the disko-managed /boot partition.
   # Omitted for lxc guests, which boot from the host kernel (T-078).
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = true;
+{% endif %}
 {% endif %}
 
   services.openssh = {

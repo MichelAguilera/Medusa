@@ -243,10 +243,15 @@ class NixosHost(BaseModel):
     # hypervisor can read the guest IP and shut it down gracefully; false for
     # lxc/physical. Derived from the host's nixos_guest. See T-078.
     qemu_guest_agent: bool
-    # Whether to emit a systemd-boot bootloader (UEFI). True for vm/physical
-    # guests that own a real disk; false for lxc (a container boots from the host
-    # kernel, no bootloader). Derived from nixos_guest. See T-078.
+    # Whether to emit a bootloader at all. True for vm/physical guests that own
+    # a real disk; false for lxc (a container boots from the host kernel, no
+    # bootloader). Derived from nixos_guest. See T-078.
     boot_loader: bool
+    # Legacy-BIOS variant (T-094): the raw disk GRUB installs to (e.g.
+    # /dev/vda) on firmware with no UEFI. None -> systemd-boot/EFI as before.
+    # Only meaningful when boot_loader is true; carried from the host record's
+    # nixos_boot_device.
+    boot_bios_device: str | None
     # system.stateVersion -- the release this host was installed with, pinned for
     # life. See T-078.
     state_version: str

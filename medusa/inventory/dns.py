@@ -256,6 +256,16 @@ class HostInventory(BaseModel):
     # keys are not secret. Without at least one, `nixos-rebuild --target-host`
     # cannot authenticate, so a deployable nixos host needs one. nixos-only.
     nixos_admin_keys: list[str] = Field(default_factory=list)
+    # Legacy-BIOS boot (T-094): the raw disk GRUB installs to (e.g. /dev/vda).
+    # Set on hosts whose firmware has no UEFI -- cheap KVM VPSes like RackNerd,
+    # where the T-078 systemd-boot/EFI branch would render an unbootable
+    # system. Set -> the host module emits boot.loader.grub on this device
+    # instead of systemd-boot, and the operator's disko layout must carry an
+    # EF02 BIOS-boot partition instead of an ESP. Unset -> UEFI as before.
+    # Explicit device rather than inferred from disko's EF02 auto-wiring: one
+    # less implicit dependency on disko internals. nixos-only; meaningless on
+    # lxc (a container boots from the host kernel, no bootloader at all).
+    nixos_boot_device: str | None = None
     # NixOS `system.stateVersion` for this host -- the release it was first
     # installed with. Pinned at install and NEVER bumped on upgrade (it guards
     # stateful defaults), so it is host data, not derived from the flake's
@@ -395,6 +405,23 @@ class HostInventory(BaseModel):
                 raise ValueError(
                     f"host {self.name}: nixos_state_version requires platform: "
                     f"nixos"
+                )
+            if self.nixos_boot_device is not None:
+                raise ValueError(
+                    f"host {self.name}: nixos_boot_device requires platform: "
+                    f"nixos"
+                )
+        if self.nixos_boot_device is not None:
+            if self.nixos_guest == "lxc":
+                raise ValueError(
+                    f"host {self.name}: nixos_boot_device cannot apply to an "
+                    f"lxc guest -- a container boots from the host kernel, "
+                    f"no bootloader"
+                )
+            if not self.nixos_boot_device.startswith("/dev/"):
+                raise ValueError(
+                    f"host {self.name}: nixos_boot_device must be an absolute "
+                    f"/dev path (got {self.nixos_boot_device!r})"
                 )
         if self.nixos_disko and self.nixos_guest == "lxc":
             raise ValueError(

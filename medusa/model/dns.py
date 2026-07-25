@@ -90,6 +90,9 @@ class HostRecord(BaseModel):
     # Whether render stages an operator-authored disko config for this host's
     # nixos-anywhere bootstrap. See T-078.
     nixos_disko: bool = False
+    # Legacy-BIOS GRUB install disk (e.g. /dev/vda) for firmware with no UEFI;
+    # None -> the systemd-boot/EFI branch. Carried verbatim. See T-094.
+    nixos_boot_device: str | None = None
     # Admin/deploy SSH public keys for the nixos deploy user. Plain data (public
     # keys are not secret). See T-078.
     nixos_admin_keys: tuple[str, ...] = ()
