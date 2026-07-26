@@ -128,6 +128,11 @@
     group = "medusa";
     extraGroups = [ "docker" ];
     home = "/home/medusa";
+    # Traversable (not listable) by others: the stacks tree beneath is
+    # deliberately world-readable (2775 dirs / 0664 files, env/ excepted at
+    # 2770) but the NixOS default homeMode of 700 walled it off from the
+    # non-root admin user.
+    homeMode = "751";
   };
 {% endif %}
 {% if host.egress_gateway %}
