@@ -362,7 +362,7 @@
       after = [ "docker.service" "medusa-stacks-sync.service" "network-online.target" "remote-fs.target"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %}{% if host.tunnel %} "medusa-tunnel-firewall.service" "medusa-tunnel-routes.service"{% endif %} ];
       requires = [ "docker.service" "medusa-stacks-sync.service"{% if host.staged_secrets %} "medusa-secrets.service"{% endif %}{% if host.tunnel %} "medusa-tunnel-firewall.service" "medusa-tunnel-routes.service"{% endif %} ];
       wants = [ "network-online.target" ];
-      restartTriggers = [ ../stacks/{{ stack.name }} ];
+      restartTriggers = [ ../stacks/{{ host.name }}/{{ stack.name }} ];
       # Runs as medusa (docker group) -- the same identity that runs compose on
       # Debian; deploy users never get docker-group (root-equivalent) access.
       serviceConfig = {
