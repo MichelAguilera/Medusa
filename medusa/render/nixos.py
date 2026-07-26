@@ -17,10 +17,13 @@ def render_nixos(
     - ``generated/nixos/hosts/<host>.nix`` -- the per-host module: hostname,
       systemd-networkd, storage ``fileSystems``, the compose substrate (docker,
       medusa user, sync + per-stack units), and the medusa-secrets unit.
-    - ``generated/nixos/stacks/<stack>/…`` -- the host's compose stacks staged
-      into the flake tree (T-087). Content is formatted with the SAME compose
-      templates/helpers the Debian path uses, from the same models -- compose
-      is the platform-neutral container layer; only the delivery differs.
+    - ``generated/nixos/stacks/<host>/<stack>/…`` -- the host's compose stacks
+      staged into the flake tree (T-087). Content is formatted with the SAME
+      compose templates/helpers the Debian path uses, from the same models --
+      compose is the platform-neutral container layer; only the delivery
+      differs. Host-keyed because stack NAMES repeat across hosts (three
+      hosts run an ``infrastructure`` stack); a name-keyed tree lets the
+      last-rendered host clobber the others' staging.
     - ``generated/nixos/secrets-enc/…`` -- ciphertext staged verbatim
       (store-safe; decrypted on the host by medusa-secrets, the T-080 seam).
     - ``generated/nixos/disko/<host>.nix`` -- for hosts that opt into disko
@@ -55,7 +58,7 @@ def render_nixos(
                 host.disko_source
             )
         for stack in host.stacks:
-            stack_dir = generated_dir / "nixos" / "stacks" / stack.name
+            stack_dir = generated_dir / "nixos" / "stacks" / host.name / stack.name
             files[stack_dir / "docker-compose.yml"] = _render_compose_file(
                 stack.compose_file, templates_dir
             )
@@ -80,7 +83,7 @@ def stage_nixos_configs(
     names its source under ``generated/`` (the exact artifact the Debian role
     ships) and the bytes are copied from the dict entry -- byte-identical to
     the Debian delivery by construction, never re-rendered. Stack configs land
-    inside ``generated/nixos/stacks/<stack>/`` where the existing etc staging,
+    inside ``generated/nixos/stacks/<host>/<stack>/`` where the existing etc staging,
     sync unit, and restart triggers already cover them; deploy configs land in
     ``generated/nixos/deploy/<host>/`` for the host module's deploy-src block."""
     for host in model.hosts:
@@ -94,7 +97,12 @@ def stage_nixos_configs(
                         f"render disagree about this host's delivery set"
                     )
                 files[
-                    generated_dir / "nixos" / "stacks" / stack.name / config.dest
+                    generated_dir
+                    / "nixos"
+                    / "stacks"
+                    / host.name
+                    / stack.name
+                    / config.dest
                 ] = files[source]
         for config in host.deploy_configs:
             source = generated_dir / config.source

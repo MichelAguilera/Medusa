@@ -100,7 +100,7 @@ class NixosStack(BaseModel):
     The stack's compose file and managed env files are the SAME platform-neutral
     models the Debian compose renderer consumes; ``render_nixos`` formats them
     with the same templates and stages the results into the flake tree
-    (``generated/nixos/stacks/<name>/``). On the host, the ``medusa-stacks-sync``
+    (``generated/nixos/stacks/<host>/<name>/``). On the host, the ``medusa-stacks-sync``
     unit materializes the staged tree into the writable Debian-identical stacks
     root (``/home/medusa/medusa-stacks/<name>``) and a per-stack systemd unit
     runs compose up against it. ``unit_suffix`` is the stack name made

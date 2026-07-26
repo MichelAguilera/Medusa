@@ -176,7 +176,7 @@
     "coredns/lan.hosts".source = ../coredns/lan.hosts;
 {% endif %}
 {% for stack in host.stacks %}
-    "medusa-stacks-src/{{ stack.name }}".source = ../stacks/{{ stack.name }};
+    "medusa-stacks-src/{{ stack.name }}".source = ../stacks/{{ host.name }}/{{ stack.name }};
 {% endfor %}
 {% for staged in host.staged_secrets %}
     "medusa-secrets-enc/{{ staged.staged }}".source = ../secrets-enc/{{ staged.staged }};
@@ -326,7 +326,7 @@
     medusa-stacks-sync = {
       description = "Materialize Medusa compose stacks from the generation";
       wantedBy = [ "multi-user.target" ];
-      restartTriggers = [{% for stack in host.stacks %} ../stacks/{{ stack.name }}{% endfor %}{% if host.deploy_configs %} ../deploy/{{ host.name }}{% endif %} ];
+      restartTriggers = [{% for stack in host.stacks %} ../stacks/{{ host.name }}/{{ stack.name }}{% endfor %}{% if host.deploy_configs %} ../deploy/{{ host.name }}{% endif %} ];
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
