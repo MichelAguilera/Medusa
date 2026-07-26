@@ -450,10 +450,16 @@ def normalize_nixos(
         )
 
     stacks_by_host: dict[str, list[NixosStack]] = {}
-    env_by_stack: dict[str, list] = {}
+    # Keyed by (host, stack), NOT stack name alone: stack names repeat across
+    # hosts (three fleet hosts run an `infrastructure` stack), and a name-only
+    # key would hand every host the union of same-named stacks' env files --
+    # including another host's values for a file both stacks declare.
+    env_by_stack: dict[tuple[str, str], list] = {}
     for env_file in services_model.env_files:
         if env_file.stack is not None:
-            env_by_stack.setdefault(env_file.stack, []).append(env_file)
+            env_by_stack.setdefault(
+                (env_file.host, env_file.stack), []
+            ).append(env_file)
     for compose_file in services_model.compose:
         if compose_file.host not in nixos_names:
             continue
@@ -472,7 +478,9 @@ def normalize_nixos(
                 compose_file=compose_file,
                 env_files=tuple(
                     sorted(
-                        env_by_stack.get(compose_file.stack, ()),
+                        env_by_stack.get(
+                            (compose_file.host, compose_file.stack), ()
+                        ),
                         key=lambda item: item.path,
                     )
                 ),
