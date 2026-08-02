@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.23.0"
+VERSION="0.24.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1867,7 +1867,7 @@ while IFS=$'\t' read -r host target; do
     if ! nixos-rebuild "$ACTION" \
         --flake "$MEDUSA_GENERATED_DIR/nixos#$host" \
         --target-host "$target" \
-        --use-remote-sudo < /dev/null; then
+        --elevate=sudo < /dev/null; then
         echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
         rc=1
     fi
@@ -1912,7 +1912,7 @@ cmd_nixos_apply() {
 medusactl nixos-apply [--check] [--limit <pattern>] — reconcile NixOS hosts.
 
 Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
---target-host <user@endpoint> --use-remote-sudo' on the controller for every
+--target-host <user@endpoint> --elevate=sudo' on the controller for every
 NixOS host in the fleet (the 'medusa nixos-deploy-plan' partition). A no-op on
 an all-Debian fleet. 'medusactl deploy' runs this automatically after the
 Debian deploy; use this command to reconcile NixOS hosts on their own.

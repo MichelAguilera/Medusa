@@ -50,7 +50,7 @@
     extraGroups = [ "wheel" ];
     openssh.authorizedKeys.keys = [{% for key in host.admin_keys %} "{{ key }}"{% endfor %} ];
   };
-  # Passwordless sudo so `nixos-rebuild --use-remote-sudo` activates without a
+  # Passwordless sudo so `nixos-rebuild --elevate=sudo` activates without a
   # prompt.
   security.sudo.wheelNeedsPassword = false;
   # A non-root deploy target must be nix-trusted or the daemon refuses the
