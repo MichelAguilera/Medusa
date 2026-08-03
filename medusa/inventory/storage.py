@@ -14,11 +14,9 @@ class NfsExportInventory(BaseModel):
         default_factory=lambda: ["rw", "sync", "no_subtree_check", "no_root_squash"]
     )
     # Declared ownership of the export directory itself (T-085). The
-    # nfs_exports role applies this on every deploy, so deploys CONVERGE to the
-    # declared state -- an export consumed by an sftp user (uid) or shared
-    # space (gid + setgid) declares it here instead of relying on a manual
-    # chown that the next deploy would clobber. Defaults preserve the
-    # historical behavior (ansible-owned, 0755).
+    # nfs_exports role applies this on every deploy, so deploys CONVERGE to
+    # the declared state -- a manual chown would be clobbered. Defaults =
+    # ansible-owned, 0755.
     owner: int = 1000
     group: int = 1000
     mode: str = "0755"

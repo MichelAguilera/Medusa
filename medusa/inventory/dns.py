@@ -9,11 +9,9 @@ class ZoneInventory(BaseModel):
 
     name: str
     upstreams: list[str] = Field(default_factory=list)
-    # CoreDNS forward transport for this zone's upstreams. "udp" is the
-    # historical default; "dot" switches to DNS-over-TLS (tcp/853) and
-    # requires forwarder_tls_servername for cert validation. Operators
-    # flip to dot when an upstream path is hijacked by an ISP or router
-    # that rewrites/drops plain UDP/53 queries.
+    # CoreDNS forward transport for this zone's upstreams. "dot" switches to
+    # DNS-over-TLS (tcp/853) and requires forwarder_tls_servername for cert
+    # validation.
     forwarder_mode: Literal["udp", "dot"] = "udp"
     forwarder_tls_servername: str | None = None
 
@@ -180,12 +178,10 @@ class HostInventory(BaseModel):
 
     name: str
     ip: IPv4Address | IPv6Address
-    # Temporary cutover address used in the controller's /etc/hosts
-    # bootstrap block when real DNS does not yet resolve this host
-    # (e.g. host still on a DHCP lease, CoreDNS not yet authoritative
-    # for the zone). When unset, the host is assumed to be reachable
-    # via DNS and is NOT seeded into /etc/hosts. Clear with
-    # `medusa promote-host` once DNS is live for this host.
+    # Temporary cutover address used in the controller's /etc/hosts bootstrap
+    # block when real DNS does not yet resolve this host. When unset, the host
+    # is NOT seeded into /etc/hosts. Clear with `medusa promote-host` once DNS
+    # is live.
     bootstrap_ip: IPv4Address | IPv6Address | None = None
     zones: list[str] = Field(min_length=1)
     aliases: list[str] = Field(default_factory=list)
@@ -195,97 +191,68 @@ class HostInventory(BaseModel):
     # ansible_user) are skipped by the ansible inventory renderer.
     ansible_user: str | None = None
     ansible_groups: list[str] = Field(default_factory=list)
-    # When ansible_user is set, distinguishes how much access medusa has to
-    # the host. "full" = medusa-built template (root SSH prep + hardening
-    # audit allowed). "limited" = pre-existing/baremetal host (no prep, no
-    # root-SSH audit). When omitted on a managed host, normalize defaults to
-    # "limited" because "full" can run destructive prep flows and must be
+    # How much access medusa has to the host: "full" = medusa-built template
+    # (root SSH prep + hardening audit allowed); "limited" = pre-existing/
+    # baremetal (no prep, no root-SSH audit). When omitted, normalize defaults
+    # to "limited" because "full" can run destructive prep flows and must be
     # deliberate. DNS-only hosts (no ansible_user) must leave this unset.
     ansible_managed_mode: Literal["full", "limited"] | None = None
-    # Opt-in to Medusa-managed static networking. When true, Medusa renders
-    # and (in a later stage) applies a static config pinning this host's NIC
-    # to its canonical `ip`. Default false: hosts are NEVER touched unless
-    # opted in, which keeps Proxmox bridge networking and any baremetal host
-    # off-limits by default. See T-055.
+    # Opt-in to Medusa-managed static networking (T-055). Default false:
+    # hosts are NEVER touched unless opted in, keeping Proxmox bridge
+    # networking and baremetal hosts off-limits by default.
     manage_network: bool = False
     # Per-host static-networking override. Fields left unset fall back to the
     # global `network:` defaults. Only meaningful when manage_network is true.
     network: NetworkConfig | None = None
-    # Opt-in to a CoreDNS wildcard (subdomain catch-all) for this host.
-    # When true, `*.<name>.<zone>` resolves to the host's own IP via a
-    # `rewrite stop` block, so the host can do its own Host-header routing.
-    # Independent of Medusa-managed services: a host running its own reverse
-    # proxy (unmanaged) can opt in without any service records. Proxy hosts
-    # get a wildcard automatically regardless of this flag.
+    # Opt-in to a CoreDNS wildcard (`*.<name>.<zone>` -> the host's own IP)
+    # so a host running its own unmanaged reverse proxy can do Host-header
+    # routing. Proxy hosts get a wildcard automatically regardless.
     wildcard: bool = False
-    # Deploy platform for this host. "debian-docker" (default) renders to the
-    # historical Compose + fstab + systemd-networkd path driven by Ansible.
-    # "nixos" renders to a generated Nix module/flake driven by nixos-rebuild
-    # (T-074/T-075) and is excluded from every Ansible role group. Orthogonal
-    # to ansible_managed_mode: a host's platform and its access mode are
-    # independent. Default keeps every existing host on the Debian path. See
-    # T-073.
+    # Deploy platform (T-073). "debian-docker" renders to the Compose + fstab
+    # + systemd-networkd path driven by Ansible; "nixos" renders to a Nix
+    # module/flake driven by nixos-rebuild (T-074/T-075) and is excluded from
+    # every Ansible role group. Orthogonal to ansible_managed_mode.
     platform: Literal["debian-docker", "nixos"] = "debian-docker"
-    # Host lifecycle state (T-091). "dormant" declares expected downtime: the
-    # host keeps its DNS records and all its artifacts still render, but deploy
-    # dispatch skips it (absent from ansible inventory/groups, skipped by the
-    # nixos deploy plan, dropped from monitoring scrape targets) and the deploy
-    # stays green. Downtime is DECLARED here, never detected at deploy time --
-    # an unreachable *active* host stays a loud failure. Validation rejects a
-    # dormant host that active hosts still depend on (NFS exports, egress
-    # gateway, coredns). Only meaningful on a deployable host (ansible_user set
-    # or platform: nixos); a DNS-only host is already inert.
+    # Host lifecycle state (T-091). "dormant" declares expected downtime: DNS
+    # records and artifacts still render, but deploy dispatch skips the host
+    # and the deploy stays green. Downtime is DECLARED here, never detected at
+    # deploy time -- an unreachable *active* host stays a loud failure. Only
+    # meaningful on a deployable host; a DNS-only host is already inert.
     state: Literal["active", "dormant"] = "active"
-    # Guest type for a nixos host. "vm" (Proxmox/KVM) gets the QEMU guest agent
-    # (services.qemuGuest.enable) so the hypervisor can read the guest's IP, run
-    # graceful shutdown, etc.; "lxc" (Proxmox container) gets no agent and cannot
-    # use disko -- a container has no block device; "physical" gets no agent but
-    # can use disko. Only meaningful for platform: nixos (ignored on debian).
-    # Default "vm" -- the common Proxmox case and the SFTP pilot (T-078).
+    # Guest type for a nixos host (T-078). "vm" gets the QEMU guest agent;
+    # "lxc" gets no agent and cannot use disko (a container has no block
+    # device); "physical" gets no agent but can use disko. nixos-only.
     nixos_guest: Literal["vm", "lxc", "physical"] = "vm"
-    # Opt into Medusa-staged disko partitioning for the nixos-anywhere bootstrap
-    # (T-078). When true, the operator authors `templates/nixos/disko/<name>.nix`
-    # (a real disko.devices Nix file -- disk layout is operator territory,
-    # T-071/T-072); render stages it verbatim into the flake tree and the host
-    # module + flake import disko and that config. Default false: a nixos host
-    # whose disk is already laid out (or managed elsewhere) needs no disko.
-    # Requires platform: nixos and a guest with a real disk (not lxc).
+    # Opt into Medusa-staged disko partitioning for the nixos-anywhere
+    # bootstrap (T-078). The operator authors the disko layout -- disk layout
+    # is operator territory (T-071/T-072) -- and render stages it verbatim
+    # into the flake tree. Requires platform: nixos and a real disk (not lxc).
     nixos_disko: bool = False
-    # Admin/deploy SSH public keys authorized for this host's deploy user
-    # (``ansible_user`` -- root or a wheel user). Plain inventory data: public
-    # keys are not secret. Without at least one, `nixos-rebuild --target-host`
-    # cannot authenticate, so a deployable nixos host needs one. nixos-only.
+    # Admin/deploy SSH public keys for this host's deploy user. Plain data
+    # (public keys are not secret). Without at least one, `nixos-rebuild
+    # --target-host` cannot authenticate. nixos-only.
     nixos_admin_keys: list[str] = Field(default_factory=list)
-    # Legacy-BIOS boot (T-094): the raw disk GRUB installs to (e.g. /dev/vda).
-    # Set on hosts whose firmware has no UEFI -- cheap KVM VPSes like RackNerd,
-    # where the T-078 systemd-boot/EFI branch would render an unbootable
-    # system. Set -> the host module emits boot.loader.grub on this device
-    # instead of systemd-boot, and the operator's disko layout must carry an
-    # EF02 BIOS-boot partition instead of an ESP. Unset -> UEFI as before.
-    # Explicit device rather than inferred from disko's EF02 auto-wiring: one
-    # less implicit dependency on disko internals. nixos-only; meaningless on
-    # lxc (a container boots from the host kernel, no bootloader at all).
+    # Legacy-BIOS boot (T-094): the raw disk GRUB installs to (e.g. /dev/vda)
+    # on firmware with no UEFI, where systemd-boot/EFI would render an
+    # unbootable system; the disko layout must then carry an EF02 BIOS-boot
+    # partition instead of an ESP. Unset -> UEFI. Explicit device rather than
+    # inferred from disko's EF02 auto-wiring. nixos-only; meaningless on lxc.
     nixos_boot_device: str | None = None
-    # NixOS `system.stateVersion` for this host -- the release it was first
-    # installed with. Pinned at install and NEVER bumped on upgrade (it guards
-    # stateful defaults), so it is host data, not derived from the flake's
-    # nixpkgs pin. Defaults in normalize to the current release. nixos-only.
+    # NixOS `system.stateVersion` -- the release the host was installed with.
+    # Pinned at install and NEVER bumped on upgrade (it guards stateful
+    # defaults), so it is host data, not derived from the nixpkgs pin.
+    # nixos-only.
     nixos_state_version: str | None = None
-    # IANA timezone for the host (e.g. "America/New_York"). Consumed by the
-    # NixOS render (`time.timeZone`); Debian hosts carry their timezone from
-    # OS install. Matters beyond cosmetics: without it /etc/localtime does
-    # not exist on NixOS, and a compose service binding /etc/localtime makes
-    # docker auto-create the missing source as a DIRECTORY, which then fails
-    # to mount over the container's file.
+    # IANA timezone, consumed by the NixOS render (`time.timeZone`). Not
+    # cosmetic: without it /etc/localtime does not exist on NixOS, and a
+    # compose service binding /etc/localtime makes docker auto-create the
+    # missing source as a DIRECTORY (mount failure).
     timezone: str | None = None
-    # The host's age recipient (public key), derived from its ssh host key via
-    # `ssh-to-age`. Public data -- not key material -- so it lives in inventory.
-    # When a host references a secret, this recipient is added to that secret's
-    # generated creation_rule so the host can decrypt it locally with its own
-    # ssh host key (host-side decryption, T-080). Both platforms: NixOS via
-    # sops-nix, Debian via a local sops decrypt step. Unset until the host's key
-    # is harvested during the T-080 cutover; a secret-referencing host without
-    # one renders a creation_rule it cannot decrypt (surfaced as a warning).
+    # The host's age recipient (public key, derived from its ssh host key via
+    # `ssh-to-age`; not key material, so it lives in inventory). Added to the
+    # creation_rule of every secret the host references so it can decrypt
+    # host-side (T-080). Unset until harvested; a secret-referencing host
+    # without one is surfaced as a warning.
     age_recipient: str | None = None
 
     @field_validator("name")
@@ -436,16 +403,14 @@ class DnsInventory(BaseModel):
 
     zones: list[ZoneInventory]
     hosts: list[HostInventory] = Field(default_factory=list)
-    # Global static-networking defaults applied to every host that opts into
-    # managed networking (manage_network: true). Per-host `network:` blocks
-    # override individual fields. Typically sets interface, prefix, gateway,
-    # and nameservers (the CoreDNS host IP). See T-055.
+    # Global static-networking defaults for hosts that opt into managed
+    # networking; per-host `network:` blocks override individual fields
+    # (T-055).
     network: NetworkConfig | None = None
-    # SSH public keys baked into the generated Medusa installer ISO's live
-    # root (T-089): boot the ISO and the controller reaches the target
-    # immediately -- no console bootstrap. Fleet-level and explicit (NOT
-    # derived from any host's nixos_admin_keys) so key rotation stays
-    # deliberate. Empty = no installer image is emitted. Public keys only.
+    # SSH public keys baked into the generated installer ISO's live root
+    # (T-089). Fleet-level and explicit (NOT derived from any host's
+    # nixos_admin_keys) so key rotation stays deliberate. Empty = no installer
+    # image is emitted. Public keys only.
     nixos_installer_keys: list[str] = Field(default_factory=list)
 
     @field_validator("nixos_installer_keys")

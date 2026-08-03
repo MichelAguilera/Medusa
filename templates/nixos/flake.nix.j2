@@ -5,9 +5,8 @@
 
   inputs = {
     nixpkgs.url = "{{ nixos.nixpkgs_ref }}";
-    # disko -- declarative partitioning consumed by nixos-anywhere on first
-    # install (T-078). Wired into a host's module list only when it opts in via
-    # nixos_disko.
+    # Consumed by nixos-anywhere on first install; wired into a host's module
+    # list only when it opts in via nixos_disko (T-078).
     disko.url = "github:nix-community/disko";
     disko.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -27,9 +26,8 @@
       };
 {% if nixos.installer_keys %}
 
-      # Medusa installer ISO (T-089): `nix build <flake>#installer` (or
-      # `medusactl build-installer`). Separate output namespace -- does not
-      # affect nixos-rebuild's nixosConfigurations resolution.
+      # Installer ISO for `medusactl build-installer` (T-089); a separate
+      # output namespace, invisible to nixosConfigurations resolution.
       packages.${system}.installer =
         (nixpkgs.lib.nixosSystem {
           inherit system;

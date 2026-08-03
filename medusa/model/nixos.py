@@ -26,9 +26,7 @@ class NixosNetwork(BaseModel):
 class NixosMount(BaseModel):
     """One ``fileSystems."<mountpoint>"`` entry. Mirrors the Debian managed
     fstab region exactly -- same source, type, and options -- so a host's NFS
-    client mounts are identical whichever platform renders them. Add automount/
-    nofail/etc. once in the storage inventory and both platforms inherit it.
-    See T-074."""
+    client mounts are identical whichever platform renders them (T-074)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -40,14 +38,12 @@ class NixosMount(BaseModel):
 
 class NixosTunnelClient(BaseModel):
     """Tunnel-routing client config for a NixOS host that runs `egress: tunnel`
-    services (T-087/D6 client slice; the T-066 mechanism). The gateway host and
-    its WireGuard machinery are untouched -- this is the same split policy
-    routing the Debian tunnel_routing role installs: mark traffic from the
-    pinned tunnel docker subnet in nftables PREROUTING, policy-route marked
-    LAN-bound traffic direct and everything else into a table whose ONLY route
-    is the default via the gateway (fail-closed: gateway down = drop, never a
-    leak via the main default route). Values come from the resolved
-    EgressGateway so both platforms route identically."""
+    services (T-087/D6; the T-066 mechanism). Same split policy routing as the
+    Debian tunnel_routing role: mark tunnel-subnet traffic, route LAN-bound
+    traffic direct, everything else into a table whose ONLY route is the
+    default via the gateway (fail-closed: gateway down = drop, never a leak).
+    Values come from the resolved EgressGateway so both platforms route
+    identically."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -60,15 +56,12 @@ class NixosTunnelClient(BaseModel):
 
 
 class NixosEgressGateway(BaseModel):
-    """This host IS the shared WireGuard egress gateway (T-066, Debian
-    wireguard_gateway role port). Emits: wg-quick on the host-decrypted tmpfs
-    config (the T-080 seam already stages/decrypts the operator's WireGuard
-    secret to /run/medusa-secrets/<host>/wireguard/<iface>.conf), the
-    generated NAT + fail-closed kill-switch nft ruleset, the dnsmasq split-DNS
-    resolver on the generated config, ip forwarding, and firewall admission
-    for client DNS. A gateway host must be DEDICATED: the kill-switch forward
-    chain has a drop policy, so co-locating compose stacks would silently
-    break their forwarded traffic (enforced in normalize)."""
+    """This host IS the shared WireGuard egress gateway (T-066 port). Emits
+    wg-quick on the host-decrypted tmpfs config (delivered via the T-080
+    seam), the generated NAT + fail-closed kill-switch nft ruleset, and the
+    split-DNS resolver. A gateway host must be DEDICATED: the kill-switch
+    forward chain has a drop policy, so co-located compose stacks' forwarded
+    traffic would silently break (enforced in normalize)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -76,21 +69,11 @@ class NixosEgressGateway(BaseModel):
 
 
 class NixosNfsServer(BaseModel):
-    """This host serves the fleet's NFS exports (T-096, nfs_exports role port).
+    """NFS export server config for a NixOS host (T-096).
 
-    The module consumes the SAME generated exports file the Debian role ships
-    to /etc/exports (``storage/exports/<host>/medusa.exports``, staged
-    byte-identical into the flake tree — the CoreDNS precedent), so export
-    authorization is one formatter on both platforms. ``exports`` carries the
-    per-export provisioning plans, applied by the medusa-nfs-provision unit
-    (which nfs-server requires): ensure the first-segment dataset (T-071
-    convention), converge export-dir ownership (T-085), full parity with the
-    Debian role's every-deploy behavior. Two hard rules the unit encodes:
-    ``zfs create`` is the ONLY ZFS verb Medusa ever executes (the ADR fence —
-    destroy/rename/rollback/properties are permanently out of scope), and it
-    never mounts a fresh dataset over a path that already holds data outside
-    one (fails loudly instead — a shadowed share looks empty to clients and
-    backups)."""
+    Renders to: nfsd on the byte-identically staged exports file, the
+    guarded create-only medusa-nfs-provision unit (T-071/T-085 contract;
+    ADR ZFS verb fence), and the pool import when ``zfs_pool`` is set."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -111,14 +94,12 @@ class NixosStagedConfig(BaseModel):
     (traefik dynamic config, homepage services config, prometheus targets),
     staged into the flake tree instead (T-087 config-staging slice).
 
-    ``source`` is the artifact's path under ``generated/`` as emitted by the
-    platform-neutral renderer (e.g. ``traefik/<host>/dynamic.yaml``); the
-    staging step copies those exact bytes -- it never re-renders, so the file
-    is byte-identical to what the Debian role ships. ``dest`` is where the
-    file materializes on the host, relative to the stack project dir (stack
-    configs, e.g. ``traefik/dynamic/medusa-dynamic.yaml`` -- the path the
-    container binds relatively) or to the deploy root ``/home/medusa/medusa``
-    (deploy configs, e.g. ``monitoring/prometheus-targets.yaml``)."""
+    ``source`` is the artifact's path under ``generated/``; the staging step
+    copies those exact bytes -- it never re-renders, so the file is
+    byte-identical to what the Debian role ships. ``dest`` is where the file
+    materializes on the host, relative to the stack project dir (stack
+    configs) or to the deploy root ``/home/medusa/medusa`` (deploy
+    configs)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -129,14 +110,12 @@ class NixosStagedConfig(BaseModel):
 class NixosStack(BaseModel):
     """One compose stack this NixOS host runs (T-087, compose-on-NixOS).
 
-    The stack's compose file and managed env files are the SAME platform-neutral
-    models the Debian compose renderer consumes; ``render_nixos`` formats them
-    with the same templates and stages the results into the flake tree
-    (``generated/nixos/stacks/<host>/<name>/``). On the host, the ``medusa-stacks-sync``
-    unit materializes the staged tree into the writable Debian-identical stacks
-    root (``/home/medusa/medusa-stacks/<name>``) and a per-stack systemd unit
-    runs compose up against it. ``unit_suffix`` is the stack name made
-    unit-safe (``media/immich`` -> ``media-immich``)."""
+    The compose file and env files are the SAME platform-neutral models the
+    Debian compose renderer consumes, formatted with the same templates and
+    staged into the flake tree (``generated/nixos/stacks/<host>/<name>/``);
+    on the host they sync to the Debian-identical stacks root and a per-stack
+    unit runs compose up. ``unit_suffix`` is the stack name made unit-safe
+    (``media/immich`` -> ``media-immich``)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -158,13 +137,12 @@ class NixosStack(BaseModel):
 
 class NixosStagedSecret(BaseModel):
     """One encrypted SOPS file staged into the flake tree (T-087 port of the
-    T-080 Debian seam). Store-safe: it is ciphertext; the host's
-    ``medusa-secrets`` unit decrypts it to tmpfs with its own ssh host key
-    (ssh-to-age), exactly as on Debian. ``staged`` is the path both under
-    ``generated/nixos/secrets-enc/`` and ``/etc/medusa-secrets-enc/`` on the
-    host. ``ciphertext`` is read verbatim at the inventory boundary (cli) and
-    carried on the model so the renderer stays a pure formatter (the
-    disko_source precedent)."""
+    T-080 seam). Store-safe: it is ciphertext; the host's ``medusa-secrets``
+    unit decrypts it to tmpfs with its own ssh host key (ssh-to-age).
+    ``staged`` is the path both under ``generated/nixos/secrets-enc/`` and
+    ``/etc/medusa-secrets-enc/`` on the host. ``ciphertext`` is read verbatim
+    at the inventory boundary (cli) and carried on the model so the renderer
+    stays a pure formatter."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -236,14 +214,9 @@ class NixosHost(BaseModel):
     egress_gateway: NixosEgressGateway | None = None
     # CoreDNS host (T-056 port): true when this host is the fleet's DNS
     # resolver. Runs CoreDNS on the same generated Corefile + lan.hosts the
-    # Debian role deploys (byte-identical, staged in-generation). The Debian
-    # role's backup/health-check/restore guard maps to NixOS generations: a
-    # bad config is a `nixos-rebuild --rollback`.
+    # Debian role deploys (byte-identical, staged in-generation).
     coredns: bool = False
-    # NFS export server (T-096, nfs_exports role port): set when this host
-    # serves NFS exports. Emits nfsd on the staged byte-identical exports
-    # file, the ZFS pool import when the server declares a pool root, and
-    # tmpfiles convergence of export-dir ownership. None everywhere else.
+    # Set when this host serves NFS exports (T-096); None everywhere else.
     nfs: NixosNfsServer | None = None
     # Tunnel-routing client (T-087/D6): set when this host runs at least one
     # `egress: tunnel` service. Emits the nft marking + policy-routing units,
@@ -251,10 +224,9 @@ class NixosHost(BaseModel):
     # pre-create; stack units hard-require the tunnel units so a container
     # can never start before the fail-closed routing is in place.
     tunnel: NixosTunnelClient | None = None
-    # Per-host configs materialized under the deploy root /home/medusa/medusa
-    # (currently the prometheus targets file, mirroring the Debian monitoring
-    # role's medusa_deploy_root destination). Staged via the generation's
-    # deploy-src tree and synced by medusa-stacks-sync. Empty for most hosts.
+    # Per-host configs materialized under the deploy root /home/medusa/medusa,
+    # mirroring the Debian medusa_deploy_root destination. Empty for most
+    # hosts.
     deploy_configs: tuple[NixosStagedConfig, ...] = ()
     # Host-side-decrypted secrets this host's services reference (T-087 port of
     # the T-080 seam). staged_secrets drives ciphertext staging + etc entries;
@@ -285,9 +257,8 @@ class NixosHost(BaseModel):
     # bootloader). Derived from nixos_guest. See T-078.
     boot_loader: bool
     # Legacy-BIOS variant (T-094): the raw disk GRUB installs to (e.g.
-    # /dev/vda) on firmware with no UEFI. None -> systemd-boot/EFI as before.
-    # Only meaningful when boot_loader is true; carried from the host record's
-    # nixos_boot_device.
+    # /dev/vda) on firmware with no UEFI. None -> systemd-boot/EFI. Only
+    # meaningful when boot_loader is true.
     boot_bios_device: str | None
     # system.stateVersion -- the release this host was installed with, pinned for
     # life. See T-078.
@@ -305,11 +276,10 @@ class NixosHost(BaseModel):
     # host module imports it and the flake adds disko.nixosModules.disko. See
     # T-078.
     disko_module: str | None
-    # Verbatim operator-authored disko layout (the contents of
-    # ``inventory/nixos/disko/<name>.nix``), carried on the model so the renderer
-    # stays a pure formatter -- it writes this into the flake tree rather than
-    # reading any file. None when the host opts out of disko. Disk layout is
-    # operator territory (T-071/T-072): Medusa never derives a partition scheme.
+    # Verbatim operator-authored disko layout, carried on the model so the
+    # renderer stays a pure formatter. None when the host opts out of disko.
+    # Disk layout is operator territory (T-071/T-072): Medusa never derives a
+    # partition scheme.
     disko_source: str | None
     # SSH endpoint for `nixos-rebuild switch --target-host`, as "<user>@<host>".
     # None when the host has no ansible_user (no managed SSH endpoint) -- such a
@@ -326,9 +296,9 @@ class NixosHost(BaseModel):
 class NixosModel(BaseModel):
     """Hosts on the NixOS platform, fully derived for the Nix renderer. Empty
     when no host sets ``platform: nixos``. The renderer iterates and formats
-    only -- all partitioning and derivation happens in ``normalize_nixos`` so
-    the renderer contract holds (NixOS is a new output format, not a new
-    architecture). ``nixpkgs_ref`` pins the flake input. See T-073, T-074."""
+    only -- all partitioning and derivation happens in ``normalize_nixos``
+    (renderer contract). ``nixpkgs_ref`` pins the flake input. See T-073,
+    T-074."""
 
     model_config = ConfigDict(frozen=True)
 

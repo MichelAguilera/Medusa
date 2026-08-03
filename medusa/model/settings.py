@@ -103,11 +103,10 @@ def secret_sources(effective_services, egress=None) -> tuple[SecretSource, ...]:
                 )
             )
 
-    # The shared WireGuard egress secret is delivered the same way as every other
-    # secret -- one mechanism, one trust model (T-080). It is a root-owned system
-    # daemon config (wg-quick reads it) on a dedicated gateway that need not have
-    # the medusa user, hence owner="system". Routing it through the manifest also
-    # makes the gateway a recipient of it in the generated .sops.yaml.
+    # The WireGuard egress secret rides the same manifest as every other
+    # secret -- one mechanism, one trust model (T-080) -- which also makes the
+    # gateway a recipient in the generated .sops.yaml. owner="system": it is a
+    # root-owned daemon config on a gateway that need not have the medusa user.
     if egress is not None:
         sources.append(
             SecretSource(

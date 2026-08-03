@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.24.2"
+VERSION="0.24.3"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -175,9 +175,6 @@ load_config() {
 }
 
 require_local_inventory_dir() {
-    # Used by local mutation commands (add/remove/promote-target,
-    # status, diff, commit, push, discard) that operate on the
-    # workstation's inventory clone rather than SSHing the controller.
     [[ -n "${MEDUSACTL_INVENTORY_DIR:-}" ]] \
         || fail "MEDUSACTL_INVENTORY_DIR is not set in $CONFIG_FILE; re-run 'medusactl install-controller' or edit the config to point at your local inventory clone"
     [[ -d "$MEDUSACTL_INVENTORY_DIR" ]] \
@@ -244,16 +241,10 @@ authorize_key_on_controller() {
 }
 
 ssh_mux_opts() {
-    # Persistent SSH connection multiplexing across medusactl invocations.
-    # The first call to a given target opens a master and writes a Unix
-    # socket under SSH_MUX_DIR; subsequent calls reuse it, eliminating
-    # per-command handshake latency. ControlPersist resets each command,
-    # so a 5-minute idle window covers bursty workflows without leaking
-    # sockets after the operator walks away.
-    #
-    # When the operator has supplied their own SSH config via
-    # MEDUSACTL_SSH_CONFIG, defer to it entirely instead of overriding
-    # ControlPath/ControlMaster.
+    # ControlPersist resets per command, so the idle window covers bursty
+    # workflows without leaking sockets after the operator walks away.
+    # When MEDUSACTL_SSH_CONFIG supplies the operator's own SSH config,
+    # defer to it entirely instead of overriding ControlPath/ControlMaster.
     [[ -z "$SSH_CONFIG" ]] || return 0
     mkdir -p "$SSH_MUX_DIR" 2>/dev/null || return 0
     chmod 700 "$SSH_MUX_DIR" 2>/dev/null || true
@@ -268,15 +259,12 @@ ssh_base_opts() {
     ssh_mux_opts
 }
 
-# Ergonomic first-onboarding: prep-target/authorize-target make the CONTROLLER
-# scp/ssh to the new host BY NAME. On a brand-new host with no bootstrap_ip,
-# the controller can't resolve that name yet (CoreDNS has no record, the
-# /etc/hosts bootstrap block only seeds bootstrap_ip hosts), so the very first
-# prep fails with "Could not resolve hostname". These helpers add a TEMPORARY
-# /etc/hosts entry on the controller (canonical IP, or bootstrap_ip when set)
-# so onboarding connects, then remove it once the process finishes — like a
-# self-cleaning bootstrap. Tracked via MEDUSA_TEMP_HOST_NAME so the EXIT trap
-# also tears it down if prep fails partway.
+# prep-target/authorize-target make the CONTROLLER scp/ssh to the new host BY
+# NAME, which it cannot resolve yet on a brand-new host with no bootstrap_ip
+# (CoreDNS has no record; the /etc/hosts bootstrap block only seeds
+# bootstrap_ip hosts). These helpers add a marked TEMPORARY controller
+# /etc/hosts entry for onboarding and remove it afterwards; tracked via
+# MEDUSA_TEMP_HOST_NAME so the EXIT trap also tears it down on failure (T-066).
 MEDUSA_TEMP_HOST_NAME=""
 MEDUSA_TEMP_HOST_MARKER="# MEDUSA TEMP ONBOARD"
 
@@ -316,16 +304,11 @@ controller_clear_temp_host() {
 
 remote_command() {
     local command=$1
-    # Export both the inventory repo root (for ansible group_vars +
-    # secrets lookup) and the inventory subdir (for the medusa CLI's
-    # ProjectPaths override). MEDUSA_GENERATED_DIR is consumed by both
-    # the medusa CLI and ansible's group_vars/all.yml.
-    #
-    # ANSIBLE_INVENTORY overrides ansible.cfg's hardcoded relative
-    # path ('../generated/ansible/inventory/...') which became wrong
-    # after T-038 moved generated/ out of the code repo and into the
-    # XDG state dir. ansible.cfg can't expand env vars, so the only
-    # robust knob is ANSIBLE_INVENTORY (which ansible reads first).
+    # The MEDUSA_* exports feed both the medusa CLI (ProjectPaths override)
+    # and ansible group_vars. ANSIBLE_INVENTORY must override ansible.cfg's
+    # hardcoded relative inventory path (wrong since T-038 moved generated/
+    # to the XDG state dir); ansible.cfg cannot expand env vars, so this env
+    # knob is the only robust override.
     printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; export ANSIBLE_INVENTORY=%q,%q; cd %q && %s' \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
@@ -360,13 +343,10 @@ sanitize_log() {
     fi
 }
 
-# Turn a raw Ansible deploy log into a short, actionable failure summary:
-# the failing play / task / host, the concise error message, a recap of which
-# hosts failed, and a targeted hint for common failure classes. Only the
-# extracted `msg` is surfaced -- never the raw `=> {...}` result payload, which
-# can carry secrets (stdout/env/item). The full raw log on disk stays
-# authoritative. Falls back to a raw tail only when no structured task failure
-# is found. See T-050.
+# Summarize an Ansible failure log. Only the extracted `msg` is surfaced --
+# never the raw `=> {...}` result payload, which can carry secrets
+# (stdout/env/item); the full raw log on disk stays authoritative. Falls back
+# to a raw tail only when no structured task failure is found. See T-050.
 summarize_failure_log() {
     local log=$1
     if [[ ! -s "$log" ]]; then
@@ -593,8 +573,7 @@ fetch_file() {
 }
 
 bootstrap_source() {
-    # Fetch the controller bootstrap script (controller-only post Stage 3;
-    # target ops live in this CLI, not in the bootstrap).
+    # The bootstrap script is controller-only; target ops live in this CLI.
     local script_dir="" local_bootstrap=""
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -829,10 +808,7 @@ cmd_version() {
 }
 
 cmd_status() {
-    # T-037 stage C: fdisk-style local status. Shows the workstation
-    # inventory clone's pending changes, validates them, and reports
-    # ahead/behind vs origin/main. For the controller-side status
-    # (git HEAD on controller + medusa check there), see
+    # T-037 stage C: local inventory status; the controller-side view is
     # 'medusactl controller-status'.
     load_config
     require_local_inventory_dir
@@ -875,8 +851,7 @@ cmd_status() {
 }
 
 cmd_controller_status() {
-    # The pre-T-037 'status' command: SSH to controller, print git HEAD
-    # and branch, run 'medusa check' there.
+    # The controller-side counterpart of 'status' (T-037).
     load_config
     local target remote
     local -a ssh_opts
@@ -893,15 +868,14 @@ cmd_controller_status() {
 }
 
 cmd_diff() {
-    # T-037 stage C: colorized git diff of pending inventory changes.
+    # T-037 stage C.
     load_config
     require_local_inventory_dir
     git -C "$MEDUSACTL_INVENTORY_DIR" diff --color=auto "$@"
 }
 
 cmd_commit() {
-    # T-037 stage C: show diff first, prompt Y/n, then commit. Refuses
-    # on empty working tree.
+    # T-037 stage C.
     load_config
     require_local_inventory_dir
     local msg=${1:-}
@@ -925,7 +899,7 @@ cmd_commit() {
 }
 
 cmd_push() {
-    # T-037 stage C: push to origin/main. Refuses on dirty working tree.
+    # T-037 stage C.
     load_config
     require_local_inventory_dir
     local porcelain
@@ -939,13 +913,12 @@ cmd_push() {
 }
 
 cmd_publish() {
-    # T-037 stage C: sugar for commit + push in one shot.
+    # T-037 stage C.
     cmd_commit "$@" && cmd_push
 }
 
 cmd_discard() {
-    # T-037 stage C: 'git checkout -- .' against the inventory clone.
-    # Y/n confirmation. Aborts on empty working tree.
+    # T-037 stage C.
     load_config
     require_local_inventory_dir
     local porcelain
@@ -993,13 +966,10 @@ cmd_check() {
     cmd_audit_targets || true
 }
 
-# Audit SSH hardening across the managed targets. Pulls the host list
-# from 'medusa list-hosts --managed-only' so the mode prefix (F/L) is
-# available per row. 'full' hosts get the sshd + root-account probe;
-# 'limited' hosts get reachability + sudo only, since their hardening
-# surface is the operator's responsibility and is intentionally out of
-# medusa's audit scope. Warns on findings; does not fail the overall
-# check.
+# SSH-hardening audit. 'full' hosts get the sshd + root-account probe;
+# 'limited' hosts get reachability + sudo only — their hardening surface is
+# the operator's, intentionally outside medusa's audit scope. Warns on
+# findings; never fails the overall check.
 cmd_audit_targets() {
     local target log
     target=$(ssh_target)
@@ -1135,19 +1105,15 @@ REMOTE
 }
 
 inventory_pull_cmd() {
-    # T-037 stage D: prepended to every controller-side workflow so the
-    # controller's inventory clone fast-forwards to whatever the
-    # workstation has just pushed. Operator runs 'medusactl push' before
-    # 'medusactl deploy'; the deploy guards verify the push happened.
+    # T-037 stage D: every controller-side workflow fast-forwards the
+    # controller's inventory clone first, so it acts on what the
+    # workstation just pushed (the deploy guards verify the push happened).
     printf 'git -C %q pull --ff-only && ' "$MEDUSA_CONTROLLER_INVENTORY_PATH"
 }
 
 require_clean_for_deploy() {
-    # T-037 stage D: deploy refuses if the workstation inventory clone
-    # is dirty, ahead of origin/main (forgot to push), or behind
-    # origin/main (forgot to pull a co-worker's commit). The git remote
-    # is the authoritative source of truth; this guard makes the local
-    # clone tell us when it isn't synchronized.
+    # T-037 stage D: the git remote is the authoritative source of truth;
+    # refuse to deploy while the local clone is dirty, unpushed, or behind.
     require_local_inventory_dir
     local porcelain ahead behind
     porcelain=$(git -C "$MEDUSACTL_INVENTORY_DIR" status --porcelain 2>/dev/null)
@@ -1212,14 +1178,12 @@ EOF
         esac
     done
     require_clean_for_deploy
-    # Build the ansible --limit fragment for deploy.yml only. We union in
-    # medusa_control so the controller-side preflight (the staleness gate) and
-    # any controller play still run when the operator targets a single host.
-    # controller-apply.yml is left UNRESTRICTED on purpose: it refreshes the
-    # controller's /etc/hosts + ssh-config so the targeted host stays
-    # resolvable; limiting it to a non-controller host would make it a no-op.
-    # Single-quote the value so the remote shell does not glob '*' or interpret
-    # '!'/'&' before ansible parses the pattern.
+    # Union medusa_control into deploy.yml's --limit so the controller-side
+    # preflight (staleness gate) still runs on a targeted deploy.
+    # controller-apply.yml stays UNRESTRICTED: limiting it to a non-controller
+    # host would no-op the /etc/hosts + ssh-config refresh the targeted host
+    # needs to stay resolvable. Single-quote the value so the remote shell
+    # does not glob '*' or interpret '!'/'&' before ansible parses it.
     local deploy_limit=""
     if [[ -n "$limit" ]]; then
         deploy_limit=" --limit 'medusa_control:${limit}'"
@@ -1229,25 +1193,20 @@ EOF
         run_logged deploy-check \
             "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff${deploy_limit}" \
             || fail "deploy --check failed"
-        # NixOS hosts deploy beside the Ansible path (T-075). The render above
-        # already refreshed the flake, so refresh=0. dry-activate mirrors the
-        # Ansible --check. No-op on an all-Debian fleet (empty deploy plan).
+        # T-075: refresh=0 — the render above already refreshed the flake;
+        # dry-activate mirrors the Ansible --check.
         _nixos_apply_run dry-activate 0 "$limit"
     else
         require_controller_apply_prereqs deploy \
             || fail "deploy prerequisites failed"
-        # controller-apply BEFORE deploy: controller-apply rewrites
-        # /etc/hosts (bootstrap_ip block) and ~/.ssh/config aliases on
-        # the controller. Both feed hostname-based SSH that deploy.yml
-        # uses to reach targets. If a host's bootstrap_ip changed and
-        # we ran deploy first, ansible would resolve through stale
-        # /etc/hosts and fail with 'No route to host', short-circuiting
-        # controller-apply via '&&'.
+        # controller-apply BEFORE deploy: it rewrites the controller's
+        # /etc/hosts + ~/.ssh/config aliases that deploy.yml's hostname-based
+        # SSH depends on; the reverse order resolves through stale entries
+        # and fails before controller-apply could fix them ('&&').
         run_logged deploy \
             "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml${deploy_limit}" \
             || fail "deploy failed"
-        # Reconcile NixOS hosts after the Debian fleet (T-075). refresh=0: the
-        # deploy step just rendered. No-op on an all-Debian fleet.
+        # T-075: refresh=0 — the deploy step just rendered.
         _nixos_apply_run switch 0 "$limit"
     fi
 }
@@ -1256,8 +1215,7 @@ EOF
 # per stack, 'stack host services platform state'. The platform/state columns
 # are what the runtime-verb routing decides on (T-092); a controller release
 # that predates them emits three columns, and callers degrade to the legacy
-# ansible path (where compose_guard keeps zero-host runs loud). Used by
-# 'compose list' and by cmd_compose routing.
+# ansible path (where compose_guard keeps zero-host runs loud).
 fetch_stacks() {
     local target
     local -a ssh_opts
@@ -1281,16 +1239,9 @@ REMOTE
 
 # Non-interactive runtime verb on a NixOS-hosted stack (T-092). No ansible --
 # NixOS hosts are outside docker_hosts by design -- and no TTY; run_logged
-# captures the run like any other op. Path mirrors _compose_interactive:
-# workstation -> controller -> stack host (controller ~/.ssh/config alias) ->
-# 'sudo -Hu medusa docker compose' in the flake-materialized stack dir.
-# Verb mapping keeps parity with the ansible path: 'down' is compose 'stop'
-# (state=stopped), 'up' is 'up -d' (state=present against the stack dir the
-# flake last materialized -- a runtime start, NOT delivery: on NixOS the
-# compose file only changes via nixos-apply, so 'up' here can only reconcile
-# containers to the delivered generation, e.g. revive a stack parked by
-# 'down'), 'pull' is 'up -d --pull always' (state=present + pull=always:
-# fetch moved tags, recreate changed containers).
+# captures the run. Path mirrors _compose_interactive. The verb mapping keeps
+# parity with the ansible path; on NixOS 'up' is a runtime start, NOT
+# delivery: the compose file only changes via nixos-apply.
 _compose_runtime_direct() {
     local action=$1 target_host=$2 stack=$3 service=${4:-}
     local -a dcargs
@@ -1338,8 +1289,8 @@ _compose_interactive() {
     [[ "$verb" != "exec" || -n "$service" ]] || fail "compose exec: --service <name> is required"
     [[ "$verb" != "exec" || ${#rest[@]} -gt 0 ]] || fail "compose exec: a command is required after -- (e.g. -- bash)"
 
-    # Assemble the docker compose argv (host side). logs/ps: [forwarded flags...]
-    # [service]; exec: service [command...].
+    # Host-side argv: logs/ps take [forwarded flags...] [service];
+    # exec takes service [command...].
     local -a dcargs=("$verb")
     case "$verb" in
         logs|ps)
@@ -1475,12 +1426,9 @@ EOF
     local action=$1
     shift
 
-    # 'list' is a read-only inspector. It runs on the controller (like every
-    # other compose verb), NOT on the workstation: the controller is where
-    # `medusa` reliably runs (uv run) and where the other verbs render the tree,
-    # so the listing matches what they would act on. list-stacks computes stacks
-    # straight from the normalized model (no render needed); we read the
-    # controller's current inventory without a pull, so it's a fast plain read.
+    # 'list' runs on the controller, NOT the workstation: that is where the
+    # other verbs act, so the listing matches them. No render, no pull — a
+    # fast plain read.
     if [[ "$action" == "list" ]]; then
         [[ "${1:-}" != "--help" && "${1:-}" != "-h" ]] || { echo "medusactl compose list — print rendered stacks (stack / host / services / platform / state)."; return 0; }
         [[ $# -eq 0 ]] || fail "compose list: unexpected argument '$1'"
@@ -1492,13 +1440,8 @@ EOF
         return 0
     fi
 
-    # Interactive passthrough verbs (T-083): logs / ps / exec. These do NOT fit
-    # the ansible path — they need a live TTY (stream follow, Ctrl-C, exec -it),
-    # which run_logged's log-only capture can't give. Instead we open a real,
-    # terminal-attached SSH: workstation -t-> controller -t-> the stack's host,
-    # then `docker compose <verb>` as the medusa runtime user (it owns the stacks
-    # tree and is in the docker group). The controller resolves stack->host from
-    # `medusa list-stacks` and reaches the host via its ~/.ssh/config aliases.
+    # T-083: logs/ps/exec need a live TTY (stream follow, Ctrl-C, exec -it),
+    # which run_logged's log-only capture can't give; see _compose_interactive.
     if [[ "$action" == "logs" || "$action" == "ps" || "$action" == "exec" ]]; then
         _compose_interactive "$action" "$@"
         return $?
@@ -1535,14 +1478,12 @@ EOF
     local direct_action=$action
     [[ "$action" == "up" && "$pull" -eq 1 ]] && direct_action=pull
 
-    # NixOS-native routing (T-092): resolve the target against the controller's
-    # stack table BEFORE dispatch. A stack on an active NixOS host takes the
-    # direct SSH path -- the ansible plays never reach it (nixos hosts are
-    # stripped from docker_hosts) -- and debian stacks fall through to the
-    # legacy ansible path, which stays frozen (architecture-decisions, "New
-    # work is NixOS-native only"). Rows missing the platform column (controller
-    # release predates it) fall through wholesale; compose_guard keeps any
-    # zero-host run loud.
+    # T-092: resolve the target against the controller's stack table BEFORE
+    # dispatch -- the ansible plays never reach a NixOS-hosted stack (nixos
+    # hosts are stripped from docker_hosts). Debian stacks fall through to the
+    # frozen legacy ansible path (architecture-decisions, "New work is
+    # NixOS-native only"); rows missing the platform column fall through
+    # wholesale, and compose_guard keeps any zero-host run loud.
     local stacks_tsv direct_failures=0
     stacks_tsv=$(fetch_stacks) \
         || fail "compose $action: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
@@ -1568,12 +1509,10 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
             return $?
         fi
     else
-        # Fleet-wide runtime verb (up included: NixOS hosts are stripped from
-        # docker_hosts, so before the direct path a fleet 'up' silently skipped
-        # them): every active NixOS-hosted stack over the direct path first,
-        # then the legacy ansible path if any debian stacks remain. Dormant
-        # hosts' stacks are declared downtime (T-091): skipped with a notice,
-        # never an error.
+        # Fleet-wide: NixOS hosts are stripped from docker_hosts, so without
+        # the direct path a fleet 'up' silently skipped them. Dormant hosts'
+        # stacks are declared downtime (T-091): skipped with a notice, never
+        # an error.
         local nixos_rows legacy_rows dormant_rows
         nixos_rows=$(awk -F'\t' '$4=="nixos" && $5!="dormant"' <<<"$stacks_tsv")
         legacy_rows=$(awk -F'\t' '$4!="" && $4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
@@ -1604,9 +1543,9 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
     # 'down' is a runtime stop and must work even mid-edit.
     [[ "$mutating" -eq 1 ]] && require_clean_for_deploy
 
-    # Assemble extra-vars + host limit. Single-quote values so the remote shell
-    # leaves stack slashes and pattern chars intact for ansible. --host unions in
-    # medusa_control so compose-up's preflight play still runs (as deploy does).
+    # Single-quote values so the remote shell leaves stack slashes and pattern
+    # chars intact for ansible. --host unions in medusa_control so compose-up's
+    # preflight play still runs (as deploy does).
     local extra=""
     [[ -n "$stack" ]]   && extra+=" -e medusa_compose_target='${stack}'"
     [[ -n "$service" ]] && extra+=" -e medusa_compose_service='${service}'"
@@ -1679,10 +1618,8 @@ cmd_finalize_dns() {
     require_controller_apply_prereqs finalize-dns \
         || fail "finalize-dns prerequisites failed"
 
-    # Build the remote script. It reads /etc/hosts on the controller, finds
-    # the bootstrap marker block, validates each entry against the resolver
-    # (unless --force), then lets the controller_bootstrap role remove the
-    # block through the same privileged path used for apply.
+    # The block is validated against the resolver first (unless --force) and
+    # removed through the same privileged controller_bootstrap path as apply.
     local remote
     remote=$(cat <<'REMOTE'
 set -euo pipefail
@@ -1796,22 +1733,19 @@ REMOTE
 
 # --- NixOS deploy dispatch (T-075) ------------------------------------------
 #
-# The NixOS half of the deploy engine, beside (not replacing) the Ansible path.
-# Debian/Docker hosts deploy via controller-apply + deploy.yml; NixOS hosts
-# reconcile via `nixos-rebuild switch --target-host`. The fleet partition is the
-# tested `medusa nixos-deploy-plan` (Platform Fork Boundary, seam 2): one
+# Beside (not replacing) the Ansible path. The fleet partition is the tested
+# `medusa nixos-deploy-plan` (Platform Fork Boundary, seam 2): one
 # `<host>\t<user@endpoint>` line per reconcilable NixOS host, empty for an
-# all-Debian fleet. Build happens on the controller and the closure is pushed to
-# the thin target. NixOS atomic activation rolls a bad switch back to the prior
-# generation, so this path needs none of the Debian prove-then-consume guards.
+# all-Debian fleet. NixOS atomic activation rolls a bad switch back to the
+# prior generation, so this path needs none of the Debian prove-then-consume
+# guards.
 
 _nixos_apply_run() {
     # Shared SSH runner for the nixos-rebuild apply. $1 = action
     # ("switch" | "dry-activate"); $2 = refresh ("1" pulls+renders first, "0"
     # trusts a render the caller already did, e.g. cmd_deploy); $3 = limit (an
     # optional host pattern from `deploy --limit` — restricts the reconcile to
-    # NixOS hosts whose NAME matches; empty means all NixOS hosts). Mirrors
-    # cmd_finalize_dns's remote-script execution (bash -s over SSH).
+    # NixOS hosts whose NAME matches; empty means all NixOS hosts).
     local action=$1 refresh=${2:-1} limit=${3:-}
     local remote
     remote=$(cat <<'REMOTE'
@@ -1858,23 +1792,13 @@ if ! command -v nixos-rebuild >/dev/null 2>&1; then
     echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
     exit 70
 fi
-# Remote-sudo flag: ALWAYS the old spelling. --elevate=sudo cannot be used
-# even when the resolved nixos-rebuild documents it: nixos-rebuild RE-EXECS
-# the nixos-rebuild of the flake-pinned nixpkgs (to match target semantics)
-# and hands it the original argv, so a new outer binary that accepts the
-# flag feeds it to an old inner binary that rejects it. This killed the
-# T-096 cutover switch twice — T-095's version inference AND a --help
-# probe were both fooled by inspecting the wrong binary. --use-remote-sudo
-# is accepted by every vintage (the new one prints a cosmetic deprecation
-# warning). Revisit only if upstream removes the old spelling — by then
-# the pinned nixpkgs' inner binary knows the new one.
 rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
     echo "==> nixos-rebuild $ACTION: $host ($target)"
-    # Elevation only for non-root deploy users; a root target has nothing to
-    # elevate, and skipping the flag keeps root deploys immune to this whole
-    # flag-vintage class.
+    # Old remote-sudo spelling only: nixos-rebuild re-execs the flake-pinned
+    # inner binary with the original argv, and old inner binaries reject
+    # --elevate=sudo (T-095). Root targets need no elevation at all.
     flags=()
     [[ "$target" == root@* ]] || flags=(--use-remote-sudo)
     # </dev/null: nixos-rebuild's underlying ssh must not inherit the loop's
@@ -1929,8 +1853,7 @@ medusactl nixos-apply [--check] [--limit <pattern>] — reconcile NixOS hosts.
 Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
 --target-host <user@endpoint>' on the controller for every NixOS host in
 the fleet (the 'medusa nixos-deploy-plan' partition); non-root targets add
-the remote-sudo flag, probed per run because its name differs across
-nixos-rebuild vintages. A no-op on
+--use-remote-sudo (the re-exec-safe spelling, T-095). A no-op on
 an all-Debian fleet. 'medusactl deploy' runs this automatically after the
 Debian deploy; use this command to reconcile NixOS hosts on their own.
 
@@ -2120,11 +2043,6 @@ REMOTE
 }
 
 # --- Target ops -------------------------------------------------------------
-#
-# All target subcommands run the relevant 'medusa' Python CLI commands on the
-# controller (single source of truth for inventory edits) and, when the edit
-# changed state, apply the regenerated bootstrap blocks through the
-# controller_bootstrap Ansible role.
 
 _run_local_mutation() {
     # T-037 stage B: run a medusa inventory mutation (add-host,
@@ -2168,14 +2086,9 @@ EOF
 }
 
 _run_remote_with_render_and_apply() {
-    # Compose: <pre-block bash> + medusa render + apply blocks.
-    # $1 is the bash snippet to run BEFORE render (typically a medusa
-    # add-host or remove-host call). Echoes the full output and returns
-    # the SSH exit code via PIPESTATUS handling.
-    #
-    # When the third argument is "dry-run", the render + apply tail is
-    # omitted: the pre-script is expected to validate without writing,
-    # and there is nothing to deploy.
+    # $1 is the bash snippet run BEFORE render (typically a medusa add-host
+    # or remove-host call). Mode "dry-run" omits the render + apply tail:
+    # the pre-script validates without writing, so there is nothing to deploy.
     local pre_script=$1 name=$2 mode=${3:-apply} log target install_rc=0
     target=$(ssh_target)
     log=$(log_path "$name")
@@ -2428,17 +2341,12 @@ EOF
         zones=(lan)
     fi
 
-    # T-043: --prep now works on both modes. On 'full' hosts (default
-    # when --prep is passed without --limited) prep-debian runs with
-    # MEDUSA_PREP_HARDEN=1 (sshd clamp + root-password lock). On
-    # 'limited' hosts prep-debian runs with MEDUSA_PREP_HARDEN=0 —
-    # general prep only, no destructive sshd or root edits. Picking
-    # the mode is the operator's call; --prep no longer flips it.
+    # T-043: the managed mode, not --prep, decides the harden gate
+    # (MEDUSA_PREP_HARDEN); bare --prep only defaults an unset mode to full.
     if [[ "$prep" -eq 1 && -z "$mode" ]]; then
         mode="full"
     fi
 
-    # Build the medusa add-host argument list.
     local args
     args=$(printf "%q " add-host "$name" --ip "$ip" --ansible-user "$user")
     local z; for z in "${zones[@]}"; do args+=$(printf "%q " --zone "$z"); done
@@ -2485,7 +2393,6 @@ EOF
         fi
     fi
 
-    # Onboarding finished — tear down the temporary entry.
     controller_clear_temp_host
 }
 
@@ -2627,9 +2534,8 @@ EOF
         *)              fail "list-targets: unknown flag '${1:-}'" ;;
     esac
 
-    # T-037 stage B: list-hosts is a read-only inspector against the
-    # workstation's inventory clone (source of truth post-T-037), not
-    # the controller. Stream straight to the user's terminal.
+    # T-037 stage B: read the workstation's inventory clone (source of
+    # truth), not the controller.
     require_local_inventory_dir
     ( cd "$MEDUSACTL_INVENTORY_DIR" \
         && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
@@ -2682,10 +2588,8 @@ EOF
     local name=${1:-}
     [[ -n "$name" ]] || fail "prep-target: name argument is required"
 
-    # Resolve the target's mode, IP, and ansible user via
-    # 'medusa list-hosts --managed-only'. The mode prefix (F/L/-) is a
-    # public contract between medusa and this wrapper; field 1 of each
-    # row is the letter, field 2 is the name.
+    # The list-hosts mode prefix (F/L/-) is a public contract between
+    # medusa and this wrapper: field 1 is the letter, field 2 the name.
     local target ssh_opts
     target=$(ssh_target)
     mapfile -t ssh_opts < <(ssh_base_opts)
@@ -2708,10 +2612,8 @@ EOF
         fail "prep-target: $name is not in the managed host list; add it first with 'medusactl add-target'"
     fi
     mode=$(awk '{print $1}' <<< "$line")
-    # T-043: prep-debian now has a harden gate. Full hosts get the
-    # destructive hardening tail; limited hosts get general prep only
-    # (no sshd clamp, no root-password lock), making prep-target the
-    # plug-and-play onboarding path for pre-existing baremetal too.
+    # T-043 harden gate: full hosts get the destructive hardening tail;
+    # limited hosts get general prep only.
     local harden=1
     if [[ "$mode" == "L" ]]; then
         harden=0
@@ -2721,24 +2623,20 @@ EOF
     [[ -z "$user" ]] && user="ansible"
     [[ -z "$ip" ]] && fail "prep-target: could not determine IP for $name"
 
-    # Strip stale known_hosts entries on controller for this target.
-    # prep-target is the "fresh host or re-bootstrap" path by contract,
-    # so a host key change is expected (every clone has a unique key per
-    # prepare-template.sh's regen-on-first-boot logic). Without this,
-    # 'WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED' aborts the
-    # connection. Idempotent: -R on a missing entry is a no-op.
+    # prep-target is the "fresh host or re-bootstrap" path by contract, so a
+    # changed host key is expected and would otherwise abort the connection
+    # with 'REMOTE HOST IDENTIFICATION HAS CHANGED'; strip the stale
+    # controller known_hosts entries. Idempotent: -R on a missing entry is a
+    # no-op.
     local kh_clean_script
     kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
         "$name" "${name}.lan" "$ip")
     ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$kh_clean_script")" >/dev/null 2>&1 || true
 
-    # T-043 follow-up: probe controller -> target key auth first. If the
-    # ansible user is already authorized + NOPASSWD sudo works, use that
-    # path (no password prompt). Otherwise fall back to root SSH password
-    # for first-time bootstrap. This is what makes re-prep on an already
-    # hardened full host work — PermitRootLogin=prohibit-password blocks
-    # the root password path, but key auth to the ansible user still
-    # works.
+    # T-043: probe controller -> target key auth first, falling back to root
+    # SSH password only for first-time bootstrap. On an already-hardened full
+    # host PermitRootLogin=prohibit-password blocks the root-password path,
+    # so the key path is what makes re-prep work.
     local auth_mode="key"
     # Hostname target (not ip) so the controller's /etc/hosts
     # bootstrap_ip override routes the probe through the cutover IP
@@ -2757,9 +2655,8 @@ EOF
         printf "\n" >&2
     fi
 
-    # Build the remote prep script. Two variants: key path (no sshpass,
-    # ssh as ansible user, sudo on target) and root-password path
-    # (existing sshpass + scp + ssh as root flow).
+    # Two variants: key path (ssh as the ansible user, sudo on target) and
+    # root-password path (sshpass as root).
     local remote
     if [[ "$auth_mode" == "key" ]]; then
         remote=$(cat <<REMOTE
@@ -3056,10 +2953,8 @@ EOF
         fail "seed-target: refusing unsafe username '$user' (must match ^[a-z_][a-z0-9_-]*\$)"
     fi
 
-    # Strip stale known_hosts entries on controller (see prep-target
-    # for rationale). seed-target is also a "fresh-host" path by
-    # contract — limited-mode bootstrap of a host whose previous
-    # incarnation may have left a different host key behind.
+    # seed-target is also a fresh-host path by contract; strip stale
+    # controller known_hosts entries (see prep-target).
     local kh_clean_script
     kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
         "$name" "${name}.lan" "$ip")
@@ -3320,9 +3215,8 @@ EOF
 }
 
 cmd_install_runtime() {
-    # T-037 stage A: install the workstation-local medusa runtime via
-    # `uv tool install`. Required for local mutation commands
-    # (add-target, remove-target, promote-target, status, diff, etc).
+    # T-037 stage A: the local medusa runtime backs the local mutation
+    # commands (add-target, status, diff, etc).
     command -v uv >/dev/null 2>&1 \
         || fail "uv is not installed; see https://docs.astral.sh/uv/ first"
     local source_url="git+https://github.com/${MEDUSA_GITHUB_REPO}.git@${MEDUSA_INSTALL_REF}"
@@ -3395,11 +3289,9 @@ EOF
     printf "%s✓%s medusactl updated at %s\n" "$color_green" "$color_reset" "$destination"
     refresh_installed_completions
 
-    # Workstation-side medusa Python package. T-037 moved inventory
-    # mutations (add-host, remove-host, promote-host) onto the
-    # workstation, so a stale local 'medusa' is a real footgun —
-    # fixes shipped on the controller alone are invisible to
-    # 'medusactl add-target' etc. Upgrade if managed via uv tool.
+    # T-037: inventory mutations run on the workstation, so a stale local
+    # 'medusa' silently misses controller-shipped fixes — upgrade it when
+    # managed via uv tool.
     if [[ "$skip_python" -eq 1 ]]; then
         info "skipping 'medusa' Python upgrade (--no-python)"
         return 0
@@ -3818,10 +3710,7 @@ cmd_clean() {
 }
 
 cmd_undo() {
-    # T-037 stage E: 'undo' is reimplemented as 'git revert HEAD' against
-    # the workstation inventory clone. The pre-T-037 XDG snapshot store
-    # is on the way out (T-038); git history is now the source of
-    # undo-able state.
+    # T-037 stage E / T-038: git history is the source of undo-able state.
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
 medusactl undo — revert the most recent inventory commit (git revert HEAD).
@@ -3867,8 +3756,7 @@ EOF
 }
 
 cmd_history() {
-    # T-038: replaces the pre-T-038 'list-backups' command. The XDG
-    # snapshot store is gone; git is the inventory audit trail.
+    # T-038: git is the inventory audit trail.
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
 medusactl history — show recent inventory commits.

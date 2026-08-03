@@ -543,11 +543,9 @@ def list_stacks_cmd(
 
 
 def _save_dns_with_rollback(doc: Any, paths: ProjectPaths) -> None:
-    # Save then validate. Without rollback, a cross-reference failure
-    # (e.g. storage exports point at a host we just removed) would leave
-    # dns.yaml mutated on disk while the operation reported failure.
-    # In-memory bytes are enough; longer-term undo lives in git
-    # (T-038 retired the XDG snapshot store).
+    # Save then validate. Without rollback, a cross-reference failure would
+    # leave dns.yaml mutated on disk while the operation reported failure.
+    # In-memory bytes are enough; longer-term undo lives in git (T-038).
     original = paths.dns_inventory.read_bytes()
     save_dns_doc(doc, paths.dns_inventory)
     try:

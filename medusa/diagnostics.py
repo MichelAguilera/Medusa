@@ -34,10 +34,8 @@ def coredns_target_diagnostics(
     dns_model: DnsModel, groups_model: AnsibleGroupsModel
 ) -> tuple[Diagnostic, ...]:
     """Warn when a coredns_hosts member is not actually a connectable managed
-    host. The group can include a name (the `coredns` fallback) that has no
-    `ansible_user`, in which case the coredns play renders config but has
-    nothing to SSH into and DNS is never written -- the silent gap behind
-    T-056."""
+    host: the coredns play would render config but have nothing to SSH into,
+    so DNS is never written (T-056)."""
     managed = {host.name for host in dns_model.hosts if host.is_ansible_managed}
     return tuple(
         Diagnostic(

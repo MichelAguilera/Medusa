@@ -18,18 +18,15 @@ def render_nixos(
       systemd-networkd, storage ``fileSystems``, the compose substrate (docker,
       medusa user, sync + per-stack units), and the medusa-secrets unit.
     - ``generated/nixos/stacks/<host>/<stack>/…`` -- the host's compose stacks
-      staged into the flake tree (T-087). Content is formatted with the SAME
-      compose templates/helpers the Debian path uses, from the same models --
-      compose is the platform-neutral container layer; only the delivery
-      differs. Host-keyed because stack NAMES repeat across hosts (three
-      hosts run an ``infrastructure`` stack); a name-keyed tree lets the
-      last-rendered host clobber the others' staging.
+      staged into the flake tree (T-087), formatted with the SAME compose
+      templates/helpers the Debian path uses. Host-keyed because stack NAMES
+      repeat across hosts; a name-keyed tree lets the last-rendered host
+      clobber the others' staging.
     - ``generated/nixos/secrets-enc/…`` -- ciphertext staged verbatim
       (store-safe; decrypted on the host by medusa-secrets, the T-080 seam).
-    - ``generated/nixos/disko/<host>.nix`` -- for hosts that opt into disko
-      (``nixos_disko``), the operator-authored layout (carried verbatim on the
-      model as ``disko_source``) written into the flake root the host module
-      imports (T-078).
+    - ``generated/nixos/disko/<host>.nix`` -- for hosts that opt into disko,
+      the operator-authored layout (carried verbatim on the model as
+      ``disko_source``) written into the flake root (T-078).
 
     Nothing is emitted when no host is on the NixOS platform, so a pure-Debian
     fleet renders no flake. The model is already fully derived by
@@ -44,8 +41,8 @@ def render_nixos(
         )
     }
     if model.installer_keys:
-        # Installer ISO module (T-089): built via the flake's packages output;
-        # one generic image per fleet, carrying only the installer keys.
+        # One generic installer image per fleet, carrying only the installer
+        # keys (T-089).
         files[generated_dir / "nixos" / "installer.nix"] = render_template(
             templates_dir, "nixos/installer.nix.j2", {"nixos": model}
         )

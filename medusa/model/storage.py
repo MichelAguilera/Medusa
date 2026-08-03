@@ -33,12 +33,10 @@ class NfsExportClient(BaseModel):
 
     host: str
     fqdn: str
-    # Canonical DNS IP of the client host (HostRecord.ip), NOT its
-    # bootstrap_ip. Exports are emitted by IP so the NFS server authorizes
-    # mounts without any reverse-DNS dependency (see T-059). Deriving from
-    # the canonical ip keeps the export in lockstep with inventory: change
-    # the host IP -> re-render -> export follows, and `medusa check` fails
-    # until it does.
+    # Canonical DNS IP of the client host, NOT its bootstrap_ip. Exports are
+    # emitted by IP so the NFS server authorizes mounts without any
+    # reverse-DNS dependency, and the export stays in lockstep with inventory
+    # (T-059).
     ip: str
     options: tuple[str, ...]
 

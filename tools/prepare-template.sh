@@ -255,7 +255,6 @@ if [[ "$DO_EXTRA" -eq 1 ]]; then
     info "Installing extras: ${EXTRA_PACKAGES[*]}"
     apt-get install -y -qq "${EXTRA_PACKAGES[@]}" \
         || phase_fail "extras" "extras install failed"
-    # Enable unattended-upgrades non-interactively.
     if dpkg -l unattended-upgrades >/dev/null 2>&1; then
         dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1 || true
     fi

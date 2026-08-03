@@ -83,8 +83,7 @@ def _derive_managed_mode(
         return ManagedMode.NONE
     if ansible_managed_mode is None:
         # Safer default: "full" enables destructive prep flows and must be
-        # deliberate. Hosts marked managed without an explicit mode are
-        # treated as long-lived limited hosts.
+        # deliberate.
         return ManagedMode.LIMITED
     return ManagedMode(ansible_managed_mode)
 
@@ -92,9 +91,8 @@ def _derive_managed_mode(
 def _resolve_network(
     host: HostInventory, defaults: NetworkConfig | None
 ) -> HostNetwork | None:
-    # resolve_host_network owns the override+default merge and all validation
-    # (already exercised by the inventory validator). Map its result onto the
-    # normalized model type; None for hosts that did not opt in.
+    # resolve_host_network owns the merge + validation; None = host did not
+    # opt in.
     resolved = resolve_host_network(host, defaults)
     if resolved is None:
         return None
@@ -222,12 +220,10 @@ def normalize_sops(
 ) -> SopsConfigModel:
     """Build the generated ``.sops.yaml`` model: one creation_rule per distinct
     secret source, whose recipients are the operator keys plus the age recipient
-    of every host that references that secret. A crosscut over services (the
-    secret->host map) and dns (host age recipients) -- documented like
-    render_docs, kept out of any single renderer. A host that references a
-    secret but has no age recipient yet is simply omitted from that rule's
-    recipients (it gets added once its key is harvested); the gap is surfaced by
-    ``sops_recipient_diagnostics``. See T-080.
+    of every host that references that secret (T-080). A documented crosscut
+    over services (secret->host map) and dns (age recipients). A host with no
+    age recipient yet is omitted from its rules' recipients; the gap is
+    surfaced by ``sops_recipient_diagnostics``.
     """
     recipient_by_host = {
         host.name: host.age_recipient
@@ -255,11 +251,9 @@ def normalize_sops(
                 ordered.append(recipient)
         rules.append(
             SopsRule(
-                # Anchor at a path-component boundary, not the string start: sops
-                # matches path_regex against the file's ABSOLUTE path, so a
-                # leading ^ would never match (the path starts with the repo
-                # root). (^|/) matches both a relative `secrets/...` and an
-                # absolute `/.../secrets/...`. See T-080.
+                # Anchor at a path-component boundary, not the string start:
+                # sops matches path_regex against the file's ABSOLUTE path, so
+                # a leading ^ would never match (T-080).
                 path_regex=f"(^|/){re.escape(source)}$",
                 recipients=tuple(ordered),
             )
@@ -275,13 +269,11 @@ def validate_dormant_dependencies(
 ) -> None:
     """Reject a dormant host that active hosts still depend on (T-091).
 
-    Dormancy skips deploy dispatch, so these are exactly the cross-host
-    dependencies a runtime skip could never guard: an active host would be
-    deployed against infrastructure that is declared down. A crosscut over
-    dns (state) + storage (exports/mounts) + services (egress, coredns) --
-    documented like render_docs and normalize_sops, kept out of any single
-    normalizer. All-dormant dependents are fine: parking a server together
-    with all its clients is a consistent declaration.
+    Dormancy skips deploy dispatch, so an active dependent would be deployed
+    against infrastructure declared down. A documented crosscut over dns
+    (state) + storage (exports/mounts) + services (egress, coredns).
+    All-dormant dependents are fine: parking a server with all its clients is
+    a consistent declaration.
     """
     dormant = {host.name for host in dns_model.hosts if host.is_dormant}
     if not dormant:
@@ -359,13 +351,12 @@ def normalize_network(dns_model: DnsModel) -> NetworkModel:
     )
 
 
-# Pinned nixpkgs the generated flake builds against. A single point of change;
-# the exact rev is frozen by flake.lock when the NixOS deploy path lands (T-075).
+# Pinned nixpkgs the generated flake builds against; exact rev frozen by
+# flake.lock (T-075).
 NIXPKGS_REF = "github:NixOS/nixpkgs/nixos-25.05"
-# Default system.stateVersion for a freshly installed nixos host. Deliberately a
-# separate constant from NIXPKGS_REF: stateVersion is pinned at install and must
-# NOT move when the flake's nixpkgs pin is bumped (it guards stateful defaults).
-# A host can override per-host via nixos_state_version. See T-078.
+# Deliberately separate from NIXPKGS_REF: stateVersion is pinned at install and
+# must NOT move when the nixpkgs pin is bumped (it guards stateful defaults).
+# Per-host override: nixos_state_version (T-078).
 DEFAULT_NIXOS_STATE_VERSION = "25.05"
 SFTP_CHROOT_ROOT = "/srv/sftp"
 # Subdir inside each member's chroot where shared spaces mount (T-084):
@@ -388,19 +379,16 @@ def normalize_nixos(
     monitoring_model: MonitoringModel | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
-    Nix renderer formats. Crosscuts dns + storage + services + native services
-    the way the Debian path is split across compose/fstab/networkd, but gathered
-    here so the renderer stays formatting-only (renderer contract). Empty when no
-    host is on the NixOS platform. See T-073, T-074, T-076, T-087."""
+    Nix renderer formats. Crosscuts dns + storage + services + native services,
+    gathered here so the renderer stays formatting-only (renderer contract).
+    Empty when no host is on the NixOS platform. See T-073, T-074, T-076,
+    T-087."""
     mounts_by_host = dict(storage_model.mounts_by_host)
     nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
 
-    # T-087/D6 client slice: a NixOS host running `egress: tunnel` services
-    # gets the tunnel-routing client (nft marking + fail-closed policy
-    # routing), derived from the same resolved EgressGateway the Debian
-    # tunnel_routing role consumes via the egress manifest. The former D6
-    # guard is lifted; what remains guarded is the GATEWAY host itself
-    # (wireguard_gateway has no NixOS port -- see the infra-role guard below).
+    # Tunnel-routing client (T-087/D6): a NixOS host running `egress: tunnel`
+    # services gets nft marking + fail-closed policy routing, derived from the
+    # same resolved EgressGateway the Debian tunnel_routing role consumes.
     tunnel_by_host: dict[str, NixosTunnelClient] = {}
     for host_name in services_model.tunnel_services_by_host:
         if host_name not in nixos_names:
@@ -425,19 +413,15 @@ def normalize_nixos(
     coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
-    # CoreDNS on NixOS (T-056 port): the DNS host gets the coredns unit on
-    # the same generated Corefile + lan.hosts the Debian role deploys.
-    # Derivation mirrors the ansible-groups builder (coredns_hosts above).
+    # CoreDNS on NixOS (T-056 port): same generated Corefile + lan.hosts the
+    # Debian role deploys. Derivation mirrors the ansible-groups builder.
     nixos_coredns_hosts = {
         name for name in coredns_hosts if name in nixos_names
     }
 
-    # NFS export server on NixOS (T-096, nfs_exports role port — the last
-    # Debian-only infrastructure role; its former reject-on-nixos guard is
-    # lifted). The host consumes the same generated exports file the Debian
-    # role ships, plus the pool import and hostId the NixOS ZFS module
-    # requires. Derivation mirrors the ansible-groups builder
-    # (nfs_export_hosts), which strips NixOS hosts from the Ansible play.
+    # NFS export server on NixOS (T-096). Derivation mirrors the
+    # ansible-groups builder (nfs_export_hosts), which strips NixOS hosts
+    # from the Ansible play.
     zfs_root_by_server = dict(storage_model.zfs_roots)
     nfs_by_host: dict[str, NixosNfsServer] = {}
     for server, server_exports in storage_model.exports_by_server:
@@ -447,10 +431,8 @@ def normalize_nixos(
         nfs_by_host[server] = NixosNfsServer(
             exports=server_exports,
             zfs_pool=zfs_root.lstrip("/") if zfs_root else None,
-            # Stable 8-hex hostId from the host name: ZFS ties pool ownership
-            # to the hostid, so a rebuild that changed it would refuse the
-            # import without -f. Any stable value works; sha256 avoids
-            # coordinating uniqueness by hand.
+            # Must be stable across rebuilds: a changed hostid forces
+            # `zpool import -f` (T-096).
             host_id=(
                 hashlib.sha256(server.encode()).hexdigest()[:8]
                 if zfs_root
@@ -473,9 +455,8 @@ def normalize_nixos(
         if compose_file.host not in nixos_names:
             continue
         if compose_file.stack is None:
-            # Stackless per-host compose files predate the stack layout; no
-            # NixOS host has ever carried one and the sync/unit naming assumes
-            # a stack dir. Reject loudly rather than guess a layout.
+            # The sync/unit naming assumes a stack dir; reject loudly rather
+            # than guess a layout for a stackless service group.
             raise ValueError(
                 f"host '{compose_file.host}' has compose services without a "
                 f"stack; NixOS hosts require stacked services (T-087)"
@@ -498,15 +479,11 @@ def normalize_nixos(
             )
         )
 
-    # Shared WireGuard egress gateway (T-066, wireguard_gateway role port):
-    # a NixOS gateway gets wg-quick on the host-decrypted config, the
-    # generated NAT + kill-switch ruleset, and the split-DNS resolver. The
-    # T-080 seam already routes the operator's WireGuard secret to this host
-    # (secret_sources carries it), so staged_secrets/secret_files need no
+    # Shared WireGuard egress gateway (T-066 port). The T-080 seam already
+    # routes the gateway's WireGuard secret here, so staged_secrets need no
     # special-casing. The dedicated-host contract the Debian role only
-    # documents is ENFORCED here: the kill-switch forward chain drops
-    # everything not leaving via the tunnel, which would silently break any
-    # co-located compose stack's forwarded traffic.
+    # documents is ENFORCED here: the kill-switch forward chain (policy drop)
+    # would silently break a co-located stack's forwarded traffic.
     egress_gateway_by_host: dict[str, NixosEgressGateway] = {}
     egress = services_model.egress
     if egress is not None and egress.gateway in nixos_names:
@@ -525,12 +502,10 @@ def normalize_nixos(
             interface=egress.interface
         )
 
-    # In-fleet insecure registries: a service image whose registry component
-    # is itself a fleet route host (e.g. gitea.<host>.lan/user/app) is served
-    # over plain HTTP behind the fleet proxy, so the PULLING host's docker
-    # daemon must trust it. Derived per host from the images its stacks pull.
-    # TraefikRoute.host is the MACHINE; the routed FQDN lives in the rule
-    # (built as Host(`fqdn`) in _traefik_route, mirrored here).
+    # In-fleet insecure registries: an image registry that is itself a fleet
+    # route host is served over plain HTTP behind the fleet proxy, so the
+    # PULLING host's docker daemon must trust it. TraefikRoute.host is the
+    # MACHINE; the routed FQDN lives in the rule (Host(`fqdn`)).
     fleet_route_hosts = {
         route.rule.removeprefix("Host(`").removesuffix("`)")
         for routes in services_model.traefik_routes_by_host.values()
@@ -549,20 +524,12 @@ def normalize_nixos(
         if registries:
             insecure_registries_by_host[host_name] = tuple(sorted(registries))
 
-    # T-087 config-staging slice: the per-host artifacts the Debian traefik /
-    # homepage / monitoring roles copy onto the host ride the flake tree
-    # instead. Sources are the SAME rendered files those roles ship (the
-    # staging step copies bytes, never re-renders). traefik/homepage configs
-    # live inside the stack project dir on both platforms -- the containers
-    # bind them relatively (./traefik/dynamic, ./homepage/config) -- so they
-    # stage into the stack tree; the prometheus targets file mirrors the
-    # Debian medusa_deploy_root destination (/home/medusa/medusa/monitoring)
-    # via the host's deploy-src tree. When the host runs a prometheus service
-    # in a stack, the main config plus a targets copy ALSO stage into that
-    # stack's tree (./prometheus) so the container needs no deploy-root mount
-    # and no hand-seeded config. Host derivations mirror the ansible-groups
-    # builder (service NAME, the convention the Debian plays target), so a
-    # host migrating platforms keeps the same delivery set.
+    # Config staging (T-087): the per-host artifacts the Debian roles copy
+    # onto the host ride the flake tree instead -- same rendered bytes, never
+    # re-rendered. traefik/homepage stage into the stack tree (the containers
+    # bind them relatively); prometheus targets mirror the Debian deploy-root
+    # destination. Host derivations mirror the ansible-groups builder (service
+    # NAME), so a host migrating platforms keeps the same delivery set.
     def _stack_with_service(host_name: str, service_name: str) -> str:
         for stack in stacks_by_host.get(host_name, ()):
             if any(
@@ -747,14 +714,12 @@ def normalize_native(
     dns_model: DnsModel,
     storage_model: StorageModel,
 ) -> NativeModel:
-    """Validate + derive host-native services (currently SFTP). A native service
-    must target a ``platform: nixos`` host -- no Debian native-service renderer
-    exists yet, so a debian-docker target is rejected with a clear diagnostic
-    (the explicit not-implemented boundary). Each user's storage ref resolves
-    against storage.yaml and must sit under the derived, root-owned chroot so the
-    writable area is inside the ChrootDirectory (OpenSSH correctness, derived not
-    asked). Authorized keys are public-key material carried verbatim as plain
-    inventory data (T-078 resolution). See T-076."""
+    """Validate + derive host-native services (currently SFTP; T-076). A native
+    service must target a ``platform: nixos`` host -- no Debian native-service
+    renderer exists, so other targets are rejected with a clear diagnostic.
+    Each user's storage ref resolves against storage.yaml and must sit under
+    the derived, root-owned chroot (OpenSSH correctness). Authorized keys are
+    public-key material carried verbatim as plain inventory data (T-078)."""
     hosts_by_name = {host.name: host for host in dns_model.hosts}
     mounts_by_host = dict(storage_model.mounts_by_host)
     exports_by_id = {export.id: export for export in storage_model.exports}
@@ -794,9 +759,8 @@ def normalize_native(
                     f"root-owned chroot."
                 )
             # A pinned uid is a promise about the export's file ownership --
-            # cross-check it so a mismatch fails at render time instead of as
-            # a runtime Permission denied after a deploy re-owns the dir
-            # (T-085).
+            # cross-check so a mismatch fails at render time, not as a runtime
+            # Permission denied after a deploy re-owns the dir (T-085).
             if user.uid is not None:
                 export = exports_by_id[mount.export_id]
                 if export.owner != user.uid:
@@ -816,10 +780,8 @@ def normalize_native(
                 )
             )
 
-        # Storage declarations live ONLY in storage.yaml: a share's per-member
-        # mounts are authored there (same export, one mountpoint per member,
-        # exactly like the private per-user mounts). The share block here only
-        # declares the group concept; normalize cross-checks the two files.
+        # Storage declarations live ONLY in storage.yaml: the share block
+        # declares just the group concept; cross-check the two files here.
         mounts_by_mountpoint = {
             mount.mountpoint: mount for mount in host_mounts.values()
         }
@@ -1094,17 +1056,11 @@ def normalize_storage(
     def _realize_mount(mount, host: str) -> NfsMount:
         export = exports[mount.export]
         if host == export.server:
-            # The mount's host IS the export's server (T-096): realize the
-            # same declared mapping -- "this export appears at this path on
-            # this host" -- as a local bind, never as loopback NFS. A host
-            # NFS-mounting itself deadlocks under memory pressure (client
-            # writeback waits on a server allocation in the same kernel,
-            # and `hard` retries forever). The declared mount options are
-            # NFS transport concerns (hard, vers, _netdev, automount) and
-            # do not carry over. On a ZFS server the bind REQUIRES
-            # zfs-mount: binding over a not-yet-mounted mountpoint dir
-            # would silently serve (and write to) the root filesystem --
-            # fail loudly instead, never fall through.
+            # Same-host mounts realize as local binds -- loopback NFS
+            # deadlocks under memory pressure (T-096). Declared options are
+            # NFS transport concerns and do not carry over; on a ZFS server
+            # the bind REQUIRES zfs-mount so it can never bind over the
+            # unmounted mountpoint dir and silently hit the root fs.
             return NfsMount(
                 id=mount.id,
                 host=host,
@@ -1166,11 +1122,8 @@ def normalize_storage(
             key=lambda item: item.id,
         )
         # Deduped by host: the export authorizes a CLIENT, however many times
-        # that client mounts it (an sftp shared space mounts one export at N
-        # member mountpoints, T-084; duplicate entries would trip exportfs).
-        # The server itself is never a client (T-096): its own mounts realize
-        # as local binds, so no NFS authorization exists to grant -- an
-        # export consumed only same-host renders no /etc/exports line at all.
+        # that client mounts it (T-084; duplicates would trip exportfs). The
+        # server itself is never a client -- its mounts are binds (T-096).
         client_hosts = sorted(
             {
                 host
@@ -1258,9 +1211,8 @@ def normalize_services(
         formatted = ", ".join(unknown_hosts)
         raise ValueError(f"services reference unknown hosts: {formatted}")
 
-    # A stack renders as one unit per host platform; a stack whose services
-    # straddle a Debian and a NixOS host has no coherent output target. Reject
-    # it with a clear diagnostic (T-073). Relax later if a real need appears.
+    # A stack whose services straddle a Debian and a NixOS host has no
+    # coherent output target; reject it (T-073).
     platform_by_host = {host.name: host.platform for host in dns_model.hosts}
     stack_platforms: dict[str, set[str]] = {}
     for service in services:
@@ -1306,12 +1258,9 @@ def normalize_services(
     compose_files = normalize_compose_files(inventory, compose_services, egress)
     compose_data_dirs = normalize_compose_data_dirs(compose_services)
 
-    # Compose is deliberately NOT partitioned by platform (T-087): compose
-    # files are the platform-neutral container layer, rendered identically for
-    # every docker-running host. NixOS hosts consume the same ComposeFile
-    # models again in normalize_nixos to derive delivery (stacks staged into
-    # the flake) -- the SUBSTRATE forks per platform, the container layer does
-    # not. See the Platform Fork Boundary ADR.
+    # Compose is deliberately NOT partitioned by platform (T-087): the
+    # container layer is platform-neutral; only the SUBSTRATE forks (Platform
+    # Fork Boundary ADR).
     proxies = _validate_proxy_engines(services, traefik_routes)
     _validate_proxy_network_membership(services)
 
@@ -1691,9 +1640,8 @@ def normalize_ansible_groups(
     egress_gateway_hosts = _ansible(
         (services_model.egress.gateway,) if services_model.egress else ()
     )
-    # Docker hosts that actually run a tunneled service get the tunnel network
-    # + policy routing applied. These are exactly the keys of the per-host
-    # tunnel map.
+    # Only hosts that actually run a tunneled service get the tunnel network
+    # + policy routing.
     tunnel_routing_hosts = _ansible(tuple(sorted(services_model.tunnel_services_by_host)))
     nixos_hosts = tuple(sorted(nixos_names - dormant_names))
 

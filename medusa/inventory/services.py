@@ -530,9 +530,7 @@ class ServicesInventory(BaseModel):
                 continue
             any_tunneled = True
             # A reverse proxy must stay directly reachable; routing its egress
-            # through the tunnel would break inbound routing. This is the one
-            # invariant the schema can enforce generically — see T-066 for the
-            # broader "do not tunnel ingress/tunnel-client services" guidance.
+            # through the tunnel would break inbound routing (T-066).
             if service.proxy is not None:
                 raise ValueError(
                     f"service {service.id}: egress 'tunnel' is invalid for a "
