@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from medusa.inventory.services import ServicesInventory
+from medusa.inventory.storage import StorageInventory
 from medusa.model.dns import DnsModel
 from medusa.model.services import ServicesModel
 from medusa.model.volumes import is_bind_source
@@ -26,6 +27,24 @@ def service_diagnostics(inventory: ServicesInventory) -> tuple[Diagnostic, ...]:
     for service in inventory.services:
         diagnostics.extend(_owner_diagnostics(f"service {service.id}", service))
 
+    return tuple(diagnostics)
+
+
+def storage_diagnostics(inventory: StorageInventory) -> tuple[Diagnostic, ...]:
+    # Mountpoint convention (T-097): permanent client mounts live under /srv.
+    diagnostics: list[Diagnostic] = []
+    for mount in inventory.mounts:
+        if mount.mountpoint != "/srv" and not mount.mountpoint.startswith("/srv/"):
+            diagnostics.append(
+                Diagnostic(
+                    severity=Severity.WARNING,
+                    message=(
+                        f"mount {mount.id} mountpoint {mount.mountpoint} is "
+                        "outside /srv. Permanent client mounts belong under "
+                        "/srv/<share> (mountpoint convention, T-097)."
+                    ),
+                )
+            )
     return tuple(diagnostics)
 
 

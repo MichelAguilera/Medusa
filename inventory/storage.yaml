@@ -10,6 +10,6 @@ mounts:
 - id: data
   host: [host02, host03]
   export: data
-  mountpoint: /mnt/data
+  mountpoint: /srv/data
   type: nfs
   options: [rw, hard, vers=4.2, _netdev, nofail, x-systemd.automount, noatime]

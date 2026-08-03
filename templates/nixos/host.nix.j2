@@ -356,6 +356,10 @@
     medusa-stacks-sync = {
       description = "Materialize Medusa compose stacks from the generation";
       wantedBy = [ "multi-user.target" ];
+{% if host.stacks %}
+      after = [ "docker.service" ];
+      requires = [ "docker.service" ];
+{% endif %}
       restartTriggers = [{% for stack in host.stacks %} ../stacks/{{ host.name }}/{{ stack.name }}{% endfor %}{% if host.deploy_configs %} ../deploy/{{ host.name }}{% endif %} ];
       serviceConfig = {
         Type = "oneshot";
@@ -373,6 +377,22 @@
         (cd "$src" && find . -type f -exec install -o medusa -g medusa -m 0664 {} "$dst/{}" \;)
         [ ! -d "$dst/env" ] || chmod 2770 "$dst/env"
 {% endfor %}
+{% if host.stacks %}
+        # Down compose projects whose project dir lived under the medusa
+        # stack root but left the generation — the containers are dockerd's
+        # state, not the generation's, so nothing else reaches them (T-093).
+        # Working-dir guard: a hand-run compose project elsewhere on the host
+        # is never collateral. Data dirs are left in place.
+        keep=" {% for stack in host.stacks %}/home/medusa/medusa-stacks/{{ stack.name }} {% endfor %}"
+        ${pkgs.docker}/bin/docker ps -a --filter label=com.docker.compose.project \
+          --format '{{ '{{' }}.Label "com.docker.compose.project"{{ '}}' }}|{{ '{{' }}.Label "com.docker.compose.project.working_dir"{{ '}}' }}' \
+          | sort -u | while IFS='|' read -r project dir; do
+          case "$dir" in /home/medusa/medusa-stacks/*) ;; *) continue ;; esac
+          case "$keep" in *" $dir "*) continue ;; esac
+          [ -n "$project" ] || continue
+          ${pkgs.docker}/bin/docker compose -p "$project" down --remove-orphans
+        done
+{% endif %}
 {% if host.deploy_configs %}
         # Same tree + modes as the Debian monitoring role.
         install -d -o medusa -g medusa -m 2775 /home/medusa/medusa

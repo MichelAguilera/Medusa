@@ -15,6 +15,7 @@ from medusa.diagnostics import (
     diagnostic_warnings,
     service_diagnostics,
     sops_recipient_diagnostics,
+    storage_diagnostics,
 )
 from medusa.generated import stale_files, write_generated
 from medusa.inventory.dns import parse_dns_inventory
@@ -144,15 +145,17 @@ def _load_all(
     on_diagnostics: DiagnosticHandler = lambda _: None,
 ) -> _Inventory:
     dns_model = normalize_dns(parse_dns_inventory(load_yaml(paths.dns_inventory)))
-    storage_model = normalize_storage(
-        parse_storage_inventory(load_optional_yaml(paths.storage_inventory)),
-        dns_model,
+    storage_inventory = parse_storage_inventory(
+        load_optional_yaml(paths.storage_inventory)
     )
+    storage_model = normalize_storage(storage_inventory, dns_model)
 
     services_inventory = parse_services_inventory(load_yaml(paths.services_inventory))
     _validate_secret_sources(services_inventory, paths)
 
-    diagnostics = service_diagnostics(services_inventory)
+    diagnostics = service_diagnostics(services_inventory) + storage_diagnostics(
+        storage_inventory
+    )
     on_diagnostics(diagnostics)
     _fail_on_diagnostic_errors(diagnostics)
 
