@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.28.0"
+VERSION="0.29.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -417,19 +417,113 @@ summarize_failure_log() {
     printf "\n  full log: %s%s%s\n" "$color_blue" "$log" "$color_reset" >&2
 }
 
-# Animate a braille spinner on stderr showing the latest Ansible play/task,
+# Summarize a nixos-apply failure log: host / error / per-host recap / hint,
+# the same block shape as summarize_failure_log. Only named error lines are
+# surfaced — never a raw tail, except the no-structured-failure fallback.
+# Anchors on the remote loop's '  ✗ <host>:' marker and RESULT lines (T-088).
+summarize_nixos_failure_log() {
+    local log=$1
+    if [[ ! -s "$log" ]]; then
+        return 0
+    fi
+
+    local fline lineno linetext failhost reason startline msg hint recap
+    fline=$(grep -nE '^  ✗ [^:]+:' "$log" | head -1 || true)
+
+    if [[ -z "$fline" ]]; then
+        # No host was even attempted: controller-level failure (render, plan,
+        # missing nixos-rebuild). Surface the first named error if any.
+        msg=$(grep -E '^error(\([^)]*\))?:|nixos-rebuild not found' "$log" \
+            | head -1 || true)
+        if [[ -z "$msg" ]]; then
+            printf "\n%s(no structured failure found; raw tail below)%s\n" \
+                "$color_yellow" "$color_reset" >&2
+            tail -40 "$log" >&2 || true
+            printf "\n  full log: %s\n" "$log" >&2
+            return 0
+        fi
+        failhost="(controller)"
+        lineno=$(wc -l < "$log")
+    else
+        lineno="${fline%%:*}"
+        linetext="${fline#*:}"
+        failhost=$(printf '%s' "$linetext" | sed -E 's/^  ✗ ([^:]+):.*/\1/')
+        reason=$(printf '%s' "$linetext" | sed -E 's/^  ✗ [^:]+: //')
+
+        # The salient nix error for THIS host: search only between its ==>
+        # marker and its ✗ line, or an earlier host's errors bleed in.
+        startline=$(head -n "$lineno" "$log" \
+            | grep -nE "^==> nixos-rebuild [a-z-]+: ${failhost} " \
+            | tail -1 | cut -d: -f1 || true)
+        msg=$(sed -n "${startline:-1},${lineno}p" "$log" \
+            | grep -E "^error(\([^)]*\))?:|builder for '.*' failed|Failed to start |the following units failed:" \
+            | tail -1 || true)
+        [[ -z "$msg" ]] && msg="$reason"
+    fi
+    msg=${msg//$'\n'/ }
+    if [[ ${#msg} -gt 400 ]]; then
+        msg="${msg:0:400}..."
+    fi
+
+    case "${reason:-}$msg" in
+        *"nixos-rebuild not found"*)
+            hint="The controller has no Nix. Install it (or re-run 'medusactl install-controller') before reconciling NixOS hosts." ;;
+        *"does not provide attribute"*|*"attribute"*"missing"*)
+            hint="The flake has no entry for this host — stale render or the host is not in inventory. Run 'medusactl render' and check dns.yaml." ;;
+        *"cross-wired attr/target pair"*|*"hostname preflight"*)
+            hint="The machine at the target endpoint is not '$failhost'. Fix the host's ip/endpoint in dns.yaml, or the machine's hostname (T-098)." ;;
+        *"the following units failed"*|*"Failed to start "*)
+            hint="The switch itself landed; a unit failed to start afterwards. Inspect 'systemctl status <unit>' and 'journalctl -u <unit>' on $failhost; roll back with 'nixos-rebuild --rollback' there if needed." ;;
+        *"No space left on device"*)
+            hint="Nix store is full. Run 'nix-collect-garbage -d' on the controller (build side) or the target (copy side), then retry." ;;
+        *"Permission denied"*|*"publickey"*|*"Host key verification failed"*)
+            hint="The controller cannot SSH to the target as the deploy user. Check nixos_admin_keys in inventory covers the controller key." ;;
+        *"No route to host"*|*"Connection refused"*|*"timed out"*)
+            hint="Target unreachable over SSH. Check it is powered on and resolvable from the controller." ;;
+        *)
+            hint="" ;;
+    esac
+
+    recap=$(awk '$1 == "RESULT" { printf "    %s %s\n", ($3 == "ok" ? "✓" : "✗"), $2 }' "$log")
+
+    printf "\n" >&2
+    printf "  %shost:%s  %s\n" "$color_blue" "$color_reset" "${failhost:-?}" >&2
+    printf "  %serror:%s %s\n" "$color_red" "$color_reset" "$msg" >&2
+    if [[ -n "$recap" ]]; then
+        printf "\n  %srecap:%s\n" "$color_blue" "$color_reset" >&2
+        printf '%s\n' "$recap" >&2
+    fi
+    if [[ -n "$hint" ]]; then
+        printf "\n  %shint:%s  %s\n" "$color_yellow" "$color_reset" "$hint" >&2
+    fi
+    printf "\n  full log: %s%s%s\n" "$color_blue" "$log" "$color_reset" >&2
+}
+
+# Animate a braille spinner on stderr showing the latest progress line,
 # tailed live from the deploy log, until rc_file becomes non-empty (the
 # background SSH wrote its exit code there). Clears its own line on exit. Only
-# called on a TTY. See T-050.
+# called on a TTY. Defaults match Ansible play/task lines; nix callers pass
+# their own patterns (T-050, T-088). $3 grep pattern / $4 sed cleanup select
+# the progress line; optional $5/$6 do the same for a context prefix (the
+# current host from its ==> marker).
 spin_progress() {
     local rc_file=$1 log=$2
+    local pattern=${3:-'^(TASK|PLAY) \['} clean=${4:-'s/ \*+[[:space:]]*$//'}
+    local prefix_pattern=${5:-} prefix_clean=${6:-}
     local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local i=0 frame last cols line
+    local i=0 frame last cols line prefix
     printf '\033[?25l' >&2  # hide cursor
     while [[ ! -s "$rc_file" ]]; do
         frame=${frames[i++ % ${#frames[@]}]}
-        last=$(grep -E '^(TASK|PLAY) \[' "$log" 2>/dev/null | tail -1 \
-            | sed -E 's/ \*+[[:space:]]*$//' || true)
+        last=$(grep -E "$pattern" "$log" 2>/dev/null | tail -1 \
+            | sed -E "$clean" || true)
+        if [[ -n "$prefix_pattern" ]]; then
+            prefix=$(grep -E "$prefix_pattern" "$log" 2>/dev/null | tail -1 \
+                | sed -E "${prefix_clean:-s/^/&/}" || true)
+            if [[ -n "$prefix" ]]; then
+                last="${prefix}${last:+: $last}"
+            fi
+        fi
         [[ -z "$last" ]] && last="working..."
         cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}
         line="  ${color_blue}${frame}${color_reset} ${last}"
@@ -1695,11 +1789,13 @@ while IFS=$'\t' read -r host target; do
         cat /proc/sys/kernel/hostname 2>/dev/null | tr -d '[:space:]') || true
     if [[ -z "$actual" ]]; then
         echo "  ✗ $host: hostname preflight could not read /proc/sys/kernel/hostname on $target" >&2
+        echo "RESULT $host failed"
         rc=1
         continue
     fi
     if [[ "$actual" != "$host" && "$actual" != "nixos" ]]; then
         echo "  ✗ $host: refusing $ACTION — $target reports hostname '$actual' but the flake attribute names '$host' (cross-wired attr/target pair, T-098)" >&2
+        echo "RESULT $host failed"
         rc=1
         continue
     fi
@@ -1718,7 +1814,12 @@ while IFS=$'\t' read -r host target; do
         --target-host "$target" \
         "${flags[@]}" < /dev/null; then
         echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
+        # RESULT lines are the machine-readable per-host recap the workstation
+        # formats — sturdier than regexing nix output for outcomes (T-088).
+        echo "RESULT $host failed"
         rc=1
+    else
+        echo "RESULT $host ok"
     fi
 done <<< "$plan"
 exit $rc
@@ -1742,15 +1843,57 @@ REMOTE
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
         "$action" "$refresh" "$limit")
 
+    # switch runs log-only (spinner on a TTY, plain otherwise) like run_logged;
+    # dry-activate still streams — its would-be unit changes ARE the payload
+    # the operator asked for (T-088).
     local rc=0
-    ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
-        || rc=${PIPESTATUS[0]}
+    if [[ "$action" == "switch" && -t 2 ]]; then
+        local rc_file="${log}.rc"
+        rm -f "$rc_file"
+        {
+            if ssh "${ssh_opts[@]}" "$target" "$env_prefix bash -s" \
+                <<< "$remote" >"$log" 2>&1; then
+                echo 0
+            else
+                echo "$?"
+            fi >"$rc_file"
+        } &
+        local bgpid=$!
+        spin_progress "$rc_file" "$log" \
+            '^(building|these [0-9]+ derivations|copying|stopping the following|activating the configuration|starting the following)' \
+            's/\.\.\.$//' \
+            '^==> nixos-rebuild' \
+            's/^==> nixos-rebuild [a-z-]+: ([^ ]+).*/\1/'
+        wait "$bgpid" 2>/dev/null || true
+        rc=$(cat "$rc_file" 2>/dev/null || echo 1)
+        rm -f "$rc_file"
+    elif [[ "$action" == "switch" ]]; then
+        ssh "${ssh_opts[@]}" "$target" "$env_prefix bash -s" \
+            <<< "$remote" >"$log" 2>&1 || rc=$?
+    else
+        ssh -t "${ssh_opts[@]}" "$target" "$env_prefix bash -s" <<< "$remote" 2>&1 | tee "$log" \
+            || rc=${PIPESTATUS[0]}
+    fi
     sanitize_log "$log"
     if [[ "$rc" -eq 0 ]]; then
-        printf "%s✓%s nixos-apply\n" "$color_green" "$color_reset"
+        if [[ "$action" == "switch" ]]; then
+            local ok_count skip_line
+            ok_count=$(awk '$1 == "RESULT" && $3 == "ok" { n++ } END { print n + 0 }' "$log")
+            if [[ "$ok_count" -eq 0 ]]; then
+                skip_line=$(grep -E 'skipped$' "$log" | head -1 || true)
+                printf "%s✓%s nixos-apply%s\n" "$color_green" "$color_reset" \
+                    "${skip_line:+ (${skip_line})}"
+            else
+                printf "%s✓%s nixos-apply (%s switched)\n" \
+                    "$color_green" "$color_reset" "$ok_count"
+            fi
+        else
+            printf "%s✓%s nixos-apply\n" "$color_green" "$color_reset"
+        fi
         return 0
     fi
-    printf "%s✗%s nixos-apply failed (log: %s)\n" "$color_red" "$color_reset" "$log" >&2
+    printf "%s✗%s nixos-apply failed\n" "$color_red" "$color_reset" >&2
+    summarize_nixos_failure_log "$log"
     return 1
 }
 
@@ -1763,9 +1906,9 @@ medusactl nixos-apply [--check] [--limit <pattern>] — reconcile NixOS hosts.
 Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
 --target-host <user@endpoint>' on the controller for every NixOS host in
 the fleet (the 'medusa nixos-deploy-plan' partition); non-root targets add
---use-remote-sudo (the re-exec-safe spelling, T-095). A no-op on
-an all-Debian fleet. 'medusactl deploy' runs this automatically after the
-Debian deploy; use this command to reconcile NixOS hosts on their own.
+--use-remote-sudo (the re-exec-safe spelling, T-095). 'medusactl deploy'
+runs this automatically after controller-apply; use this command to
+reconcile NixOS hosts on their own.
 
 Before each switch a hostname preflight asserts the machine at the target
 IS the host the flake attribute names (T-098); the only tolerated mismatch
@@ -3348,6 +3491,10 @@ case "${1:-}" in
         # Internal: render the failure summary for a given Ansible log. Used by
         # the deploy-error formatter tests (T-050); not a public command.
         summarize_failure_log "${2:-}"
+        ;;
+    __summarize-nixos-failure)
+        # Internal: same, for a nixos-apply log (T-088).
+        summarize_nixos_failure_log "${2:-}"
         ;;
     install-controller)
         shift
