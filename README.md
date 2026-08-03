@@ -2,7 +2,8 @@
 
 Homelab infrastructure source-of-truth and config generator. Model your
 homelab once in YAML, then generate runnable configs for CoreDNS,
-Traefik, Homepage, Docker Compose, monitoring, and Ansible deploys.
+Traefik, Homepage, Docker Compose, monitoring, and NixOS hosts — and
+deploy them with `nixos-rebuild`.
 
 ## Install
 
@@ -10,60 +11,44 @@ Traefik, Homepage, Docker Compose, monitoring, and Ansible deploys.
 curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/main/install.sh | bash
 ```
 
-See [`docs/bootstrap.md`](docs/bootstrap.md) for the full controller
-bootstrap reference and [`docs/site-management.md`](docs/site-management.md)
-for adding and deploying targets.
+The installer bootstraps a controller (a small Debian LXC or VM that
+holds the rendered artifacts and runs the deploys) and can optionally
+install the `medusactl` workstation CLI. Run `medusactl --help` for the
+full command surface: inventory git porcelain (`status`, `diff`,
+`commit`, `push`), render/deploy (`check`, `render`, `deploy`,
+`nixos-apply`, `compose`), and target onboarding (`add-target`,
+`install-nixos-target`, `seed-target`).
 
-## Prepare a Debian template
+## Deploying
 
-Run `prepare-template.sh` once on a fresh Debian 12 / 13 install (VM,
-LXC, or bare metal) to bring it into a state where `medusactl
-prep-target` can finish the bootstrap unattended on every clone.
-
-Installs `sudo`, `openssh-server`, `python3`, `qemu-guest-agent` (VMs
-only), wipes baked SSH host keys so each clone gets unique identities
-on first boot, bakes a root password, and drops in a temporary
-permissive sshd config so first-run root SSH password auth works. Once
-`medusactl prep-target` runs against a full-mode host, the harden
-block replaces the temporary drop-in and locks the root password.
-
-Run on the target host as root, with the password piped via env so it
-never lands in shell history:
-
-```bash
-read -r -s -p "Root password: " pw
-curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/main/tools/prepare-template.sh \
-  | sudo env MEDUSA_TEMPLATE_ROOT_PASSWORD="$pw" bash
-unset pw
-```
-
-Or download first to review the script before running:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/main/tools/prepare-template.sh -o prepare-template.sh
-sudo bash prepare-template.sh --root-password='<pw>'
-```
-
-After it finishes: shut the guest down, convert to a Proxmox template
-in the UI, and clone away. Each clone boots ready for `medusactl
-prep-target <name>`.
+Targets are NixOS hosts. `medusactl deploy` renders the inventory,
+refreshes the controller's `/etc/hosts` + SSH aliases
+(`controller-apply.yml`, the one Ansible playbook), then reconciles
+each host with `nixos-rebuild switch --flake` — with a hostname
+preflight that refuses to activate a configuration on the wrong
+machine. A first stand-up is `medusactl install-nixos-target`
+(nixos-anywhere + disko; the operator authors the disk layout).
+Compose remains the container layer: stacks are rendered per host,
+delivered by the flake, and driven at runtime with
+`medusactl compose <up|down|restart|pull|logs|ps|exec>` directly over
+SSH.
 
 ## Layout
 
 This repo holds the **runnable code**: the `medusa` Python package, the
-`medusactl` workstation CLI, Ansible playbooks/roles, Jinja2 templates,
-and bootstrap scripts. Operator inventory (DNS, services, storage,
-secrets) lives in a separate repo that you supply at bootstrap time — see
-[`docs/bootstrap.md`](docs/bootstrap.md) for the two-repo layout.
+`medusactl` workstation CLI, the controller bootstrap
+(`tools/bootstrap-controller.sh` + `ansible/`), and Jinja2 templates.
+Operator inventory (DNS, services, storage, secrets) lives in a
+separate private repo that you supply at bootstrap time; the demo
+`inventory/` here shows the expected shape.
 
 ## Pipeline
 
 ```
-inventory YAML → validated model → normalized model → renderers → generated artifacts → Ansible deploy
+inventory YAML → validated model → normalized model → renderers → generated artifacts → nixos-rebuild
 ```
 
-- Human-authored: `inventory/` (in your inventory repo), `templates/`,
-  `ansible/`, `docs/`.
+- Human-authored: `inventory/` (in your inventory repo), `templates/`.
 - Generated: never committed to either repo; written to an XDG state dir
   on the controller (`~/.local/state/medusa/generated` by default).
 
