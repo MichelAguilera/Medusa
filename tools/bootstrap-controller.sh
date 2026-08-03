@@ -251,8 +251,8 @@ install_controller_sudoers() {
     # sees is /bin/sh, not cp / install / python3 — sudoers cannot match
     # the tmp paths or wildcarded argv that Ansible generates. The
     # controller user therefore needs unrestricted NOPASSWD sudo, same
-    # as every other ansible user in this repo (prep-debian.sh,
-    # bootstrap-infra.sh, bootstrap-rig.sh).
+    # as every other ansible user in this repo (bootstrap-infra.sh,
+    # bootstrap-rig.sh).
     local sudoers_user sudoers_file tmp
     sudoers_user=$(id -un)
     sudoers_file="/etc/sudoers.d/medusa-controller-bootstrap"

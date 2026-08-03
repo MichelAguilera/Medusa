@@ -210,8 +210,8 @@ class HostInventory(BaseModel):
     wildcard: bool = False
     # Deploy platform (T-073). "debian-docker" renders to the Compose + fstab
     # + systemd-networkd path driven by Ansible; "nixos" renders to a Nix
-    # module/flake driven by nixos-rebuild (T-074/T-075) and is excluded from
-    # every Ansible role group. Orthogonal to ansible_managed_mode.
+    # module/flake driven by nixos-rebuild (T-074/T-075). Orthogonal to
+    # ansible_managed_mode.
     platform: Literal["debian-docker", "nixos"] = "debian-docker"
     # Host lifecycle state (T-091). "dormant" declares expected downtime: DNS
     # records and artifacts still render, but deploy dispatch skips the host

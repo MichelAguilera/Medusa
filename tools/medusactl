@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.24.3"
+VERSION="0.28.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -77,7 +77,7 @@ Usage:
     medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
                           [--zone <zone>] [--user <user>]
                           [--alias <alias> ...] [--group <group> ...]
-                          [--prep] [--authorize] [--no-seed-hosts] [--force]
+                          [--authorize] [--no-seed-hosts] [--force]
                           [--dry-run]
     medusactl remove-target <name> [--dry-run]
                             [--remove-mounts] [--remove-exports]
@@ -85,10 +85,8 @@ Usage:
     medusactl promote-target <name> [--dry-run]
     medusactl list-targets [--managed-only | --full | --limited]
     medusactl add-targets-from-file <path>
-    medusactl prep-target <name>
     medusactl authorize-target <name>
     medusactl repin-target <name> [--ip <addr>]
-    medusactl migrate-deploy-root <name> --from-user <user> [--apply]
     medusactl finalize-dns [--resolver <ip>] [--check] [--force]
     medusactl undo [--dry-run]
     medusactl history [-n <N>]
@@ -259,7 +257,7 @@ ssh_base_opts() {
     ssh_mux_opts
 }
 
-# prep-target/authorize-target make the CONTROLLER scp/ssh to the new host BY
+# authorize-target/seed-target make the CONTROLLER scp/ssh to the new host BY
 # NAME, which it cannot resolve yet on a brand-new host with no bootstrap_ip
 # (CoreDNS has no record; the /etc/hosts bootstrap block only seeds
 # bootstrap_ip hosts). These helpers add a marked TEMPORARY controller
@@ -283,7 +281,7 @@ controller_seed_temp_host() {
         MEDUSA_TEMP_HOST_NAME="$name"
         info "seeded temporary controller /etc/hosts: $name -> $ip (auto-removed when onboarding finishes)"
     else
-        warn "could not seed a temporary /etc/hosts entry for $name on the controller; prep may fail to resolve it"
+        warn "could not seed a temporary /etc/hosts entry for $name on the controller; onboarding may fail to resolve it"
     fi
 }
 
@@ -309,13 +307,12 @@ remote_command() {
     # hardcoded relative inventory path (wrong since T-038 moved generated/
     # to the XDG state dir); ansible.cfg cannot expand env vars, so this env
     # knob is the only robust override.
-    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; export ANSIBLE_INVENTORY=%q,%q; cd %q && %s' \
+    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; export ANSIBLE_INVENTORY=%q; cd %q && %s' \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH/ansible/inventory/hosts.ini" \
-        "$MEDUSA_CONTROLLER_GENERATED_PATH/ansible/inventory/medusa-groups.yml" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$command"
 }
@@ -966,10 +963,9 @@ cmd_check() {
     cmd_audit_targets || true
 }
 
-# SSH-hardening audit. 'full' hosts get the sshd + root-account probe;
-# 'limited' hosts get reachability + sudo only — their hardening surface is
-# the operator's, intentionally outside medusa's audit scope. Warns on
-# findings; never fails the overall check.
+# Managed-host audit: reachability + sudo probe per host — hardening is the
+# operator's, intentionally outside medusa's audit scope. Warns on findings;
+# never fails the overall check.
 cmd_audit_targets() {
     local target log
     target=$(ssh_target)
@@ -999,7 +995,6 @@ while IFS= read -r line; do
     # Skip rows that don't start with the managed-mode prefix letter.
     [[ "$line" =~ ^[FL][[:space:]] ]] || continue
 
-    mode=$(awk '{print $1}' <<< "$line")
     name=$(awk '{print $2}' <<< "$line")
     ip=$(awk '{print $3}' <<< "$line")
     user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
@@ -1008,71 +1003,22 @@ while IFS= read -r line; do
 
     checked=$((checked + 1))
 
-    if [[ "$mode" == "L" ]]; then
-        # Limited mode: reachability + sudo only. Hardening checks belong
-        # to the operator, not medusa.
-        # -n: don't read from stdin, otherwise ssh swallows the outer
-        # 'read -r line' loop's heredoc and the loop exits after the
-        # first iteration.
-        # Use hostname (not ip) so the controller's /etc/hosts
-        # bootstrap block (bootstrap_ip override) routes the
-        # connection during the cutover phase. /etc/hosts -> DNS
-        # fallback keeps this correct when bootstrap_ip is unset.
-        if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
-                -o StrictHostKeyChecking=accept-new "${user}@${name}" \
-                'sudo -n true' >/dev/null 2>&1; then
-            printf "  ✓ %s (%s@%s): reachable + sudo ok (limited; hardening checks skipped)\n" \
-                "$name" "$user" "$ip"
-        else
-            printf "  ! %s (%s@%s): unreachable or sudo -n unavailable (limited)\n" \
-                "$name" "$user" "$ip"
-            findings=$((findings + 1))
-        fi
-        continue
-    fi
-
-    # Full mode: existing sshd + root-account probe.
-    # -n: see L-mode comment above. Hostname target: same reason.
-    sshd_out=$(ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
-        -o StrictHostKeyChecking=accept-new "${user}@${name}" \
-        'sudo -n sshd -T 2>/dev/null; echo "---"; sudo -n passwd -S root 2>/dev/null' \
-        2>/dev/null) || {
-        printf "  ! %s (%s@%s): unreachable or sudo -n unavailable\n" \
+    # -n: don't read from stdin, otherwise ssh swallows the outer
+    # 'read -r line' loop's heredoc and the loop exits after the
+    # first iteration.
+    # Use hostname (not ip) so the controller's /etc/hosts
+    # bootstrap block (bootstrap_ip override) routes the
+    # connection during the cutover phase. /etc/hosts -> DNS
+    # fallback keeps this correct when bootstrap_ip is unset.
+    if ssh -n -o BatchMode=yes -o ConnectTimeout=5 \
+            -o StrictHostKeyChecking=accept-new "${user}@${name}" \
+            'sudo -n true' >/dev/null 2>&1; then
+        printf "  ✓ %s (%s@%s): reachable + sudo ok (limited; hardening checks skipped)\n" \
+            "$name" "$user" "$ip"
+    else
+        printf "  ! %s (%s@%s): unreachable or sudo -n unavailable (limited)\n" \
             "$name" "$user" "$ip"
         findings=$((findings + 1))
-        continue
-    }
-
-    permit=$(awk -F= '
-        BEGIN { val = "?" }
-        /^---$/ { exit }
-        tolower($1) ~ /^permitrootlogin[[:space:]]*$/ { val = $2; next }
-        /^[[:space:]]*permitrootlogin[[:space:]]/ {
-            sub(/^[[:space:]]*permitrootlogin[[:space:]]+/, "", $0)
-            val = $0
-        }
-        END { print val }
-    ' <<< "$sshd_out")
-    [[ "$permit" == "?" ]] && permit=$(grep -i '^permitrootlogin ' <<< "$sshd_out" | awk '{print $2}' | head -n1)
-    [[ -z "$permit" ]] && permit="?"
-
-    root_status=$(awk '/^---$/{flag=1; next} flag' <<< "$sshd_out" | awk '{print $2}' | head -n1)
-    [[ -z "$root_status" ]] && root_status="?"
-
-    bad=()
-    case "$permit" in
-        yes|without-password) bad+=("PermitRootLogin=$permit") ;;
-    esac
-    if [[ "$root_status" == "P" ]]; then
-        bad+=("root account has password (status=$root_status)")
-    fi
-
-    if [[ ${#bad[@]} -gt 0 ]]; then
-        findings=$((findings + 1))
-        printf "  ! %s (%s@%s): %s\n" "$name" "$user" "$ip" "$(IFS='; '; echo "${bad[*]}")"
-    else
-        printf "  ✓ %s (%s@%s): PermitRootLogin=%s root-status=%s\n" \
-            "$name" "$user" "$ip" "$permit" "$root_status"
     fi
 done <<< "$hosts"
 
@@ -1142,18 +1088,14 @@ cmd_deploy() {
         cat <<EOF
 medusactl deploy [--check] [--limit <pattern>] — render and apply the fleet.
 
-Runs controller-apply.yml then deploy.yml on the controller, then reconciles any
-NixOS hosts (nixos-rebuild). Without --limit this touches every managed host.
+Runs controller-apply.yml on the controller (the /etc/hosts + ssh-config
+refresh), then reconciles the fleet with nixos-rebuild. The Debian ansible
+deploy path was retired with T-096 phase 3.
 
-  --check            Dry run (ansible --check --diff; NixOS dry-activate).
-  --limit <pattern>  Scope the run to a subset. <pattern> is an Ansible host
-                     pattern: a host (host01), a comma list (host01,host02),
-                     a group (docker_hosts), a glob (web*) or a union/negation
-                     (foo:!bar). The controller plays (preflight staleness gate,
-                     /etc/hosts + ssh-config refresh) always run regardless, so a
-                     targeted host stays resolvable. The NixOS reconcile is
-                     limited to NixOS hosts whose NAME matches the pattern; group
-                     names and negations only affect the Debian deploy.
+  --check            Dry run (controller-apply --check --diff; NixOS dry-activate).
+  --limit <pattern>  Reconcile only NixOS hosts whose NAME matches <pattern>
+                     (host, comma list, or glob). controller-apply always runs
+                     unrestricted so a targeted host stays resolvable.
 
 Examples:
   medusactl deploy --limit host01
@@ -1178,33 +1120,24 @@ EOF
         esac
     done
     require_clean_for_deploy
-    # Union medusa_control into deploy.yml's --limit so the controller-side
-    # preflight (staleness gate) still runs on a targeted deploy.
-    # controller-apply.yml stays UNRESTRICTED: limiting it to a non-controller
-    # host would no-op the /etc/hosts + ssh-config refresh the targeted host
-    # needs to stay resolvable. Single-quote the value so the remote shell
-    # does not glob '*' or interpret '!'/'&' before ansible parses it.
-    local deploy_limit=""
-    if [[ -n "$limit" ]]; then
-        deploy_limit=" --limit 'medusa_control:${limit}'"
-        info "limiting deploy to: $limit (controller plays always run)"
-    fi
+    # controller-apply stays UNRESTRICTED under --limit: limiting it would
+    # no-op the /etc/hosts + ssh-config refresh a targeted host needs to
+    # stay resolvable.
+    [[ -z "$limit" ]] || info "limiting the NixOS reconcile to: $limit (controller-apply always runs)"
     if [[ "$check" -eq 1 ]]; then
         run_logged deploy-check \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff && uv run ansible-playbook playbooks/deploy.yml --check --diff${deploy_limit}" \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff" \
             || fail "deploy --check failed"
-        # T-075: refresh=0 — the render above already refreshed the flake;
-        # dry-activate mirrors the Ansible --check.
+        # T-075: refresh=0 — the render above already refreshed the flake.
         _nixos_apply_run dry-activate 0 "$limit"
     else
         require_controller_apply_prereqs deploy \
             || fail "deploy prerequisites failed"
-        # controller-apply BEFORE deploy: it rewrites the controller's
-        # /etc/hosts + ~/.ssh/config aliases that deploy.yml's hostname-based
-        # SSH depends on; the reverse order resolves through stale entries
-        # and fails before controller-apply could fix them ('&&').
+        # controller-apply BEFORE the reconcile: it rewrites the controller's
+        # /etc/hosts + ~/.ssh/config aliases that nixos-rebuild's
+        # hostname-based SSH depends on.
         run_logged deploy \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml && uv run ansible-playbook playbooks/deploy.yml${deploy_limit}" \
+            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml" \
             || fail "deploy failed"
         # T-075: refresh=0 — the deploy step just rendered.
         _nixos_apply_run switch 0 "$limit"
@@ -1213,9 +1146,8 @@ EOF
 
 # Fetch the rendered stack table from the controller: one tab-separated row
 # per stack, 'stack host services platform state'. The platform/state columns
-# are what the runtime-verb routing decides on (T-092); a controller release
-# that predates them emits three columns, and callers degrade to the legacy
-# ansible path (where compose_guard keeps zero-host runs loud).
+# are what the runtime-verb routing decides on (T-092); rows without
+# platform=nixos are a hard error since the ansible path retired (T-096).
 fetch_stacks() {
     local target
     local -a ssh_opts
@@ -1237,11 +1169,9 @@ REMOTE
          bash -s" <<< "$remote"
 }
 
-# Non-interactive runtime verb on a NixOS-hosted stack (T-092). No ansible --
-# NixOS hosts are outside docker_hosts by design -- and no TTY; run_logged
-# captures the run. Path mirrors _compose_interactive. The verb mapping keeps
-# parity with the ansible path; on NixOS 'up' is a runtime start, NOT
-# delivery: the compose file only changes via nixos-apply.
+# Non-interactive runtime verb on a NixOS-hosted stack (T-092); no TTY, so
+# run_logged captures the run. Path mirrors _compose_interactive. 'up' is a
+# runtime start, NOT delivery: the compose file only changes via nixos-apply.
 _compose_runtime_direct() {
     local action=$1 target_host=$2 stack=$3 service=${4:-}
     local -a dcargs
@@ -1359,33 +1289,27 @@ REMOTE
 cmd_compose() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
         cat <<EOF
-medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--check] [--pull]
-                  Drive the Compose lifecycle on docker_hosts. The default
-                  'deploy' only STAGES stack files (medusa_compose_apply=false);
-                  these verbs actually change runtime state.
+medusactl compose <verb> [stack] [--service <name>] [--host <pattern>] [--pull]
+                  Drive the Compose runtime lifecycle. Config changes deliver
+                  via 'medusactl deploy' / 'nixos-apply'; these verbs change
+                  runtime state on the host.
 
 Lifecycle verbs:
-  up        Bring stacks to state=present (start containers). On NixOS hosts
-            this is a RUNTIME start of the flake-materialized generation --
-            the inverse of 'down', e.g. to revive a parked stack; it does NOT
-            deliver config edits (that stays 'medusactl deploy' /
-            'nixos-apply'). On debian hosts it renders, stages, and applies
-            (ansible-routed delivery).
-  down      Bring stacks to state=stopped.
-  restart   Restart stacks (compose v2 'restarted').
-  pull      Pull newer images and recreate changed containers (state=present,
-            pull=always). 'compose up <stack> --pull' is the same for one stack.
+  up        RUNTIME start of the flake-materialized generation -- the inverse
+            of 'down', e.g. to revive a parked stack; it does NOT deliver
+            config edits (that stays 'medusactl deploy' / 'nixos-apply').
+  down      Stop a stack's containers.
+  restart   Restart stacks.
+  pull      Pull newer images and recreate changed containers.
+            'compose up <stack> --pull' is the same for one stack.
   list      Print the rendered stacks (stack / host / services / platform /
             state) and exit.
 
 Runtime routing (T-092): up/down/restart/pull resolve the stack on the
-controller first. A stack on an active NixOS host runs 'docker compose' there
-directly over SSH (up->up -d, down->stop, restart->restart, pull->up -d
---pull always) -- no ansible, no clean-tree requirement, works mid-edit.
-Debian-hosted stacks keep the legacy ansible path (frozen; see
-architecture-decisions, "New work is NixOS-native only"). Fleet-wide runs
-cover every active NixOS stack and then any debian stacks; dormant hosts'
-stacks are skipped with a notice.
+controller first, then run 'docker compose' on its host directly over SSH
+(up->up -d, down->stop, restart->restart, pull->up -d --pull always) -- no
+clean-tree requirement, works mid-edit. The Debian ansible path was retired
+with T-096 phase 3; dormant hosts' stacks are skipped with a notice.
 
 Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
   logs      Stream a stack's logs (pass -f to follow, via -- ).
@@ -1401,12 +1325,7 @@ Targeting:
                      (direct NixOS path: exact host name).
                      Interactive: the host a stack lives on, when it is on >1 host.
   --pull             (up only) force an image re-pull on apply.
-  --check            (lifecycle only) dry run (ansible --check --diff); not
-                     supported on the direct NixOS path.
   -- <args...>       (interactive only) forward args verbatim to 'docker compose'.
-
-The Docker engine is a Tier-2 dependency Medusa owns; the docker_engine role
-(run by 'up') installs it when absent and leaves an existing install untouched.
 
 Examples:
   medusactl compose up
@@ -1447,19 +1366,14 @@ EOF
         return $?
     fi
 
-    local play mutating=1
     case "$action" in
-        up)      play=compose-up.yml ;;
-        down)    play=compose-stop.yml; mutating=0 ;;
-        restart) play=compose-restart.yml ;;
-        pull)    play=compose-pull.yml ;;
+        up|down|restart|pull) ;;
         *) fail "compose: unknown verb '$action' (expected up|down|restart|pull|logs|ps|exec|list)" ;;
     esac
 
-    local check="" stack="" service="" host="" pull=0
+    local stack="" service="" host="" pull=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --check) check=" --check --diff"; shift ;;
             --service) shift; [[ -n "${1:-}" ]] || fail "compose: --service requires a name"; service=$1; shift ;;
             --service=*) service=${1#--service=}; [[ -n "$service" ]] || fail "compose: --service requires a name"; shift ;;
             --host) shift; [[ -n "${1:-}" ]] || fail "compose: --host requires a host pattern"; host=$1; shift ;;
@@ -1479,11 +1393,8 @@ EOF
     [[ "$action" == "up" && "$pull" -eq 1 ]] && direct_action=pull
 
     # T-092: resolve the target against the controller's stack table BEFORE
-    # dispatch -- the ansible plays never reach a NixOS-hosted stack (nixos
-    # hosts are stripped from docker_hosts). Debian stacks fall through to the
-    # frozen legacy ansible path (architecture-decisions, "New work is
-    # NixOS-native only"); rows missing the platform column fall through
-    # wholesale, and compose_guard keeps any zero-host run loud.
+    # dispatch. Only the direct NixOS path remains (the ansible plays retired
+    # with T-096 phase 3); a non-nixos row is a hard error, never a silent skip.
     local stacks_tsv direct_failures=0
     stacks_tsv=$(fetch_stacks) \
         || fail "compose $action: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
@@ -1501,22 +1412,24 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
         fi
         local row_host row_platform row_state
         IFS=$'\t' read -r _ row_host _ row_platform row_state <<<"$matches"
-        if [[ "$row_platform" == "nixos" ]]; then
-            [[ "$row_state" != "dormant" ]] || fail "compose $action: '$stack' is on '$row_host', which is declared dormant (T-091); wake it in dns.yaml first"
-            [[ -z "$check" ]] || fail "compose $action: --check is not supported on the direct NixOS path"
-            [[ "$action" != "up" ]] || info "nixos: starting '$stack' from the materialized generation (runtime only; config changes deliver via 'medusactl deploy')"
-            _compose_runtime_direct "$direct_action" "$row_host" "$stack" "$service"
-            return $?
-        fi
+        [[ "$row_platform" == "nixos" ]] \
+            || fail "compose $action: '$stack' is on '$row_host' (platform '${row_platform:-?}'); the ansible compose path was retired with T-096 phase 3 — migrate the host to nixos or run docker compose there by hand"
+        [[ "$row_state" != "dormant" ]] || fail "compose $action: '$stack' is on '$row_host', which is declared dormant (T-091); wake it in dns.yaml first"
+        [[ "$action" != "up" ]] || info "nixos: starting '$stack' from the materialized generation (runtime only; config changes deliver via 'medusactl deploy')"
+        _compose_runtime_direct "$direct_action" "$row_host" "$stack" "$service"
+        return $?
     else
-        # Fleet-wide: NixOS hosts are stripped from docker_hosts, so without
-        # the direct path a fleet 'up' silently skipped them. Dormant hosts'
-        # stacks are declared downtime (T-091): skipped with a notice, never
-        # an error.
+        # Fleet-wide. Dormant hosts' stacks are declared downtime (T-091):
+        # skipped with a notice, never an error. A surviving non-nixos row is
+        # a hard error — nothing can deliver to it anymore.
         local nixos_rows legacy_rows dormant_rows
         nixos_rows=$(awk -F'\t' '$4=="nixos" && $5!="dormant"' <<<"$stacks_tsv")
-        legacy_rows=$(awk -F'\t' '$4!="" && $4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
+        legacy_rows=$(awk -F'\t' '$4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
         dormant_rows=$(awk -F'\t' '$5=="dormant"' <<<"$stacks_tsv")
+        if [[ -n "$legacy_rows" ]]; then
+            fail "compose $action: non-nixos stack(s) in the render; the ansible compose path was retired with T-096 phase 3:
+$(awk -F'\t' '{print "  " $1 " (" $2 ")"}' <<<"$legacy_rows")"
+        fi
         if [[ -n "$dormant_rows" ]]; then
             local d_stack d_host d_rest
             while IFS=$'\t' read -r d_stack d_host d_rest; do
@@ -1526,38 +1439,16 @@ $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
         if [[ -n "$nixos_rows" ]]; then
             local n_stack n_host n_rest
             while IFS=$'\t' read -r n_stack n_host n_rest; do
-                # </dev/null: run_logged's inner ssh must not eat the rows
-                # this loop is still reading from its own stdin.
+                # </dev/null: the inner ssh must not eat the rows this loop
+                # is still reading from its own stdin.
                 _compose_runtime_direct "$direct_action" "$n_host" "$n_stack" "" </dev/null \
                     || direct_failures=$((direct_failures + 1))
             done <<<"$nixos_rows"
-            if [[ -z "$legacy_rows" ]]; then
-                [[ "$direct_failures" -eq 0 ]] \
-                    || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
-                return 0
-            fi
         fi
+        [[ "$direct_failures" -eq 0 ]] \
+            || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
+        return 0
     fi
-
-    # Mutating verbs (up/restart/pull) follow the deploy clean-tree discipline;
-    # 'down' is a runtime stop and must work even mid-edit.
-    [[ "$mutating" -eq 1 ]] && require_clean_for_deploy
-
-    # Single-quote values so the remote shell leaves stack slashes and pattern
-    # chars intact for ansible. --host unions in medusa_control so compose-up's
-    # preflight play still runs (as deploy does).
-    local extra=""
-    [[ -n "$stack" ]]   && extra+=" -e medusa_compose_target='${stack}'"
-    [[ -n "$service" ]] && extra+=" -e medusa_compose_service='${service}'"
-    [[ "$pull" -eq 1 ]] && extra+=" -e medusa_compose_pull=always"
-    local limit=""
-    [[ -n "$host" ]] && limit=" --limit 'medusa_control:${host}'"
-
-    run_logged "compose-$action" \
-        "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/$play$check$extra$limit" \
-        || return 1
-    [[ "$direct_failures" -eq 0 ]] \
-        || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
 }
 
 cmd_controller_apply() {
@@ -1796,6 +1687,25 @@ rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
     echo "==> nixos-rebuild $ACTION: $host ($target)"
+    # The machine at the target must BE the host the flake attribute names;
+    # 'nixos' is allowed as the nixos-anywhere installer default on a first
+    # deploy (T-098). -n: same stdin rule as the nixos-rebuild call below.
+    actual=$(ssh -n -o BatchMode=yes -o ConnectTimeout=10 \
+        -o StrictHostKeyChecking=accept-new "$target" \
+        cat /proc/sys/kernel/hostname 2>/dev/null | tr -d '[:space:]') || true
+    if [[ -z "$actual" ]]; then
+        echo "  ✗ $host: hostname preflight could not read /proc/sys/kernel/hostname on $target" >&2
+        rc=1
+        continue
+    fi
+    if [[ "$actual" != "$host" && "$actual" != "nixos" ]]; then
+        echo "  ✗ $host: refusing $ACTION — $target reports hostname '$actual' but the flake attribute names '$host' (cross-wired attr/target pair, T-098)" >&2
+        rc=1
+        continue
+    fi
+    if [[ "$actual" == "nixos" && "$host" != "nixos" ]]; then
+        echo "  hostname preflight: $target reports the installer default 'nixos' (first deploy); proceeding"
+    fi
     # Old remote-sudo spelling only: nixos-rebuild re-execs the flake-pinned
     # inner binary with the original argv, and old inner binaries reject
     # --elevate=sudo (T-095). Root targets need no elevation at all.
@@ -1857,6 +1767,10 @@ the fleet (the 'medusa nixos-deploy-plan' partition); non-root targets add
 an all-Debian fleet. 'medusactl deploy' runs this automatically after the
 Debian deploy; use this command to reconcile NixOS hosts on their own.
 
+Before each switch a hostname preflight asserts the machine at the target
+IS the host the flake attribute names (T-098); the only tolerated mismatch
+is the nixos-anywhere installer default 'nixos' on a first deploy.
+
   --check            dry-activate (build + show the activation diff), no switch.
   --limit <pattern>  Reconcile only NixOS hosts whose NAME matches <pattern>
                      (host, comma list, or glob).
@@ -1892,8 +1806,8 @@ medusactl install-nixos-target <host> --ip <addr> [--force] — first-time NixOS
                   stand-up via nixos-anywhere + disko.
 
 Installs NixOS onto a FRESH box from the generated flake, partitioning its disks
-declaratively via disko. This is the once-per-host analogue of prep-target for
-the Debian path; ongoing changes use 'medusactl nixos-apply'.
+declaratively via disko. This runs once per host; ongoing changes use
+'medusactl nixos-apply'.
 
   <host>        flake attribute (generated/nixos#<host>); must already be in
                 inventory as platform: nixos and rendered.
@@ -2085,61 +1999,6 @@ EOF
     return 0
 }
 
-_run_remote_with_render_and_apply() {
-    # $1 is the bash snippet run BEFORE render (typically a medusa add-host
-    # or remove-host call). Mode "dry-run" omits the render + apply tail:
-    # the pre-script validates without writing, so there is nothing to deploy.
-    local pre_script=$1 name=$2 mode=${3:-apply} log target install_rc=0
-    target=$(ssh_target)
-    log=$(log_path "$name")
-
-    if [[ "$mode" != "dry-run" ]]; then
-        require_controller_apply_prereqs "$name" \
-            || return 1
-    fi
-
-    local tail=""
-    if [[ "$mode" != "dry-run" ]]; then
-        tail="uv run medusa render
-cd ansible
-uv run ansible-playbook playbooks/controller-apply.yml"
-    fi
-
-    local full_script
-    full_script=$(cat <<REMOTE
-set -euo pipefail
-export PATH="\$HOME/.local/bin:\$PATH"
-export MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH")
-export MEDUSA_INVENTORY_ROOT=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH")
-export MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory")
-export MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets")
-export MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH")
-cd "\$MEDUSA_CONTROLLER_PATH"
-${pre_script}
-${tail}
-REMOTE
-)
-
-    local ssh_opts
-    mapfile -t ssh_opts < <(ssh_base_opts)
-
-    printf "%s==>%s %s\n" "$color_blue" "$color_reset" "$name"
-    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
-    printf "log:    %s\n" "$log"
-
-    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$full_script" 2>&1 | tee "$log" \
-        || install_rc=${PIPESTATUS[0]}
-    sanitize_log "$log"
-    stty sane 2>/dev/null || true
-    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
-    if [[ "$install_rc" -eq 0 ]]; then
-        printf "%s✓%s %s\n" "$color_green" "$color_reset" "$name"
-        return 0
-    fi
-    printf "%s✗%s %s (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
-    return 1
-}
-
 cmd_add_target() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
@@ -2149,15 +2008,15 @@ Usage:
   medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
                        [--zone <zone>] [--user <user>]
                        [--alias <alias> ...] [--group <group> ...]
-                       [--prep] [--seed] [--authorize] [--no-seed-hosts]
+                       [--seed] [--authorize] [--no-seed-hosts]
                        [--force] [--dry-run] [--interactive]
 
 Interactive mode:
   Invoking 'medusactl add-target <name>' with no other flags on a TTY,
   or passing '--interactive' explicitly, drops into a prompt session
   that collects --ip, --bootstrap-ip, --user, --zone, mode, the
-  post-add side-effect flags (--prep if full, --seed if limited,
-  --authorize), and --no-seed-hosts. Each prompt shows a default in
+  post-add side-effect flags (--seed if limited, --authorize), and
+  --no-seed-hosts. Each prompt shows a default in
   [brackets] and accepts the default on bare Enter. A summary block
   with Y/n confirmation is printed before any write. Non-TTY callers
   still fail fast on missing --ip — scripted contracts are preserved.
@@ -2172,30 +2031,17 @@ Flags:
   --alias <alias>        DNS alias. Repeat for multiple.
   --group <group>        Ansible inventory group. Repeat for multiple.
   --limited              Mark host as 'limited' managed mode (baremetal /
-                         pre-existing). Disables prep-target and root-SSH
-                         hardening audit for this host. Without this flag
-                         the host defaults to 'limited' anyway; passing
-                         --full is required to opt into the destructive
-                         template-prep flow.
-  --full                 Mark host as 'full' managed mode. Required to
-                         allow prep-target + hardening audit. Mutually
+                         pre-existing). Without this flag the host
+                         defaults to 'limited' anyway.
+  --full                 Mark host as 'full' managed mode. Mutually
                          exclusive with --limited.
-  --prep                 After add, run host prep against the target
-                         via root SSH (prompts for shared root password).
-                         Mode-aware: on --full hosts runs general prep
-                         + hardening (sshd clamp + root lock); on
-                         --limited hosts runs general prep only (no
-                         destructive sshd or root edits). Defaults to
-                         --full when --limited is not also passed.
   --seed                 After add, run seed-target against the target
                          (limited mode only): minimal ssh-copy-id +
                          /etc/sudoers.d/<user> NOPASSWD fragment, no
                          apt install. Use when the ansible user
-                         already exists on the target. For hosts where
-                         the ansible user does not exist yet, use
-                         --prep --limited instead. Mutually exclusive
-                         with --prep / --full.
-  --authorize            After add (and prep/seed, if requested), run
+                         already exists on the target. Mutually
+                         exclusive with --full.
+  --authorize            After add (and seed, if requested), run
                          ssh-copy-id from controller to target (prompts
                          for target user's SSH password). Redundant
                          with --seed, which already authorizes the key.
@@ -2209,13 +2055,13 @@ Flags:
   --dry-run              Run medusa add-host --dry-run on the controller:
                          validate the proposed edit and print a unified
                          diff of inventory/dns.yaml; do not write, do not
-                         render, do not apply. Incompatible with --prep
-                         and --authorize.
+                         render, do not apply. Incompatible with
+                         --authorize.
 
 Examples:
   medusactl add-target host01 --ip 10.0.0.10
   medusactl add-target host01 --ip 10.0.0.10 --dry-run
-  medusactl add-target host02 --ip 10.0.0.11 --prep --authorize
+  medusactl add-target host02 --ip 10.0.0.11 --authorize
   medusactl add-target dns --ip 10.0.0.250 --alias coredns --group coredns_hosts
 
 Exit codes: 0 success, non-zero on any failure.
@@ -2234,7 +2080,7 @@ EOF
     shift
 
     local original_flag_count=$#
-    local ip="" bootstrap_ip="" user="ansible" force=0 prep=0 authorize=0 dry_run=0
+    local ip="" bootstrap_ip="" user="ansible" force=0 authorize=0 dry_run=0
     local interactive=0 no_seed_hosts=0 seed=0
     local mode=""  # "", "full", or "limited"
     local -a zones=() aliases=() groups=()
@@ -2249,7 +2095,6 @@ EOF
             --limited) mode="limited" ;;
             --full) mode="full" ;;
             --force) force=1 ;;
-            --prep) prep=1 ;;
             --authorize) authorize=1 ;;
             --seed) seed=1 ;;
             --dry-run) dry_run=1 ;;
@@ -2260,9 +2105,6 @@ EOF
         shift
     done
 
-    if [[ "$seed" -eq 1 && "$prep" -eq 1 ]]; then
-        fail "add-target: --seed and --prep are mutually exclusive (seed is limited-mode, prep is full-mode)"
-    fi
     if [[ "$seed" -eq 1 && "$mode" == "full" ]]; then
         fail "add-target: --seed cannot be combined with --full (seed is for limited-mode hosts only)"
     fi
@@ -2291,19 +2133,10 @@ EOF
                 *) fail "add-target: invalid mode '$mode_input' (expected 'limited' or 'full')" ;;
             esac
         fi
-        if [[ "$prep" -eq 0 && "$seed" -eq 0 ]]; then
-            local prep_q
-            if [[ "$mode" == "full" ]]; then
-                prep_q="Run prep-target after add (general prep + hardening: sshd clamp + root lock)"
-            else
-                prep_q="Run prep-target after add (general prep only on limited mode; no sshd or root touch)"
-            fi
-            confirm "$prep_q" "n" && prep=1
+        if [[ "$mode" == "limited" && "$seed" -eq 0 ]]; then
+            confirm "Run seed-target after add (minimal: key + sudoers only, no apt; requires user to already exist)" "n" && seed=1
         fi
-        if [[ "$mode" == "limited" && "$prep" -eq 0 && "$seed" -eq 0 ]]; then
-            confirm "Or run seed-target instead (minimal: key + sudoers only, no apt; requires user to already exist)" "n" && seed=1
-        fi
-        if [[ "$authorize" -eq 0 && "$prep" -eq 0 && "$seed" -eq 0 ]]; then
+        if [[ "$authorize" -eq 0 && "$seed" -eq 0 ]]; then
             confirm "Run authorize-target after add (ssh-copy-id only)" "n" && authorize=1
         fi
         if [[ "$no_seed_hosts" -eq 0 ]]; then
@@ -2320,7 +2153,6 @@ EOF
         [[ ${#aliases[@]} -gt 0 ]] && info "  aliases:      ${aliases[*]}"
         [[ ${#groups[@]}  -gt 0 ]] && info "  groups:       ${groups[*]}"
         info "  mode:         $mode"
-        info "  prep:         $([[ $prep -eq 1 ]] && echo yes || echo no)"
         info "  seed:         $([[ $seed -eq 1 ]] && echo yes || echo no)"
         info "  authorize:    $([[ $authorize -eq 1 ]] && echo yes || echo no)"
         info "  no-seed-hosts:$([[ $no_seed_hosts -eq 1 ]] && echo " yes" || echo " no")"
@@ -2330,21 +2162,13 @@ EOF
         confirm "Proceed" "y" || fail "add-target: aborted by user"
     fi
 
-    if [[ "$dry_run" -eq 1 ]]; then
-        if [[ "$prep" -eq 1 || "$authorize" -eq 1 ]]; then
-            fail "add-target: --dry-run cannot be combined with --prep or --authorize"
-        fi
+    if [[ "$dry_run" -eq 1 && "$authorize" -eq 1 ]]; then
+        fail "add-target: --dry-run cannot be combined with --authorize"
     fi
 
     [[ -n "$ip" ]] || fail "add-target: --ip is required"
     if [[ ${#zones[@]} -eq 0 ]]; then
         zones=(lan)
-    fi
-
-    # T-043: the managed mode, not --prep, decides the harden gate
-    # (MEDUSA_PREP_HARDEN); bare --prep only defaults an unset mode to full.
-    if [[ "$prep" -eq 1 && -z "$mode" ]]; then
-        mode="full"
     fi
 
     local args
@@ -2367,30 +2191,19 @@ EOF
         return 0
     fi
 
-    # If we are about to reach into the host (prep/seed/authorize) and it has no
+    # If we are about to reach into the host (seed/authorize) and it has no
     # bootstrap_ip, seed a temporary controller /etc/hosts entry so the first
     # connection resolves. Removed at the very end (and by the EXIT trap on
     # failure). Uses bootstrap_ip when set, else the canonical IP.
-    if [[ "$prep" -eq 1 || "$seed" -eq 1 || "$authorize" -eq 1 ]]; then
+    if [[ "$seed" -eq 1 || "$authorize" -eq 1 ]]; then
         controller_seed_temp_host "$name" "${bootstrap_ip:-$ip}"
     fi
 
-    if [[ "$prep" -eq 1 ]]; then
-        cmd_prep_target "$name" || fail "add-target: prep-target failed"
-    fi
     if [[ "$seed" -eq 1 ]]; then
         cmd_seed_target "$name" || fail "add-target: seed-target failed"
     fi
     if [[ "$authorize" -eq 1 ]]; then
-        if [[ "$prep" -eq 1 ]]; then
-            # prep-target already authorized the controller key. authorize-target
-            # installs the key over PASSWORD auth, which can't succeed against the
-            # passwordless, key-only user prep just created — so running it here
-            # is both redundant and guaranteed to fail. Skip it.
-            info "authorize-target skipped: prep-target already authorized the controller key"
-        else
-            cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
-        fi
+        cmd_authorize_target "$name" || fail "add-target: authorize-target failed"
     fi
 
     controller_clear_temp_host
@@ -2543,189 +2356,6 @@ EOF
            medusa list-hosts $extra )
 }
 
-cmd_prep_target() {
-    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-        cat <<EOF
-medusactl prep-target — (re-)run host prep against an existing target.
-
-Detects the target OS family and runs the matching prep script
-(prep-debian.sh / prep-arch.sh) via the prep-host.sh dispatcher, so
-Debian- and Arch-family hosts (incl. Omarchy) are both supported.
-
-Usage:
-  medusactl prep-target <name>
-
-Auth strategy: probes whether the controller can already reach the
-target as <ansible_user> with NOPASSWD sudo. If yes, runs prep over
-key auth as that user (sudo on the target) — no password prompt
-needed. If no, falls back to root SSH password (prompts on the
-workstation), the bootstrap path used on a clean host.
-
-This makes re-prep safe on already-hardened full hosts where
-PermitRootLogin=prohibit-password blocks the root password path:
-key auth to the ansible user still works.
-
-Runs the same prep script bootstrap uses, with mode-aware behavior:
-
-  full hosts (medusa-built templates): general prep + hardening.
-    Installs sudo/openssh-server/python3, creates the ansible user
-    with NOPASSWD sudo, authorizes the controller's SSH key, clamps
-    sshd (PermitRootLogin prohibit-password), and locks the root
-    password.
-
-  limited hosts (pre-existing baremetal: Proxmox, NFS, etc.):
-    general prep ONLY (MEDUSA_PREP_HARDEN=0). Same package install +
-    user + sudoers + key push, but skips the sshd clamp and the
-    root-password lock so cluster operations + operator root-SSH
-    escape hatch are preserved.
-
-Idempotent on both modes: re-running on an already-prepped host is
-safe and skips anything already in place.
-EOF
-        return 0
-    fi
-    load_config
-    local name=${1:-}
-    [[ -n "$name" ]] || fail "prep-target: name argument is required"
-
-    # The list-hosts mode prefix (F/L/-) is a public contract between
-    # medusa and this wrapper: field 1 is the letter, field 2 the name.
-    local target ssh_opts
-    target=$(ssh_target)
-    mapfile -t ssh_opts < <(ssh_base_opts)
-
-    local lookup
-    # T-037 stage B: look up against LOCAL inventory (not controller),
-    # so a freshly-added host visible only on the workstation can still
-    # be prepped before the operator pushes + deploys.
-    require_local_inventory_dir
-    lookup=$( cd "$MEDUSACTL_INVENTORY_DIR" \
-        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
-           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
-           medusa list-hosts --managed-only 2>&1 ) \
-        || fail "prep-target: could not list managed hosts locally"
-
-    local line mode ip user
-    line=$(grep -E "^[FL][[:space:]]+${name}[[:space:]]" <<< "$lookup" | head -n1) \
-        || true
-    if [[ -z "$line" ]]; then
-        fail "prep-target: $name is not in the managed host list; add it first with 'medusactl add-target'"
-    fi
-    mode=$(awk '{print $1}' <<< "$line")
-    # T-043 harden gate: full hosts get the destructive hardening tail;
-    # limited hosts get general prep only.
-    local harden=1
-    if [[ "$mode" == "L" ]]; then
-        harden=0
-    fi
-    ip=$(awk '{print $3}' <<< "$line")
-    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
-    [[ -z "$user" ]] && user="ansible"
-    [[ -z "$ip" ]] && fail "prep-target: could not determine IP for $name"
-
-    # prep-target is the "fresh host or re-bootstrap" path by contract, so a
-    # changed host key is expected and would otherwise abort the connection
-    # with 'REMOTE HOST IDENTIFICATION HAS CHANGED'; strip the stale
-    # controller known_hosts entries. Idempotent: -R on a missing entry is a
-    # no-op.
-    local kh_clean_script
-    kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
-        "$name" "${name}.lan" "$ip")
-    ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$kh_clean_script")" >/dev/null 2>&1 || true
-
-    # T-043: probe controller -> target key auth first, falling back to root
-    # SSH password only for first-time bootstrap. On an already-hardened full
-    # host PermitRootLogin=prohibit-password blocks the root-password path,
-    # so the key path is what makes re-prep work.
-    local auth_mode="key"
-    # Hostname target (not ip) so the controller's /etc/hosts
-    # bootstrap_ip override routes the probe through the cutover IP
-    # when set. Falls through to DNS when bootstrap_ip is unset.
-    local probe_script="ssh -n -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new $(printf %q "${user}@${name}") 'sudo -n true' >/dev/null 2>&1"
-    if ! ssh "${ssh_opts[@]}" "$target" "bash -c $(printf %q "$probe_script")" >/dev/null 2>&1; then
-        auth_mode="root-password"
-    fi
-
-    local password=""
-    if [[ "$auth_mode" == "key" ]]; then
-        printf "  controller key auth available for %s@%s; no password prompt needed\n" "$user" "$name" >&2
-    else
-        printf "  controller key auth unavailable for %s@%s; falling back to root SSH password\n" "$user" "$name" >&2
-        read -r -s -p "Root SSH password for $name: " password </dev/tty
-        printf "\n" >&2
-    fi
-
-    # Two variants: key path (ssh as the ansible user, sudo on target) and
-    # root-password path (sshpass as root).
-    local remote
-    if [[ "$auth_mode" == "key" ]]; then
-        remote=$(cat <<REMOTE
-set -euo pipefail
-cd "$MEDUSA_CONTROLLER_PATH"
-pubkey_b64=\$(base64 -w0 < ~/.ssh/id_ed25519.pub) \\
-    || { echo "controller pubkey base64 encode failed" >&2; exit 1; }
-remote_tmp=/tmp/medusa-prep.\$\$
-ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
-    ${user}@${name} "mkdir -p \${remote_tmp}" \\
-    || { echo "could not create remote temp dir on ${name}" >&2; exit 1; }
-scp -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
-    tools/prep-host.sh tools/prep-debian.sh tools/prep-arch.sh ${user}@${name}:\${remote_tmp}/
-ssh -n -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \\
-    ${user}@${name} \\
-    "sudo -- env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}/prep-host.sh; rc=\\\$?; rm -rf \${remote_tmp}; exit \\\$rc"
-REMOTE
-)
-    else
-        remote=$(cat <<REMOTE
-set -euo pipefail
-cd "$MEDUSA_CONTROLLER_PATH"
-if ! command -v sshpass >/dev/null 2>&1; then
-    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass
-fi
-pubkey_b64=\$(base64 -w0 < ~/.ssh/id_ed25519.pub) \\
-    || { echo "controller pubkey base64 encode failed" >&2; exit 1; }
-remote_tmp=/tmp/medusa-prep.\$\$
-SSHPASS=$(printf %q "$password") sshpass -e ssh -n \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o ConnectTimeout=10 \\
-    -o PreferredAuthentications=password \\
-    -o PubkeyAuthentication=no \\
-    root@${name} "mkdir -p \${remote_tmp}" \\
-    || { echo "could not create remote temp dir on ${name}" >&2; exit 1; }
-SSHPASS=$(printf %q "$password") sshpass -e scp \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o ConnectTimeout=10 \\
-    -o PreferredAuthentications=password \\
-    -o PubkeyAuthentication=no \\
-    tools/prep-host.sh tools/prep-debian.sh tools/prep-arch.sh root@${name}:\${remote_tmp}/
-SSHPASS=$(printf %q "$password") sshpass -e ssh \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o ConnectTimeout=10 \\
-    -o PreferredAuthentications=password \\
-    -o PubkeyAuthentication=no \\
-    root@${name} \\
-    "env MEDUSA_PREP_USER=$(printf %q "$user") MEDUSA_PREP_PUBKEY_B64=\$pubkey_b64 MEDUSA_PREP_HARDEN=${harden} bash \${remote_tmp}/prep-host.sh; rc=\\\$?; rm -rf \${remote_tmp}; exit \\\$rc"
-REMOTE
-)
-    fi
-
-    local log install_rc=0
-    log=$(log_path "prep-target-$name")
-    printf "%s==>%s prep-target %s (%s)\n" "$color_blue" "$color_reset" "$name" "$ip"
-    printf "log:    %s\n" "$log"
-    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
-        || install_rc=${PIPESTATUS[0]}
-    sanitize_log "$log"
-    stty sane 2>/dev/null || true
-    (printf '\033[0m' >/dev/tty) 2>/dev/null || true
-    if [[ "$install_rc" -eq 0 ]]; then
-        printf "%s✓%s prep-target %s\n" "$color_green" "$color_reset" "$name"
-        return 0
-    fi
-    printf "%s✗%s prep-target %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
-    return 1
-}
-
 cmd_repin_target() {
     load_config
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
@@ -2806,8 +2436,7 @@ Usage:
 Prompts for the target user's SSH password. Adds the controller's public
 key to the target user's ~/.ssh/authorized_keys via ssh-copy-id. Useful
 for pre-baked targets that already have the user but lack the key, and
-for key rotation. Skip when 'medusactl prep-target' just ran (prep
-already authorizes the key).
+for key rotation.
 EOF
         return 0
     fi
@@ -2893,19 +2522,16 @@ What it does:
 What it does NOT do:
   - No apt installs. No sshd edits. No PermitRootLogin clamp. No
     'passwd -l root'. No user creation. Those are owned by the
-    operator or by 'prep-target' (full mode only).
+    operator.
 
 Modes:
-  - LIMITED hosts only. Refuses FULL (use 'prep-target') and refuses
-    DNS-only hosts (no ansible_user).
+  - LIMITED hosts only. Refuses FULL and refuses DNS-only hosts
+    (no ansible_user).
 
 Prompts once for the target user's SSH password. The same password
 is used for the initial 'sudo -S' to install the sudoers fragment;
 in standard Debian/Ubuntu setups these are identical. Re-running
 seed-target on an already-seeded host is a safe no-op.
-
-Refuses to run against a full-mode host — that path belongs to
-'prep-target'.
 EOF
         return 0
     fi
@@ -2939,7 +2565,7 @@ EOF
     fi
     mode=$(awk '{print $1}' <<< "$line")
     if [[ "$mode" == "F" ]]; then
-        fail "seed-target: $name is in 'full' managed mode; use 'medusactl prep-target $name' instead. seed-target is for pre-existing (limited) hosts only."
+        fail "seed-target: $name is in 'full' managed mode; seed-target is for pre-existing (limited) hosts only."
     fi
     ip=$(awk '{print $3}' <<< "$line")
     user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
@@ -2953,8 +2579,8 @@ EOF
         fail "seed-target: refusing unsafe username '$user' (must match ^[a-z_][a-z0-9_-]*\$)"
     fi
 
-    # seed-target is also a fresh-host path by contract; strip stale
-    # controller known_hosts entries (see prep-target).
+    # seed-target is a fresh-host path by contract; a changed host key is
+    # expected, so strip stale controller known_hosts entries.
     local kh_clean_script
     kh_clean_script=$(printf 'for h in %q %q %q; do ssh-keygen -f ~/.ssh/known_hosts -R "$h" >/dev/null 2>&1 || true; done' \
         "$name" "${name}.lan" "$ip")
@@ -3020,125 +2646,6 @@ REMOTE
     return 1
 }
 
-cmd_migrate_deploy_root() {
-    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-        cat <<EOF
-medusactl migrate-deploy-root — copy old operator-home deploy roots to /home/medusa.
-
-Usage:
-  medusactl migrate-deploy-root <name> --from-user <user> [--dry-run]
-  medusactl migrate-deploy-root <name> --from-user <user> --apply
-
-Dry-run is the default. It reports whether these old roots exist:
-
-  /home/<user>/medusa
-  /home/<user>/medusa-stacks
-
-With --apply, the command ensures the target has a locked-login medusa user and
-group, creates /home/medusa/{medusa,medusa-stacks}, then rsyncs existing old
-roots into the new locations and chowns the destination to medusa:medusa. The
-old roots are not deleted.
-EOF
-        return 0
-    fi
-    load_config
-    local name=${1:-}
-    [[ -n "$name" ]] || fail "migrate-deploy-root: name argument is required"
-    shift || true
-
-    local from_user="" apply=0
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --from-user)
-                from_user=${2:-}
-                [[ -n "$from_user" ]] || fail "migrate-deploy-root: --from-user requires a value"
-                shift 2
-                ;;
-            --apply)
-                apply=1
-                shift
-                ;;
-            --dry-run)
-                apply=0
-                shift
-                ;;
-            *)
-                fail "migrate-deploy-root: unknown argument: $1"
-                ;;
-        esac
-    done
-    [[ -n "$from_user" ]] || fail "migrate-deploy-root: --from-user is required"
-    if ! [[ "$from_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-        fail "migrate-deploy-root: refusing unsafe username '$from_user' (must match ^[a-z_][a-z0-9_-]*\$)"
-    fi
-
-    local target ssh_opts
-    target=$(ssh_target)
-    mapfile -t ssh_opts < <(ssh_base_opts)
-
-    local remote
-    remote=$(cat <<REMOTE
-set -euo pipefail
-TARGET=$(printf %q "$name")
-OLD_USER=$(printf %q "$from_user")
-APPLY=$apply
-ssh_opts=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
-
-echo "  target: \${TARGET}"
-echo "  old roots: /home/\${OLD_USER}/medusa, /home/\${OLD_USER}/medusa-stacks"
-echo "  new roots: /home/medusa/medusa, /home/medusa/medusa-stacks"
-
-if [[ "\$APPLY" == "0" ]]; then
-    ssh "\${ssh_opts[@]}" "\$TARGET" "set -eu
-for p in /home/\$OLD_USER/medusa /home/\$OLD_USER/medusa-stacks; do
-  if [ -e \\\$p ]; then
-    echo found: \\\$p
-  else
-    echo missing: \\\$p
-  fi
-done
-echo dry-run: rerun with --apply to copy existing roots with rsync"
-    exit 0
-fi
-
-ssh "\${ssh_opts[@]}" "\$TARGET" "set -eu
-sudo -n groupadd -f medusa
-if id -u medusa >/dev/null 2>&1; then
-  sudo -n usermod -g medusa -s /usr/sbin/nologin medusa
-else
-  sudo -n useradd --create-home --gid medusa --shell /usr/sbin/nologin medusa
-fi
-sudo -n passwd -l medusa >/dev/null || true
-command -v rsync >/dev/null || { echo 'rsync missing on target; install rsync first' >&2; exit 1; }
-sudo -n install -d -o medusa -g medusa -m 2750 /home/medusa
-sudo -n install -d -o medusa -g medusa -m 2775 /home/medusa/medusa /home/medusa/medusa-stacks
-if [ -d /home/\$OLD_USER/medusa ]; then
-  sudo -n rsync -a /home/\$OLD_USER/medusa/ /home/medusa/medusa/
-  sudo -n chown -R medusa:medusa /home/medusa/medusa
-fi
-if [ -d /home/\$OLD_USER/medusa-stacks ]; then
-  sudo -n rsync -a /home/\$OLD_USER/medusa-stacks/ /home/medusa/medusa-stacks/
-  sudo -n chown -R medusa:medusa /home/medusa/medusa-stacks
-fi
-echo migrated deploy roots for \$HOSTNAME"
-REMOTE
-)
-
-    local log install_rc=0
-    log=$(log_path "migrate-deploy-root-$name")
-    printf "%s==>%s migrate-deploy-root %s\n" "$color_blue" "$color_reset" "$name"
-    printf "log:    %s\n" "$log"
-    ssh -t "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log" \
-        || install_rc=${PIPESTATUS[0]}
-    sanitize_log "$log"
-    if [[ "$install_rc" -eq 0 ]]; then
-        printf "%s✓%s migrate-deploy-root %s\n" "$color_green" "$color_reset" "$name"
-        return 0
-    fi
-    printf "%s✗%s migrate-deploy-root %s failed (log: %s)\n" "$color_red" "$color_reset" "$name" "$log" >&2
-    return 1
-}
-
 cmd_add_targets_from_file() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         cat <<EOF
@@ -3154,7 +2661,7 @@ Blank lines and lines starting with '#' are ignored. Defaults: zone=lan,
 user=ansible. Equivalent to running 'medusactl add-target <name>
 --ip <ip>' for each line.
 
-Does not run --prep or --authorize automatically; run those per-target
+Does not run --seed or --authorize automatically; run those per-target
 afterwards if needed.
 EOF
         return 0
@@ -3329,7 +2836,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="install-controller authorize-controller status controller-status shell check render deploy compose controller-apply finalize-dns add-target remove-target promote-target list-targets prep-target authorize-target seed-target migrate-deploy-root add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
+    commands="install-controller authorize-controller status controller-status shell check render deploy compose controller-apply finalize-dns add-target remove-target promote-target list-targets authorize-target seed-target add-targets-from-file update self-update install-runtime completion ssh-disconnect undo history clean uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -3354,7 +2861,7 @@ _medusactl_complete() {
             COMPREPLY=( $(compgen -W "--check --force --resolver" -- "$cur") )
             ;;
         add-target)
-            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --group --full --limited --prep --seed --authorize --no-seed-hosts --force --dry-run --interactive --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --group --full --limited --seed --authorize --no-seed-hosts --force --dry-run --interactive --help" -- "$cur") )
             ;;
         list-targets)
             COMPREPLY=( $(compgen -W "--managed-only --full --limited --help" -- "$cur") )
@@ -3365,11 +2872,8 @@ _medusactl_complete() {
         promote-target)
             COMPREPLY=( $(compgen -W "--dry-run --help" -- "$cur") )
             ;;
-        prep-target|authorize-target|seed-target|add-targets-from-file)
+        authorize-target|seed-target|add-targets-from-file)
             COMPREPLY=( $(compgen -W "--help" -- "$cur") )
-            ;;
-        migrate-deploy-root)
-            COMPREPLY=( $(compgen -W "--from-user --dry-run --apply --help" -- "$cur") )
             ;;
         completion)
             COMPREPLY=( $(compgen -W "bash zsh fish install" -- "$cur") )
@@ -3401,10 +2905,8 @@ _medusactl() {
         'remove-target:strip a host from inventory + bootstrap blocks'
         'promote-target:clear bootstrap_ip so the host drops out of /etc/hosts'
         'list-targets:print the host inventory'
-        'prep-target:(re-)run host prep against an existing target (OS-detected)'
         'authorize-target:ssh-copy-id from controller to an existing target'
         'seed-target:non-destructive limited-mode onboarding (key + sudoers)'
-        'migrate-deploy-root:copy old operator-home deploy roots to /home/medusa'
         'add-targets-from-file:bulk-add targets from a file'
         'update:update the controller checkout'
         'self-update:update the local medusactl helper + medusa Python tool'
@@ -3458,7 +2960,6 @@ _medusactl() {
                 '--group[ansible group]:group:' \
                 '--full[mark as full managed mode]' \
                 '--limited[mark as limited managed mode]' \
-                '--prep[also run host prep (OS-detected); mode-aware harden gate]' \
                 '--seed[also run seed-target; limited mode only]' \
                 '--authorize[also run ssh-copy-id]' \
                 '--no-seed-hosts[skip /etc/hosts seed]' \
@@ -3505,10 +3006,8 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'add-target' -d 'Add a host 
 complete -c medusactl -n '__fish_use_subcommand' -a 'remove-target' -d 'Strip a host from inventory + bootstrap blocks'
 complete -c medusactl -n '__fish_use_subcommand' -a 'promote-target' -d 'Clear bootstrap_ip so the host drops out of /etc/hosts'
 complete -c medusactl -n '__fish_use_subcommand' -a 'list-targets' -d 'Print the host inventory'
-complete -c medusactl -n '__fish_use_subcommand' -a 'prep-target' -d '(Re-)run host prep against an existing target (OS-detected)'
 complete -c medusactl -n '__fish_use_subcommand' -a 'authorize-target' -d 'ssh-copy-id from controller to an existing target'
 complete -c medusactl -n '__fish_use_subcommand' -a 'seed-target' -d 'Non-destructive limited-mode onboarding (key + sudoers)'
-complete -c medusactl -n '__fish_use_subcommand' -a 'migrate-deploy-root' -d 'Copy old operator-home deploy roots to /home/medusa'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-targets-from-file' -d 'Bulk-add targets from a file'
 complete -c medusactl -n '__fish_use_subcommand' -a 'update' -d 'Update the controller checkout'
 complete -c medusactl -n '__fish_use_subcommand' -a 'self-update' -d 'Update local medusactl helper + medusa Python tool'
@@ -3540,7 +3039,6 @@ complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l alias -d 'D
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l group -d 'ansible group'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l full -d 'Mark as full managed mode'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l limited -d 'Mark as limited managed mode'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l prep -d 'Also run host prep (OS-detected; mode-aware harden gate)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l seed -d 'Also run seed-target (limited mode only)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l authorize -d 'Also run ssh-copy-id'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l no-seed-hosts -d 'Skip /etc/hosts seed'
@@ -3553,9 +3051,6 @@ complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-m
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-exports -d 'Remove storage exports served by host'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-services -d 'Remove services hosted on host'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l cascade -d 'Imply all --remove-* flags'
-complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l from-user -d 'Old operator username'
-complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l dry-run -d 'Report planned migration only'
-complete -c medusactl -n '__fish_seen_subcommand_from migrate-deploy-root' -l apply -d 'Copy old roots into /home/medusa'
 complete -c medusactl -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish install'
 EOF
 }
@@ -3950,10 +3445,6 @@ case "${1:-}" in
         shift
         cmd_list_targets "$@"
         ;;
-    prep-target)
-        shift
-        cmd_prep_target "$@"
-        ;;
     authorize-target)
         shift
         cmd_authorize_target "$@"
@@ -3965,10 +3456,6 @@ case "${1:-}" in
     seed-target)
         shift
         cmd_seed_target "$@"
-        ;;
-    migrate-deploy-root)
-        shift
-        cmd_migrate_deploy_root "$@"
         ;;
     add-targets-from-file)
         shift

@@ -11,7 +11,6 @@ INSTALL_VERSION="0.3.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
-MEDUSA_PREP_URL="${MEDUSA_PREP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/prep-debian.sh}"
 MEDUSACTL_CLI_URL="${MEDUSACTL_CLI_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/medusactl}"
 MEDUSACTL_CLI_PATH="${MEDUSACTL_CLI_PATH:-$HOME/.local/bin/medusactl}"
 
@@ -42,8 +41,6 @@ Environment:
                            Default: MichelAguilera/Medusa
   MEDUSA_BOOTSTRAP_URL     Full URL to tools/bootstrap-controller.sh.
                            Overrides MEDUSA_INSTALL_REF.
-  MEDUSA_PREP_URL          Full URL to tools/prep-debian.sh.
-                           Overrides MEDUSA_INSTALL_REF.
   MEDUSACTL_CLI_URL        Full URL to tools/medusactl.
   MEDUSACTL_CLI_PATH       Local install path for optional CLI.
                            Default: ~/.local/bin/medusactl
@@ -52,14 +49,9 @@ The installer runs on your workstation. It connects to a Debian 12 controller
 over SSH, copies the controller bootstrap script there, then runs that
 bootstrap interactively on the controller.
 
-For a brand-new host with only root access, the installer can first run a
-root-stage prep (tools/prep-debian.sh) over SSH to create the sudo user,
-install base packages, and authorize your SSH key, then continue with the
-normal user-stage bootstrap.
-
 Adding ansible target hosts is a separate step, handled by medusactl after
 the controller is installed:
-  medusactl add-target <name> --ip <ip> [--prep] [--authorize]
+  medusactl add-target <name> --ip <ip> [--authorize]
 EOF
 }
 
@@ -168,8 +160,8 @@ fetch_file() {
 }
 
 bootstrap_source() {
-    # Fetch the controller bootstrap script (controller-only post Stage 3;
-    # no lib/prep bundling — target ops moved to medusactl).
+    # Fetch the controller bootstrap script (controller-only; target ops
+    # live in medusactl).
     local script_dir="" local_bootstrap=""
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
         script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -185,64 +177,6 @@ bootstrap_source() {
         "tools/bootstrap-controller.sh" "$tmp_bootstrap"
 
     printf "%s" "$tmp_bootstrap"
-}
-
-prep_source() {
-    local script_dir=""
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-    fi
-
-    if [[ -n "$script_dir" && -f "$script_dir/tools/prep-debian.sh" ]]; then
-        printf "%s/tools/prep-debian.sh" "$script_dir"
-        return 0
-    fi
-
-    local tmp_prep
-    tmp_prep=$(mktemp)
-    TEMP_FILES+=("$tmp_prep")
-
-    if command -v curl >/dev/null 2>&1; then
-        info "Downloading Debian prep script from $MEDUSA_PREP_URL"
-        if curl -fsSL "$MEDUSA_PREP_URL" -o "$tmp_prep"; then
-            printf "%s" "$tmp_prep"
-            return 0
-        fi
-        warn "raw prep download failed; trying authenticated GitHub CLI fallback"
-    fi
-
-    if command -v gh >/dev/null 2>&1; then
-        info "Downloading Debian prep script through gh api from $MEDUSA_GITHUB_REPO@$MEDUSA_INSTALL_REF"
-        gh api "repos/${MEDUSA_GITHUB_REPO}/contents/tools/prep-debian.sh?ref=${MEDUSA_INSTALL_REF}" \
-            --jq .content | base64 -d > "$tmp_prep" \
-            || fail "failed to download prep-debian.sh with gh api"
-        printf "%s" "$tmp_prep"
-        return 0
-    fi
-
-    fail "failed to download prep-debian.sh; install curl for public repos or gh for private repos"
-}
-
-run_root_prep() {
-    local host=$1 port=$2 root_user=$3 new_user=$4 public_key_path=$5
-    local prep_script remote_path public_key
-
-    [[ -f "$public_key_path" ]] || fail "SSH public key not found at $public_key_path"
-    public_key=$(cat "$public_key_path")
-
-    prep_script=$(prep_source)
-    remote_path="/tmp/medusa-prep-debian.sh"
-
-    info "Copying prep-debian.sh to ${root_user}@${host}..."
-    scp -P "$port" -o StrictHostKeyChecking=accept-new "$prep_script" \
-        "${root_user}@${host}:${remote_path}" \
-        || fail "failed to copy prep script to ${root_user}@${host} (is root SSH login allowed?)"
-
-    info "Running prep-debian.sh on ${root_user}@${host} (user: $new_user)..."
-    ssh -t -p "$port" -o StrictHostKeyChecking=accept-new "${root_user}@${host}" \
-        "env MEDUSA_PREP_USER=$(printf %q "$new_user") MEDUSA_PREP_PUBKEY=$(printf %q "$public_key") bash $remote_path; rm -f $remote_path" \
-        < /dev/tty \
-        || fail "prep-debian.sh failed on ${root_user}@${host}"
 }
 
 cli_source() {
@@ -358,34 +292,6 @@ CONTROLLER_HOST=""
 CONTROLLER_USER=""
 CONTROLLER_PORT=""
 REMOTE_SCRIPT=""
-PREP_DONE=false
-
-echo ""
-info "If the controller is a fresh Debian 12 host with only root access (no"
-info "sudo user yet), the installer can run a root-stage prep first to create"
-info "the user, install base packages, and authorize your SSH key."
-if confirm "Run root-stage prep on a fresh Debian 12 host first" "n"; then
-    PREP_ROOT_USER=""
-    PREP_NEW_USER=""
-    prompt CONTROLLER_HOST "Controller hostname or IP"
-    prompt CONTROLLER_PORT "SSH port" "22"
-    prompt PREP_ROOT_USER "Root-capable SSH user on the host" "root"
-    prompt PREP_NEW_USER "Username to create for Medusa" "ansible"
-
-    if [[ -z "$CONTROLLER_HOST" ]]; then
-        fail "controller hostname or IP is required"
-    fi
-    if [[ ! "$CONTROLLER_PORT" =~ ^[0-9]+$ ]]; then
-        fail "controller SSH port must be a number"
-    fi
-
-    PREP_PUBKEY=$(ensure_public_key)
-    run_root_prep "$CONTROLLER_HOST" "$CONTROLLER_PORT" "$PREP_ROOT_USER" "$PREP_NEW_USER" "$PREP_PUBKEY"
-    CONTROLLER_USER="$PREP_NEW_USER"
-    PREP_DONE=true
-    info "Root-stage prep complete. Continuing as ${CONTROLLER_USER}@${CONTROLLER_HOST}."
-    echo ""
-fi
 
 if [[ -z "$CONTROLLER_HOST" ]]; then
     prompt CONTROLLER_HOST "Controller hostname or IP"
@@ -440,9 +346,7 @@ if ! confirm "Proceed" "y"; then
 fi
 
 echo ""
-if [[ "$PREP_DONE" == "true" ]]; then
-    info "SSH key already authorized by root-stage prep; skipping ssh-copy-id"
-elif confirm "Authorize this workstation's SSH key on the controller now" "y"; then
+if confirm "Authorize this workstation's SSH key on the controller now" "y"; then
     authorize_key_on_controller "$SSH_TARGET" "$CONTROLLER_PORT" "$(ensure_public_key)"
 fi
 
@@ -490,6 +394,6 @@ echo ""
 printf "%s✓%s install: controller bootstrap completed\n" "$color_green" "$color_reset"
 echo ""
 info "Next: add ansible targets from your workstation with:"
-info "  medusactl add-target <name> --ip <ip> [--prep] [--authorize]"
+info "  medusactl add-target <name> --ip <ip> [--authorize]"
 info "Then deploy:"
 info "  medusactl deploy"

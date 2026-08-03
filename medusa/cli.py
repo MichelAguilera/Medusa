@@ -11,7 +11,6 @@ from pydantic import ValidationError
 from medusa.diagnostics import (
     Diagnostic,
     Severity,
-    coredns_target_diagnostics,
     diagnostic_errors,
     diagnostic_warnings,
     service_diagnostics,
@@ -53,7 +52,6 @@ from medusa.inventory.storage_edit import (
 )
 from medusa.model.coredns import CorednsModel
 from medusa.model.dns import DnsModel
-from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.homepage import HomepageModel
 from medusa.model.hosts import AnsibleInventoryModel
 from medusa.model.monitoring import MonitoringModel
@@ -61,7 +59,6 @@ from medusa.model.native import NativeModel
 from medusa.model.network import NetworkModel
 from medusa.model.nixos import NixosModel
 from medusa.model.normalize import (
-    normalize_ansible_groups,
     normalize_ansible_inventory,
     normalize_coredns,
     normalize_dns,
@@ -79,7 +76,6 @@ from medusa.model.services import ServicesModel
 from medusa.model.sops import SopsConfigModel
 from medusa.model.storage import StorageModel
 from medusa.paths import ProjectPaths
-from medusa.render.ansible import render_ansible_groups
 from medusa.render.caddy import render_caddy
 from medusa.render.compose import render_compose
 from medusa.render.egress import render_egress
@@ -119,7 +115,6 @@ class _Inventory:
     services_model: ServicesModel
     homepage_model: HomepageModel
     monitoring_model: MonitoringModel
-    groups_model: AnsibleGroupsModel
     coredns_model: CorednsModel
     ansible_inventory_model: AnsibleInventoryModel
     network_model: NetworkModel
@@ -174,12 +169,6 @@ def _load_all(
             host.name for host in dns_model.hosts if host.is_dormant
         ),
     )
-    groups_model = normalize_ansible_groups(
-        dns_model, services_model, storage_model, homepage_model, monitoring_model
-    )
-    # Surface the silent DNS-target gap (coredns_hosts member with no
-    # ansible_user -> config renders but never deploys). Warning-only.
-    on_diagnostics(coredns_target_diagnostics(dns_model, groups_model))
     coredns_model = normalize_coredns(dns_model, services_model)
     ansible_inventory_model = normalize_ansible_inventory(dns_model)
     network_model = normalize_network(dns_model)
@@ -216,7 +205,6 @@ def _load_all(
         services_model=services_model,
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
-        groups_model=groups_model,
         coredns_model=coredns_model,
         ansible_inventory_model=ansible_inventory_model,
         network_model=network_model,
@@ -307,7 +295,6 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_secrets_manifest(services_model, templates_dir, generated_dir),
         **render_sops_config(loaded.sops_model, templates_dir, generated_dir),
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),
-        **render_ansible_groups(loaded.groups_model, templates_dir, generated_dir),
         **render_hosts(loaded.ansible_inventory_model, templates_dir, generated_dir),
         **render_network(loaded.network_model, templates_dir, generated_dir),
         **render_nixos(loaded.nixos_model, templates_dir, generated_dir),

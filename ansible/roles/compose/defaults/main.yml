@@ -1,8 +1,0 @@
----
-# Fallback/safety-net list of external Docker networks to create before
-# bringing stacks up. The compose role ALSO discovers external networks (and
-# volumes) directly from the rendered compose files, so operator-declared
-# external resources are handled automatically; this list just guarantees the
-# shared Traefik 'proxy' network is always present.
-medusa_compose_external_networks:
-  - proxy

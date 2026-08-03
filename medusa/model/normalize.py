@@ -20,7 +20,6 @@ from medusa.model.compose import (
 )
 from medusa.model.coredns import CorednsModel
 from medusa.model.dns import DnsModel, DnsZone, HostNetwork, HostRecord, ManagedMode
-from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
 from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
@@ -414,14 +413,12 @@ def normalize_nixos(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
     # CoreDNS on NixOS (T-056 port): same generated Corefile + lan.hosts the
-    # Debian role deploys. Derivation mirrors the ansible-groups builder.
+    # Debian role deployed.
     nixos_coredns_hosts = {
         name for name in coredns_hosts if name in nixos_names
     }
 
-    # NFS export server on NixOS (T-096). Derivation mirrors the
-    # ansible-groups builder (nfs_export_hosts), which strips NixOS hosts
-    # from the Ansible play.
+    # NFS export server on NixOS (T-096).
     zfs_root_by_server = dict(storage_model.zfs_roots)
     nfs_by_host: dict[str, NixosNfsServer] = {}
     for server, server_exports in storage_model.exports_by_server:
@@ -1594,88 +1591,6 @@ def normalize_monitoring(
             effective_services, {"grafana", "prometheus"}
         ),
         targets=tuple(targets),
-    )
-
-
-def normalize_ansible_groups(
-    dns_model: DnsModel,
-    services_model: ServicesModel,
-    storage_model: StorageModel,
-    homepage_model: HomepageModel,
-    monitoring_model: MonitoringModel,
-) -> AnsibleGroupsModel:
-    # NixOS hosts are driven by the Nix path (T-074/T-075), never by Ansible
-    # roles. Strip them from every role group so an operator can't point a role
-    # at a NixOS box; they appear only in the dedicated nixos_hosts group.
-    # Dormant hosts (T-091) leave every group INCLUDING nixos_hosts: groups are
-    # deploy dispatch, and declared downtime means "do not deploy here".
-    nixos_names = {host.name for host in dns_model.hosts if host.is_nixos}
-    dormant_names = {host.name for host in dns_model.hosts if host.is_dormant}
-
-    def _ansible(names: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(
-            name
-            for name in names
-            if name not in nixos_names and name not in dormant_names
-        )
-
-    docker_hosts = _ansible(
-        tuple(sorted({compose.host for compose in services_model.compose}))
-    )
-    storage_hosts = _ansible(
-        tuple(sorted({mount.host for mount in storage_model.mounts}))
-    )
-    nfs_export_hosts = _ansible(
-        tuple(server for server, _ in storage_model.exports_by_server)
-    )
-    coredns_hosts = _platform_hosts(services_model, {"coredns"})
-    if not coredns_hosts:
-        coredns_hosts = tuple(
-            host.name for host in dns_model.hosts if host.name == "coredns"
-        )
-    coredns_hosts = _ansible(coredns_hosts)
-    managed_network_hosts = _ansible(
-        tuple(sorted(host.name for host in dns_model.hosts if host.network is not None))
-    )
-    egress_gateway_hosts = _ansible(
-        (services_model.egress.gateway,) if services_model.egress else ()
-    )
-    # Only hosts that actually run a tunneled service get the tunnel network
-    # + policy routing.
-    tunnel_routing_hosts = _ansible(tuple(sorted(services_model.tunnel_services_by_host)))
-    nixos_hosts = tuple(sorted(nixos_names - dormant_names))
-
-    traefik_hosts = _ansible(_platform_hosts(services_model, {"traefik"}))
-    homepage_hosts = _ansible(homepage_model.hosts)
-    monitoring_hosts = _ansible(monitoring_model.hosts)
-
-    fields: tuple[tuple[str, tuple[str, ...]], ...] = (
-        ("coredns_hosts", tuple(sorted(coredns_hosts))),
-        ("docker_hosts", docker_hosts),
-        ("egress_gateway_hosts", egress_gateway_hosts),
-        ("homepage_hosts", homepage_hosts),
-        ("managed_network_hosts", managed_network_hosts),
-        ("monitoring_hosts", monitoring_hosts),
-        ("nfs_export_hosts", nfs_export_hosts),
-        ("nixos_hosts", nixos_hosts),
-        ("storage_hosts", storage_hosts),
-        ("traefik_hosts", traefik_hosts),
-        ("tunnel_routing_hosts", tunnel_routing_hosts),
-    )
-
-    return AnsibleGroupsModel(
-        docker_hosts=docker_hosts,
-        storage_hosts=storage_hosts,
-        nfs_export_hosts=nfs_export_hosts,
-        coredns_hosts=tuple(sorted(coredns_hosts)),
-        traefik_hosts=traefik_hosts,
-        homepage_hosts=homepage_hosts,
-        monitoring_hosts=monitoring_hosts,
-        managed_network_hosts=managed_network_hosts,
-        egress_gateway_hosts=egress_gateway_hosts,
-        tunnel_routing_hosts=tunnel_routing_hosts,
-        nixos_hosts=nixos_hosts,
-        groups=fields,
     )
 
 

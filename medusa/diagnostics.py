@@ -3,7 +3,6 @@ from enum import StrEnum
 
 from medusa.inventory.services import ServicesInventory
 from medusa.model.dns import DnsModel
-from medusa.model.groups import AnsibleGroupsModel
 from medusa.model.services import ServicesModel
 from medusa.model.volumes import is_bind_source
 
@@ -28,27 +27,6 @@ def service_diagnostics(inventory: ServicesInventory) -> tuple[Diagnostic, ...]:
         diagnostics.extend(_owner_diagnostics(f"service {service.id}", service))
 
     return tuple(diagnostics)
-
-
-def coredns_target_diagnostics(
-    dns_model: DnsModel, groups_model: AnsibleGroupsModel
-) -> tuple[Diagnostic, ...]:
-    """Warn when a coredns_hosts member is not actually a connectable managed
-    host: the coredns play would render config but have nothing to SSH into,
-    so DNS is never written (T-056)."""
-    managed = {host.name for host in dns_model.hosts if host.is_ansible_managed}
-    return tuple(
-        Diagnostic(
-            Severity.WARNING,
-            f"coredns_hosts member '{name}' is not ansible-managed (no "
-            f"ansible_user); the CoreDNS play has no connectable target, so "
-            f"rendered DNS config will not deploy. Make it a managed host, "
-            f"e.g. `medusactl add-target {name} --ip <ip> --zone <zone> "
-            f"--user <user> --force`.",
-        )
-        for name in groups_model.coredns_hosts
-        if name not in managed
-    )
 
 
 def sops_recipient_diagnostics(
