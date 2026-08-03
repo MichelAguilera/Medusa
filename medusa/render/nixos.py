@@ -76,8 +76,8 @@ def stage_nixos_configs(
     model: NixosModel,
     generated_dir: Path,
 ) -> None:
-    """Copy the per-host traefik/homepage/monitoring artifacts into the NixOS
-    staging trees (T-087 config-staging slice).
+    """Copy the per-host traefik/homepage/monitoring/exports artifacts into
+    the NixOS staging trees (T-087 config-staging slice; T-096 exports).
 
     Runs AFTER all renderers, over the assembled files dict: each staged config
     names its source under ``generated/`` (the exact artifact the Debian role
@@ -139,6 +139,22 @@ def stage_nixos_configs(
                     f"but a NixOS host serves CoreDNS"
                 )
             files[generated_dir / "nixos" / "coredns" / artifact] = files[source]
+    # NFS exports artifact (T-096, nfs_exports role port): the exports file
+    # the Debian role deploys to /etc/exports, staged for the server host's
+    # module to readFile. Same bytes.
+    for host in model.hosts:
+        if host.nfs is None:
+            continue
+        source = generated_dir / "storage" / "exports" / host.name / "medusa.exports"
+        if source not in files:
+            raise ValueError(
+                f"exports artifact 'storage/exports/{host.name}/medusa.exports' "
+                f"was not rendered but host '{host.name}' serves NFS exports "
+                f"on NixOS"
+            )
+        files[
+            generated_dir / "nixos" / "storage" / host.name / "medusa.exports"
+        ] = files[source]
     # Egress gateway artifacts (T-066 port): the NAT + kill-switch ruleset and
     # split-DNS resolver config the Debian wireguard_gateway role deploys,
     # staged for the gateway host's module to interpolate. Same bytes.

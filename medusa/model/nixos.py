@@ -6,6 +6,7 @@ from medusa.model.services import (
     ComposeFile,
     GeneratedEnvFile,
 )
+from medusa.model.storage import NfsServerExport
 
 
 class NixosNetwork(BaseModel):
@@ -32,8 +33,8 @@ class NixosMount(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     mountpoint: str
-    device: str  # "<server-fqdn>:/path"
-    fs_type: str  # "nfs" | "nfs4"
+    device: str  # "<server-fqdn>:/path", or a local path for same-host binds
+    fs_type: str  # "nfs" | "nfs4" | "none" (same-host bind, T-096)
     options: tuple[str, ...]
 
 
@@ -72,6 +73,37 @@ class NixosEgressGateway(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     interface: str  # e.g. "wg0"; artifact + secret paths derive from it
+
+
+class NixosNfsServer(BaseModel):
+    """This host serves the fleet's NFS exports (T-096, nfs_exports role port).
+
+    The module consumes the SAME generated exports file the Debian role ships
+    to /etc/exports (``storage/exports/<host>/medusa.exports``, staged
+    byte-identical into the flake tree — the CoreDNS precedent), so export
+    authorization is one formatter on both platforms. ``exports`` carries the
+    per-export provisioning plans, applied by the medusa-nfs-provision unit
+    (which nfs-server requires): ensure the first-segment dataset (T-071
+    convention), converge export-dir ownership (T-085), full parity with the
+    Debian role's every-deploy behavior. Two hard rules the unit encodes:
+    ``zfs create`` is the ONLY ZFS verb Medusa ever executes (the ADR fence —
+    destroy/rename/rollback/properties are permanently out of scope), and it
+    never mounts a fresh dataset over a path that already holds data outside
+    one (fails loudly instead — a shadowed share looks empty to clients and
+    backups)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    exports: tuple[NfsServerExport, ...]
+    # ZFS pool imported at boot (``boot.zfs.extraPools``), from the server's
+    # declared zfs_root by the T-071 convention (pool name = mountpoint sans
+    # leading slash). None when the server exports plain directories.
+    zfs_pool: str | None
+    # networking.hostId — the NixOS ZFS module refuses to build without it.
+    # Derived deterministically from the host name so rebuilds keep the same
+    # id (a changed hostid makes `zpool import` demand -f). None when no
+    # pool (no ZFS module, no requirement).
+    host_id: str | None
 
 
 class NixosStagedConfig(BaseModel):
@@ -208,6 +240,11 @@ class NixosHost(BaseModel):
     # role's backup/health-check/restore guard maps to NixOS generations: a
     # bad config is a `nixos-rebuild --rollback`.
     coredns: bool = False
+    # NFS export server (T-096, nfs_exports role port): set when this host
+    # serves NFS exports. Emits nfsd on the staged byte-identical exports
+    # file, the ZFS pool import when the server declares a pool root, and
+    # tmpfiles convergence of export-dir ownership. None everywhere else.
+    nfs: NixosNfsServer | None = None
     # Tunnel-routing client (T-087/D6): set when this host runs at least one
     # `egress: tunnel` service. Emits the nft marking + policy-routing units,
     # loose reverse-path filtering, and the pinned-subnet tunnel network

@@ -166,11 +166,39 @@
   # at the network config's nameservers (this host itself).
   services.resolved.enable = false;
 {% endif %}
-{% if host.egress_gateway or host.coredns %}
+{% if host.nfs %}
 
+  # ---- NFS export server (T-096, nfs_exports role port) ---------------------
+  # This host serves the fleet's NFS exports on the SAME generated exports
+  # file the Debian role deploys to /etc/exports (staged in-generation,
+  # byte-identical -- the CoreDNS precedent). Export provisioning (dataset
+  # ensure + dir ownership convergence, T-071/T-085 parity) runs in the
+  # medusa-nfs-provision unit below, which nfs-server requires -- a missing
+  # source path can never half-abort `exportfs -ra` silently.
+{% if host.nfs.zfs_pool %}
+  boot.supportedFilesystems = [ "zfs" ];
+  # The data pool, imported at boot; the pool is not a NixOS fileSystems
+  # entry (its datasets carry their own mountpoints).
+  boot.zfs.extraPools = [ "{{ host.nfs.zfs_pool }}" ];
+  # Required by the ZFS module. Stable (derived from the host name), because
+  # ZFS ties pool ownership to the hostid -- a changed id forces
+  # `zpool import -f` on the next boot.
+  networking.hostId = "{{ host.nfs.host_id }}";
+{% endif %}
+  services.nfs.server.enable = true;
+  services.nfs.server.exports = builtins.readFile ../storage/{{ host.name }}/medusa.exports;
+{% endif %}
+{% if host.egress_gateway or host.coredns or host.nfs %}
+
+{% if host.egress_gateway or host.coredns %}
   # DNS service ports (the gateway's split resolver / the fleet resolver).
-  networking.firewall.allowedTCPPorts = [ 53 ];
+{% else %}
+  # NFSv4 service port (single fixed TCP port; the fleet mounts vers=4 only).
+{% endif %}
+  networking.firewall.allowedTCPPorts = [{% if host.egress_gateway or host.coredns %} 53{% endif %}{% if host.nfs %} 2049{% endif %} ];
+{% if host.egress_gateway or host.coredns %}
   networking.firewall.allowedUDPPorts = [ 53 ];
+{% endif %}
 {% endif %}
 {% if host.stacks or host.staged_secrets or host.deploy_configs or host.coredns %}
 
@@ -222,9 +250,60 @@
 {% endif %}
   ];
 {% endif %}
-{% if host.stacks or host.staged_secrets or host.coredns %}
+{% if host.stacks or host.staged_secrets or host.coredns or host.nfs %}
 
   systemd.services = {
+{% if host.nfs %}
+    # Export provisioning (T-096): ensure each export's first-segment dataset
+    # exists (T-071 convention) and converge export-dir ownership (T-085),
+    # exactly what the Debian nfs_exports role does on every deploy. CREATE
+    # is the only ZFS verb Medusa ever executes (ADR fence: destroy/rename/
+    # rollback/properties are permanently out of scope). The create is
+    # guarded: if the export path already holds data OUTSIDE a dataset, the
+    # unit fails loudly rather than mount a fresh dataset over it -- a
+    # shadowed share looks empty to clients and backups.
+    medusa-nfs-provision = {
+      description = "Provision Medusa NFS export datasets and directories";
+      wantedBy = [ "multi-user.target" ];
+{% if host.nfs.zfs_pool %}
+      # zfs.target: pool imported and datasets mounted before we look.
+      after = [ "zfs.target" ];
+      path = [ pkgs.zfs ];
+{% endif %}
+      serviceConfig = {
+        Type = "oneshot";
+        RemainAfterExit = true;
+      };
+      script = ''
+        set -eu
+{% for export in host.nfs.exports %}
+{% if export.dataset %}
+        if ! zfs list -H -o name '{{ export.dataset }}' >/dev/null 2>&1; then
+          if [ -d '{{ export.path }}' ] && [ -n "$(ls -A '{{ export.path }}')" ]; then
+            echo "refusing to create dataset {{ export.dataset }}: {{ export.path }} already holds data outside a dataset -- migrate it by hand first" >&2
+            exit 1
+          fi
+          zfs create '{{ export.dataset }}'
+        fi
+{% endif %}
+{% for dir in export.directories %}
+        mkdir -p '{{ dir.path }}'
+        chown {{ dir.owner }}:{{ dir.group }} '{{ dir.path }}'
+        chmod {{ dir.mode }} '{{ dir.path }}'
+{% endfor %}
+{% endfor %}
+      '';
+    };
+
+    # exportfs aborts the whole reload when any export path fails to stat
+    # (the reason the Debian role provisions before deploying the file) --
+    # nfsd must not start until every source path exists.
+    nfs-server = {
+      after = [ "medusa-nfs-provision.service" ];
+      requires = [ "medusa-nfs-provision.service" ];
+    };
+
+{% endif %}
 {% if host.coredns %}
     # CoreDNS on the generated config. Restart=on-failure self-heals transient
     # crashes; the hosts plugin re-reads lan.hosts on change, and a Corefile

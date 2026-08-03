@@ -1,3 +1,4 @@
+import hashlib
 import re
 
 from medusa.inventory.dns import (
@@ -35,6 +36,7 @@ from medusa.model.nixos import (
     NixosModel,
     NixosMount,
     NixosNetwork,
+    NixosNfsServer,
     NixosSecretEnvFile,
     NixosSecretFile,
     NixosEgressGateway,
@@ -420,11 +422,6 @@ def normalize_nixos(
             lan_subnets=egress.lan_subnets,
         )
 
-    # Same guard class as D6 for the Debian-only infrastructure roles: the
-    # coredns, wireguard_gateway, and nfs_exports Ansible roles have no NixOS
-    # delivery path and the plays skip NixOS hosts, so flipping one of these
-    # hosts to platform: nixos would silently stop delivering the role. The
-    # host derivations mirror the ansible-groups builder exactly.
     coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
@@ -435,18 +432,30 @@ def normalize_nixos(
         name for name in coredns_hosts if name in nixos_names
     }
 
-    infra_on_nixos = [
-        f"'{server}' serves NFS exports"
-        for server, _ in storage_model.exports_by_server
-        if server in nixos_names
-    ]
-    if infra_on_nixos:
-        raise ValueError(
-            f"hosts serving Debian-only infrastructure roles cannot be "
-            f"platform: nixos -- nfs_exports has no NixOS "
-            f"delivery path yet, so the role would be silently "
-            f"dropped: {'; '.join(sorted(infra_on_nixos))} -- keep these "
-            f"hosts on debian until the role is ported"
+    # NFS export server on NixOS (T-096, nfs_exports role port — the last
+    # Debian-only infrastructure role; its former reject-on-nixos guard is
+    # lifted). The host consumes the same generated exports file the Debian
+    # role ships, plus the pool import and hostId the NixOS ZFS module
+    # requires. Derivation mirrors the ansible-groups builder
+    # (nfs_export_hosts), which strips NixOS hosts from the Ansible play.
+    zfs_root_by_server = dict(storage_model.zfs_roots)
+    nfs_by_host: dict[str, NixosNfsServer] = {}
+    for server, server_exports in storage_model.exports_by_server:
+        if server not in nixos_names:
+            continue
+        zfs_root = zfs_root_by_server.get(server)
+        nfs_by_host[server] = NixosNfsServer(
+            exports=server_exports,
+            zfs_pool=zfs_root.lstrip("/") if zfs_root else None,
+            # Stable 8-hex hostId from the host name: ZFS ties pool ownership
+            # to the hostid, so a rebuild that changed it would refuse the
+            # import without -f. Any stable value works; sha256 avoids
+            # coordinating uniqueness by hand.
+            host_id=(
+                hashlib.sha256(server.encode()).hexdigest()[:8]
+                if zfs_root
+                else None
+            ),
         )
 
     stacks_by_host: dict[str, list[NixosStack]] = {}
@@ -698,6 +707,7 @@ def normalize_nixos(
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
             egress_gateway=egress_gateway_by_host.get(host.name),
             coredns=host.name in nixos_coredns_hosts,
+            nfs=nfs_by_host.get(host.name),
             tunnel=tunnel_by_host.get(host.name),
             deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
             staged_secrets=secrets_by_host.get(host.name, _NO_SECRETS)[0],
@@ -1077,27 +1087,61 @@ def normalize_storage(
         for export in inventory.exports
     }
 
+    zfs_root_by_server = {
+        server.name: server.zfs_root for server in inventory.servers
+    }
+
+    def _realize_mount(mount, host: str) -> NfsMount:
+        export = exports[mount.export]
+        if host == export.server:
+            # The mount's host IS the export's server (T-096): realize the
+            # same declared mapping -- "this export appears at this path on
+            # this host" -- as a local bind, never as loopback NFS. A host
+            # NFS-mounting itself deadlocks under memory pressure (client
+            # writeback waits on a server allocation in the same kernel,
+            # and `hard` retries forever). The declared mount options are
+            # NFS transport concerns (hard, vers, _netdev, automount) and
+            # do not carry over. On a ZFS server the bind REQUIRES
+            # zfs-mount: binding over a not-yet-mounted mountpoint dir
+            # would silently serve (and write to) the root filesystem --
+            # fail loudly instead, never fall through.
+            return NfsMount(
+                id=mount.id,
+                host=host,
+                export_id=mount.export,
+                server=export.server,
+                server_path=export.path,
+                mountpoint=mount.mountpoint,
+                type="none",
+                options=(
+                    ("bind", "x-systemd.requires=zfs-mount.service")
+                    if zfs_root_by_server.get(export.server)
+                    else ("bind",)
+                ),
+                source=export.path,
+                server_ip=hosts_by_name[export.server].ip,
+                client_ip=hosts_by_name[host].ip,
+            )
+        return NfsMount(
+            id=mount.id,
+            host=host,
+            export_id=mount.export,
+            server=export.server,
+            server_path=export.path,
+            mountpoint=mount.mountpoint,
+            type=mount.type,
+            options=tuple(mount.options),
+            source=f"{hosts_by_name[export.server].fqdns[0]}:{export.path}",
+            server_ip=hosts_by_name[export.server].ip,
+            # The export authorizes this client by its canonical IP;
+            # the role asserts the live source IP matches (T-059).
+            client_ip=hosts_by_name[host].ip,
+        )
+
     mounts = tuple(
         sorted(
             (
-                NfsMount(
-                    id=mount.id,
-                    host=host,
-                    export_id=mount.export,
-                    server=exports[mount.export].server,
-                    server_path=exports[mount.export].path,
-                    mountpoint=mount.mountpoint,
-                    type=mount.type,
-                    options=tuple(mount.options),
-                    source=(
-                        f"{hosts_by_name[exports[mount.export].server].fqdns[0]}:"
-                        f"{exports[mount.export].path}"
-                    ),
-                    server_ip=hosts_by_name[exports[mount.export].server].ip,
-                    # The export authorizes this client by its canonical IP;
-                    # the role asserts the live source IP matches (T-059).
-                    client_ip=hosts_by_name[host].ip,
-                )
+                _realize_mount(mount, host)
                 for mount in inventory.mounts
                 for host in mount.host
             ),
@@ -1115,9 +1159,6 @@ def normalize_storage(
         )
         for host in sorted(mounts_by_host)
     )
-    zfs_root_by_server = {
-        server.name: server.zfs_root for server in inventory.servers
-    }
     exports_by_server: dict[str, list[NfsServerExport]] = {}
     for export in exports.values():
         export_mounts = sorted(
@@ -1127,8 +1168,16 @@ def normalize_storage(
         # Deduped by host: the export authorizes a CLIENT, however many times
         # that client mounts it (an sftp shared space mounts one export at N
         # member mountpoints, T-084; duplicate entries would trip exportfs).
+        # The server itself is never a client (T-096): its own mounts realize
+        # as local binds, so no NFS authorization exists to grant -- an
+        # export consumed only same-host renders no /etc/exports line at all.
         client_hosts = sorted(
-            {host for mount in export_mounts for host in mount.host}
+            {
+                host
+                for mount in export_mounts
+                for host in mount.host
+                if host != export.server
+            }
         )
         clients = tuple(
             NfsExportClient(
