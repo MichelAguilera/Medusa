@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.24.1"
+VERSION="0.24.2"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1858,16 +1858,16 @@ if ! command -v nixos-rebuild >/dev/null 2>&1; then
     echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
     exit 70
 fi
-# Remote-sudo flag name differs across nixos-rebuild vintages (--use-remote-sudo
-# pre-rename, --elevate=sudo post-rename), and the T-096 cutover proved the
-# version cannot be assumed: a switch hard-failed on `unknown option
-# --elevate=sudo` on the same controller whose deprecation warning motivated
-# the T-095 swap. Probe the binary that actually resolved instead of trusting
-# any version story.
-sudo_flag="--use-remote-sudo"
-if nixos-rebuild --help 2>&1 | grep -q -- '--elevate'; then
-    sudo_flag="--elevate=sudo"
-fi
+# Remote-sudo flag: ALWAYS the old spelling. --elevate=sudo cannot be used
+# even when the resolved nixos-rebuild documents it: nixos-rebuild RE-EXECS
+# the nixos-rebuild of the flake-pinned nixpkgs (to match target semantics)
+# and hands it the original argv, so a new outer binary that accepts the
+# flag feeds it to an old inner binary that rejects it. This killed the
+# T-096 cutover switch twice — T-095's version inference AND a --help
+# probe were both fooled by inspecting the wrong binary. --use-remote-sudo
+# is accepted by every vintage (the new one prints a cosmetic deprecation
+# warning). Revisit only if upstream removes the old spelling — by then
+# the pinned nixpkgs' inner binary knows the new one.
 rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
@@ -1876,7 +1876,7 @@ while IFS=$'\t' read -r host target; do
     # elevate, and skipping the flag keeps root deploys immune to this whole
     # flag-vintage class.
     flags=()
-    [[ "$target" == root@* ]] || flags=("$sudo_flag")
+    [[ "$target" == root@* ]] || flags=(--use-remote-sudo)
     # </dev/null: nixos-rebuild's underlying ssh must not inherit the loop's
     # stdin or it swallows the remaining plan lines (second host never applies).
     if ! nixos-rebuild "$ACTION" \

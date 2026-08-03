@@ -232,7 +232,7 @@ wheels = [
 
 [[package]]
 name = "medusa"
-version = "0.20.1"
+version = "0.20.2"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
