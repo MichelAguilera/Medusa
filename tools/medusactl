@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.24.0"
+VERSION="0.24.1"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1858,16 +1858,31 @@ if ! command -v nixos-rebuild >/dev/null 2>&1; then
     echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
     exit 70
 fi
+# Remote-sudo flag name differs across nixos-rebuild vintages (--use-remote-sudo
+# pre-rename, --elevate=sudo post-rename), and the T-096 cutover proved the
+# version cannot be assumed: a switch hard-failed on `unknown option
+# --elevate=sudo` on the same controller whose deprecation warning motivated
+# the T-095 swap. Probe the binary that actually resolved instead of trusting
+# any version story.
+sudo_flag="--use-remote-sudo"
+if nixos-rebuild --help 2>&1 | grep -q -- '--elevate'; then
+    sudo_flag="--elevate=sudo"
+fi
 rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
     echo "==> nixos-rebuild $ACTION: $host ($target)"
+    # Elevation only for non-root deploy users; a root target has nothing to
+    # elevate, and skipping the flag keeps root deploys immune to this whole
+    # flag-vintage class.
+    flags=()
+    [[ "$target" == root@* ]] || flags=("$sudo_flag")
     # </dev/null: nixos-rebuild's underlying ssh must not inherit the loop's
     # stdin or it swallows the remaining plan lines (second host never applies).
     if ! nixos-rebuild "$ACTION" \
         --flake "$MEDUSA_GENERATED_DIR/nixos#$host" \
         --target-host "$target" \
-        --elevate=sudo < /dev/null; then
+        "${flags[@]}" < /dev/null; then
         echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
         rc=1
     fi
@@ -1912,8 +1927,10 @@ cmd_nixos_apply() {
 medusactl nixos-apply [--check] [--limit <pattern>] — reconcile NixOS hosts.
 
 Renders, then runs 'nixos-rebuild switch --flake generated/nixos#<host>
---target-host <user@endpoint> --elevate=sudo' on the controller for every
-NixOS host in the fleet (the 'medusa nixos-deploy-plan' partition). A no-op on
+--target-host <user@endpoint>' on the controller for every NixOS host in
+the fleet (the 'medusa nixos-deploy-plan' partition); non-root targets add
+the remote-sudo flag, probed per run because its name differs across
+nixos-rebuild vintages. A no-op on
 an all-Debian fleet. 'medusactl deploy' runs this automatically after the
 Debian deploy; use this command to reconcile NixOS hosts on their own.
 
