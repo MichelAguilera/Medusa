@@ -56,13 +56,13 @@ from medusa.inventory.storage_edit import (
 from medusa.model.coredns import CorednsModel
 from medusa.model.dns import DnsModel
 from medusa.model.homepage import HomepageModel
-from medusa.model.hosts import AnsibleInventoryModel
+from medusa.model.hosts import ManagedHostsModel
 from medusa.model.monitoring import MonitoringModel
 from medusa.model.native import NativeModel
 from medusa.model.network import NetworkModel
 from medusa.model.nixos import NixosModel
 from medusa.model.normalize import (
-    normalize_ansible_inventory,
+    normalize_managed_hosts,
     normalize_coredns,
     normalize_dns,
     normalize_homepage,
@@ -134,7 +134,7 @@ class _Inventory:
     homepage_model: HomepageModel
     monitoring_model: MonitoringModel
     coredns_model: CorednsModel
-    ansible_inventory_model: AnsibleInventoryModel
+    managed_hosts_model: ManagedHostsModel
     network_model: NetworkModel
     native_model: NativeModel
     nixos_model: NixosModel
@@ -190,7 +190,7 @@ def _load_all(
         ),
     )
     coredns_model = normalize_coredns(dns_model, services_model)
-    ansible_inventory_model = normalize_ansible_inventory(dns_model)
+    managed_hosts_model = normalize_managed_hosts(dns_model)
     network_model = normalize_network(dns_model)
     native_model = normalize_native(
         parse_native_inventory(load_optional_yaml(paths.native_inventory)),
@@ -206,7 +206,7 @@ def _load_all(
         _load_nixos_secret_ciphertexts(dns_model, services_model, paths),
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
-        ansible_model=ansible_inventory_model,
+        managed_hosts_model=managed_hosts_model,
     )
     sops_model = normalize_sops(
         dns_model,
@@ -227,7 +227,7 @@ def _load_all(
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
         coredns_model=coredns_model,
-        ansible_inventory_model=ansible_inventory_model,
+        managed_hosts_model=managed_hosts_model,
         network_model=network_model,
         native_model=native_model,
         nixos_model=nixos_model,
@@ -535,7 +535,7 @@ def nixos_deploy_plan(
     <user@endpoint>``). The controller host emits ``<host>\\tlocal`` FIRST --
     the seat switches itself locally (it cannot --target-host itself, T-099)
     and takes the slot controller-apply held, before the fleet reconcile.
-    Hosts with no ansible_user are warned to stderr and skipped. Prints
+    Hosts with no deploy_user are warned to stderr and skipped. Prints
     nothing (exit 0) when the fleet has no NixOS hosts, so a pure-Debian
     deploy is a no-op. This is deploy dispatch seam 2 of the Platform Fork
     Boundary; medusactl composes the invocation from these lines. See T-075.
@@ -570,7 +570,7 @@ def nixos_deploy_plan(
         reason = (
             "skipped (dormant)"
             if entry["reason"] == "dormant"
-            else "has no ansible_user; cannot reconcile (skipping)"
+            else "has no deploy_user; cannot reconcile (skipping)"
         )
         typer.echo(f"nixos host '{entry['name']}' {reason}", err=True)
     for entry in plan:
@@ -828,25 +828,13 @@ def add_host_cmd(
     alias: list[str] = typer.Option(
         [], "--alias", help="Optional DNS alias. Repeat for multiple."
     ),
-    ansible_user: str | None = typer.Option(
+    deploy_user: str | None = typer.Option(
         None,
-        "--ansible-user",
-        help="Mark host as ansible-managed and use this SSH user.",
-    ),
-    ansible_group: list[str] = typer.Option(
-        [],
-        "--ansible-group",
-        help="Ansible inventory group. Repeat for multiple. Ignored unless --ansible-user is set.",
-    ),
-    managed_mode: str | None = typer.Option(
-        None,
-        "--managed-mode",
+        "--deploy-user",
         help=(
-            "Host management class: 'full' (medusa-built template; root "
-            "SSH prep + hardening audit) or 'limited' (pre-existing/"
-            "baremetal; no prep). Requires --ansible-user. Defaults to "
-            "'limited' on managed hosts because 'full' is destructive "
-            "and must be deliberate."
+            "Mark host as managed: the SSH user deploy dispatch connects "
+            "as. Writes platform: nixos (the only onboarding platform); "
+            "omit for an unmanaged DNS-only record."
         ),
     ),
     manage_network: bool = typer.Option(
@@ -887,11 +875,6 @@ def add_host_cmd(
 ) -> None:
     """Append a host to inventory/dns.yaml (or replace with --force)."""
     paths = _paths(root)
-    if managed_mode is not None:
-        if managed_mode not in ("full", "limited"):
-            _fail("--managed-mode must be 'full' or 'limited'")
-        if ansible_user is None:
-            _fail("--managed-mode requires --ansible-user")
     if not manage_network and (
         net_interface is not None
         or net_prefix is not None
@@ -906,9 +889,10 @@ def add_host_cmd(
             ip=ip,
             zones=tuple(zone),
             aliases=tuple(alias),
-            ansible_user=ansible_user,
-            ansible_groups=tuple(ansible_group),
-            ansible_managed_mode=managed_mode,  # type: ignore[arg-type]
+            deploy_user=deploy_user,
+            # A managed record must claim its deploy engine (T-108); nixos is
+            # the only platform new records can onboard to.
+            platform="nixos" if deploy_user is not None else None,
             bootstrap_ip=bootstrap_ip,
             manage_network=manage_network,
             net_interface=net_interface,
@@ -1169,41 +1153,26 @@ def list_hosts_cmd(
     managed_only: bool = typer.Option(
         False,
         "--managed-only",
-        help="Show only hosts that have ansible_user set (both F and L).",
-    ),
-    mode: str | None = typer.Option(
-        None,
-        "--mode",
-        help="Filter by managed mode: 'full' or 'limited'. Implies --managed-only.",
+        help="Show only hosts that have deploy_user set.",
     ),
     root: Path | None = ROOT_OPTION,
     json_output: bool = JSON_OPTION,
 ) -> None:
     """Print the host inventory in a compact table.
 
-    Mode prefix: ``F`` = full managed, ``L`` = limited managed, ``-`` =
-    DNS-only (documented). The prefix layout survives for eyeballs, but
-    machine consumers use ``--json`` (T-099); grepping the table is the
-    legacy contract.
+    Prefix: ``M`` = managed (deploy_user set), ``-`` = unmanaged. The
+    prefix layout survives for eyeballs, but machine consumers use
+    ``--json`` (T-099); grepping the table is the legacy contract.
     """
     paths = _paths(root)
-    if mode is not None and mode not in ("full", "limited"):
-        _fail("--mode must be 'full' or 'limited'")
     try:
         doc = load_dns_doc(paths.dns_inventory)
     except (ValueError, FileNotFoundError) as error:
         _fail(str(error))
 
-    if mode is not None or managed_only:
-        hosts = list_managed_hosts(doc)
-    else:
-        hosts = list_hosts(doc)
-
-    if mode is not None:
-        hosts = tuple(h for h in hosts if _host_mode_letter(h) == mode[0].upper())
+    hosts = list_managed_hosts(doc) if managed_only else list_hosts(doc)
 
     if json_output:
-        letter_to_mode = {"F": "full", "L": "limited", "-": None}
         _emit_json(
             {
                 "hosts": [
@@ -1211,9 +1180,8 @@ def list_hosts_cmd(
                         "name": host.get("name"),
                         "ip": str(host.get("ip")),
                         "zones": list(host.get("zones") or []),
-                        "user": host.get("ansible_user"),
-                        "mode": letter_to_mode[_host_mode_letter(host)],
-                        "platform": host.get("platform") or "debian-docker",
+                        "user": host.get("deploy_user"),
+                        "platform": host.get("platform"),
                         "state": host.get("state") or "active",
                         "controller": bool(host.get("controller")),
                     }
@@ -1230,13 +1198,13 @@ def list_hosts_cmd(
     hosts = _sort_hosts_by_ip(hosts)
 
     for host in hosts:
-        letter = _host_mode_letter(host)
+        letter = "M" if host.get("deploy_user") else "-"
         zones = ",".join(host.get("zones") or [])
-        user = host.get("ansible_user") or ""
-        groups = ",".join(host.get("ansible_groups") or [])
+        user = host.get("deploy_user") or ""
+        platform = host.get("platform") or ""
         typer.echo(
             f"{letter} {host.get('name'):<20} {str(host.get('ip')):<18} "
-            f"zones={zones:<12} user={user:<10} groups={groups}"
+            f"zones={zones:<12} user={user:<10} platform={platform}"
         )
 
 
@@ -1268,13 +1236,3 @@ def _sort_hosts_by_ip(hosts: Any) -> tuple[dict[str, Any], ...]:
     return tuple(sorted(hosts, key=key))
 
 
-def _host_mode_letter(host: dict[str, Any]) -> str:
-    """Map a raw dns.yaml host entry to its list-hosts prefix letter.
-
-    Mirrors the safer-default rule from normalize: an ansible-managed host
-    with no explicit ``ansible_managed_mode`` is treated as ``limited``.
-    """
-    if not host.get("ansible_user"):
-        return "-"
-    mode = host.get("ansible_managed_mode") or "limited"
-    return "F" if mode == "full" else "L"

@@ -291,7 +291,7 @@ class NixosHost(BaseModel):
     # life. See T-078.
     state_version: str
     # Deploy user whose authorized_keys carry admin/deploy SSH access (the host's
-    # ansible_user). None when the host has no managed SSH user; then admin_keys
+    # deploy_user). None when the host has no managed SSH user; then admin_keys
     # is empty and no key block is emitted. See T-078.
     admin_user: str | None
     # Admin/deploy SSH public keys for ``admin_user``. Plain data (not secret).
@@ -309,7 +309,7 @@ class NixosHost(BaseModel):
     # partition scheme.
     disko_source: str | None
     # SSH endpoint for `nixos-rebuild switch --target-host`, as "<user>@<host>".
-    # None when the host has no ansible_user (no managed SSH endpoint) -- such a
+    # None when the host has no deploy_user (no managed SSH endpoint) -- such a
     # host can be rendered but not reconciled; the deploy plan warns and skips
     # it. Derived in normalize_nixos so deploy dispatch stays model-driven
     # (Platform Fork Boundary, seam 2). See T-075.

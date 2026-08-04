@@ -6,4 +6,4 @@ Bump it on ANY breaking change to any payload shape. medusactl probes
 never infers a payload shape from the binary in front of it (T-095).
 """
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2

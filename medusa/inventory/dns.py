@@ -185,18 +185,11 @@ class HostInventory(BaseModel):
     bootstrap_ip: IPv4Address | IPv6Address | None = None
     zones: list[str] = Field(min_length=1)
     aliases: list[str] = Field(default_factory=list)
-    # Optional ansible inventory metadata. When ansible_user is set, the host
-    # is considered "managed" and is emitted into ansible inventory + the
-    # bootstrap /etc/hosts / ~/.ssh/config helper files. DNS-only hosts (no
-    # ansible_user) are skipped by the ansible inventory renderer.
-    ansible_user: str | None = None
-    ansible_groups: list[str] = Field(default_factory=list)
-    # How much access medusa has to the host: "full" = medusa-built template
-    # (root SSH prep + hardening audit allowed); "limited" = pre-existing/
-    # baremetal (no prep, no root-SSH audit). When omitted, normalize defaults
-    # to "limited" because "full" can run destructive prep flows and must be
-    # deliberate. DNS-only hosts (no ansible_user) must leave this unset.
-    ansible_managed_mode: Literal["full", "limited"] | None = None
+    # SSH user deploy dispatch connects as (nixos-rebuild --target-host).
+    # When set, the host is "managed" and appears in deploy-facing outputs
+    # (deploy plan, ssh aliases, bootstrap /etc/hosts). Unset = unmanaged:
+    # the host exists (DNS, storage references) but is not medusa's to touch.
+    deploy_user: str | None = None
     # Opt-in to Medusa-managed static networking (T-055). Default false:
     # hosts are NEVER touched unless opted in, keeping Proxmox bridge
     # networking and baremetal hosts off-limits by default.
@@ -208,11 +201,13 @@ class HostInventory(BaseModel):
     # so a host running its own unmanaged reverse proxy can do Host-header
     # routing. Proxy hosts get a wildcard automatically regardless.
     wildcard: bool = False
-    # Deploy platform (T-073). "debian-docker" renders to the Compose + fstab
-    # + systemd-networkd path driven by Ansible; "nixos" renders to a Nix
-    # module/flake driven by nixos-rebuild (T-074/T-075). Orthogonal to
-    # ansible_managed_mode.
-    platform: Literal["debian-docker", "nixos"] = "debian-docker"
+    # Deploy platform (T-073). "nixos" renders to a Nix module/flake driven by
+    # nixos-rebuild (T-074/T-075); "debian-docker" is the legacy Compose +
+    # fstab render path. Unset = unmanaged: no deploy engine, no platform
+    # partition — a record must claim its platform explicitly to be
+    # deployable (T-108; the old debian-docker default let bare records
+    # silently claim a platform they never ran).
+    platform: Literal["debian-docker", "nixos"] | None = None
     # Host lifecycle state (T-091). "dormant" declares expected downtime: DNS
     # records and artifacts still render, but deploy dispatch skips the host
     # and the deploy stays green. Downtime is DECLARED here, never detected at
@@ -292,24 +287,14 @@ class HostInventory(BaseModel):
             raise ValueError("aliases must be unique per host")
         return normalized
 
-    @field_validator("ansible_user")
+    @field_validator("deploy_user")
     @classmethod
-    def normalize_ansible_user(cls, value: str | None) -> str | None:
+    def normalize_deploy_user(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = value.strip()
         if not normalized:
-            raise ValueError("ansible_user cannot be empty when set")
-        return normalized
-
-    @field_validator("ansible_groups")
-    @classmethod
-    def normalize_ansible_groups(cls, value: list[str]) -> list[str]:
-        normalized = [item.strip() for item in value]
-        if any(not item for item in normalized):
-            raise ValueError("ansible_groups cannot contain empty values")
-        if len(set(normalized)) != len(normalized):
-            raise ValueError("ansible_groups must be unique per host")
+            raise ValueError("deploy_user cannot be empty when set")
         return normalized
 
     @field_validator("age_recipient")
@@ -325,24 +310,20 @@ class HostInventory(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def validate_managed_mode_requires_user(self) -> Self:
-        if self.ansible_user is None and self.ansible_managed_mode is not None:
+    def validate_deploy_user_requires_platform(self) -> Self:
+        if self.deploy_user is not None and self.platform is None:
             raise ValueError(
-                f"host {self.name}: ansible_managed_mode requires ansible_user"
+                f"host {self.name}: deploy_user requires platform; a managed "
+                f"host must claim its deploy engine"
             )
         return self
 
     @model_validator(mode="after")
     def validate_dormant_requires_deployable(self) -> Self:
-        if (
-            self.state == "dormant"
-            and self.ansible_user is None
-            and self.platform != "nixos"
-        ):
+        if self.state == "dormant" and self.platform is None:
             raise ValueError(
-                f"host {self.name}: state 'dormant' has no effect on a "
-                f"DNS-only host (no ansible_user, not platform: nixos); "
-                f"drop the state field"
+                f"host {self.name}: state 'dormant' has no effect on an "
+                f"unmanaged host (no platform); drop the state field"
             )
         return self
 
@@ -411,9 +392,9 @@ class HostInventory(BaseModel):
                 f"host {self.name}: controller requires platform: nixos "
                 f"(the control plane is a managed NixOS host, T-099)"
             )
-        if self.ansible_user is None:
+        if self.deploy_user is None:
             raise ValueError(
-                f"host {self.name}: controller requires ansible_user -- the "
+                f"host {self.name}: controller requires deploy_user -- the "
                 f"deploy user whose authorized_keys carry the workstation keys"
             )
         if self.state == "dormant":

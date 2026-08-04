@@ -15,6 +15,10 @@ hosts:
   ip: 10.0.0.20
   zones: [lan]
   aliases: []
+  # A host that carries services must claim its deploy platform; the
+  # deploy user is the SSH user nixos-rebuild connects as.
+  deploy_user: root
+  platform: nixos
 - name: host03
   ip: 10.0.0.30
   zones: [lan]

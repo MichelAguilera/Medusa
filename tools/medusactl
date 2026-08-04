@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.32.0"
+VERSION="0.33.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -69,7 +69,7 @@ Usage:
                             [--remove-services] [--cascade]
     medusactl promote-target <name> [--dry-run]
     medusactl repin-target <name> [--ip <addr>]
-    medusactl list-targets [--managed-only | --full | --limited]
+    medusactl list-targets [--managed-only]
     medusactl build-installer
 
   Seat (controller):
@@ -181,7 +181,7 @@ ssh_target() {
 # --json`), parsed workstation-side with jq. The contract version is probed
 # once per run; a mismatch names the stale side instead of inferring payload
 # shapes from the binary in front of us (T-095).
-MEDUSACTL_CONTRACT=1
+MEDUSACTL_CONTRACT=2
 _contract_probed=""
 
 require_jq() {
@@ -307,17 +307,12 @@ ssh_base_opts() {
 
 remote_command() {
     local command=$1
-    # The MEDUSA_* exports feed both the medusa CLI (ProjectPaths override)
-    # and ansible group_vars. ANSIBLE_INVENTORY must override ansible.cfg's
-    # hardcoded relative inventory path (wrong since T-038 moved generated/
-    # to the XDG state dir); ansible.cfg cannot expand env vars, so this env
-    # knob is the only robust override.
-    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; export ANSIBLE_INVENTORY=%q; cd %q && %s' \
+    # The MEDUSA_* exports feed the medusa CLI (ProjectPaths override).
+    printf 'export PATH="$HOME/.local/bin:$PATH"; export MEDUSA_INVENTORY_ROOT=%q; export MEDUSA_INVENTORY_DIR=%q; export MEDUSA_SECRETS_DIR=%q; export MEDUSA_GENERATED_DIR=%q; cd %q && %s' \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory" \
         "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets" \
         "$MEDUSA_CONTROLLER_GENERATED_PATH" \
-        "$MEDUSA_CONTROLLER_GENERATED_PATH/ansible/inventory/hosts.ini" \
         "$MEDUSA_CONTROLLER_PATH" \
         "$command"
 }
@@ -884,7 +879,7 @@ cmd_audit_targets() {
     # still hop FROM the controller so /etc/hosts bootstrap routing applies.
     local hosts_tsv
     hosts_tsv=$(remote_medusa_json list-hosts --json --managed-only \
-        | jq -r '.hosts[] | [.name, .ip, (.user // "ansible")] | @tsv') || {
+        | jq -r '.hosts[] | [.name, .ip, .user] | @tsv') || {
         echo "audit: medusa list-hosts --json failed on controller" >&2
         return 0
     }
@@ -896,7 +891,7 @@ findings=0
 checked=0
 while IFS=$'\t' read -r name ip user; do
     [[ -z "$name" || -z "$ip" ]] && continue
-    [[ -z "$user" ]] && user="ansible"
+    [[ -z "$user" ]] && user="root"
 
     checked=$((checked + 1))
 
@@ -1759,11 +1754,6 @@ Flags:
   --zone <zone>          DNS zone. Defaults to 'lan'. Repeat for multiple.
   --user <user>          Deploy SSH user. Marks host as managed.
   --alias <alias>        DNS alias. Repeat for multiple.
-  --limited              Mark host as 'limited' managed mode (baremetal /
-                         pre-existing). Without this flag the host
-                         defaults to 'limited' anyway.
-  --full                 Mark host as 'full' managed mode. Mutually
-                         exclusive with --limited.
   --no-seed-hosts        Skip applying the /etc/hosts bootstrap block.
                          Use when local DNS already serves the name.
   --force                Replace an existing host of the same name.
@@ -1800,9 +1790,8 @@ EOF
     shift
 
     local original_flag_count=$#
-    local ip="" bootstrap_ip="" user="ansible" force=0 dry_run=0
+    local ip="" bootstrap_ip="" user="root" force=0 dry_run=0
     local interactive=0 no_seed_hosts=0
-    local mode=""  # "", "full", or "limited"
     local -a zones=() aliases=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1811,8 +1800,6 @@ EOF
             --zone) shift; zones+=("$1") ;;
             --user) shift; user=$1 ;;
             --alias) shift; aliases+=("$1") ;;
-            --limited) mode="limited" ;;
-            --full) mode="full" ;;
             --force) force=1 ;;
             --dry-run) dry_run=1 ;;
             --interactive) interactive=1 ;;
@@ -1832,19 +1819,11 @@ EOF
         [[ -z "$ip" ]] && prompt ip "IPv4 address"
         [[ -z "$ip" ]] && fail "add-target: --ip is required"
         [[ -z "$bootstrap_ip" ]] && prompt bootstrap_ip "Bootstrap IP (controller /etc/hosts cutover, blank to skip)" ""
-        prompt user "ansible user" "$user"
+        prompt user "deploy user" "$user"
         if [[ ${#zones[@]} -eq 0 ]]; then
             local zone_input
             prompt zone_input "DNS zone" "lan"
             zones=("$zone_input")
-        fi
-        if [[ -z "$mode" ]]; then
-            local mode_input
-            prompt mode_input "Managed mode (limited/full)" "limited"
-            case "$mode_input" in
-                limited|full) mode=$mode_input ;;
-                *) fail "add-target: invalid mode '$mode_input' (expected 'limited' or 'full')" ;;
-            esac
         fi
         if [[ "$no_seed_hosts" -eq 0 ]]; then
             confirm "Skip /etc/hosts bootstrap block (--no-seed-hosts)" "n" && no_seed_hosts=1
@@ -1858,7 +1837,6 @@ EOF
         info "  user:         $user"
         info "  zones:        ${zones[*]}"
         [[ ${#aliases[@]} -gt 0 ]] && info "  aliases:      ${aliases[*]}"
-        info "  mode:         $mode"
         info "  no-seed-hosts:$([[ $no_seed_hosts -eq 1 ]] && echo " yes" || echo " no")"
         info "  force:        $([[ $force -eq 1 ]] && echo yes || echo no)"
         info "  dry-run:      $([[ $dry_run -eq 1 ]] && echo yes || echo no)"
@@ -1872,10 +1850,9 @@ EOF
     fi
 
     local args
-    args=$(printf "%q " add-host "$name" --ip "$ip" --ansible-user "$user")
+    args=$(printf "%q " add-host "$name" --ip "$ip" --deploy-user "$user")
     local z; for z in "${zones[@]}"; do args+=$(printf "%q " --zone "$z"); done
     local a; for a in "${aliases[@]}"; do args+=$(printf "%q " --alias "$a"); done
-    [[ -n "$mode" ]] && args+=$(printf "%q " --managed-mode "$mode")
     [[ -n "$bootstrap_ip" ]] && args+=$(printf "%q " --bootstrap-ip "$bootstrap_ip")
     [[ "$force" -eq 1 ]] && args+="--force "
     [[ "$dry_run" -eq 1 ]] && args+="--dry-run "
@@ -2005,14 +1982,12 @@ cmd_list_targets() {
 medusactl list-targets — print the host inventory from the controller.
 
 Usage:
-  medusactl list-targets [--managed-only | --full | --limited]
+  medusactl list-targets [--managed-only]
 
 Flags:
-  --managed-only         Show only hosts with ansible_user set (F + L).
-  --full                 Show only 'full' managed-mode hosts.
-  --limited              Show only 'limited' managed-mode hosts.
+  --managed-only         Show only hosts with deploy_user set.
 
-Prefix legend: F = full managed, L = limited managed, - = DNS-only.
+Prefix legend: M = managed (deploy_user set), - = unmanaged.
 EOF
         return 0
     fi
@@ -2020,8 +1995,6 @@ EOF
     local extra=""
     case "${1:-}" in
         --managed-only) extra="--managed-only" ;;
-        --full)         extra="--mode full" ;;
-        --limited)      extra="--mode limited" ;;
         "")             : ;;
         *)              fail "list-targets: unknown flag '${1:-}'" ;;
     esac
@@ -2250,10 +2223,10 @@ _medusactl_complete() {
             fi
             ;;
         add-target)
-            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --full --limited --no-seed-hosts --force --dry-run --interactive --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--ip --bootstrap-ip --zone --user --alias --no-seed-hosts --force --dry-run --interactive --help" -- "$cur") )
             ;;
         list-targets)
-            COMPREPLY=( $(compgen -W "--managed-only --full --limited --help" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--managed-only --help" -- "$cur") )
             ;;
         remove-target)
             COMPREPLY=( $(compgen -W "--dry-run --remove-mounts --remove-exports --remove-services --cascade --help" -- "$cur") )
@@ -2333,18 +2306,14 @@ _medusactl() {
             _arguments \
                 '--ip[IPv4 address]:ip:' \
                 '--zone[DNS zone]:zone:' \
-                '--user[ansible user]:user:' \
+                '--user[deploy user]:user:' \
                 '--alias[DNS alias]:alias:' \
-                '--full[mark as full managed mode]' \
-                '--limited[mark as limited managed mode]' \
                 '--no-seed-hosts[skip /etc/hosts seed]' \
                 '--force[replace existing entry]'
             ;;
         list-targets)
             _arguments \
-                '--managed-only[show only managed hosts]' \
-                '--full[show only full managed mode]' \
-                '--limited[show only limited managed mode]'
+                '--managed-only[show only managed hosts]'
             ;;
         remove-target)
             _arguments \
@@ -2395,15 +2364,11 @@ complete -c medusactl -n '__fish_seen_subcommand_from compose' -l check -d 'Run 
 complete -c medusactl -n '__fish_seen_subcommand_from compose' -l pull -d 'Force image re-pull (up only)'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l ip -d 'IPv4 address'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l zone -d 'DNS zone'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l user -d 'ansible user'
+complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l user -d 'deploy user'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l alias -d 'DNS alias'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l full -d 'Mark as full managed mode'
-complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l limited -d 'Mark as limited managed mode'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l no-seed-hosts -d 'Skip /etc/hosts seed'
 complete -c medusactl -n '__fish_seen_subcommand_from add-target' -l force -d 'Replace existing entry'
-complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l managed-only -d 'Show only managed hosts (F + L)'
-complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l full -d 'Show only full managed mode'
-complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l limited -d 'Show only limited managed mode'
+complete -c medusactl -n '__fish_seen_subcommand_from list-targets' -l managed-only -d 'Show only managed hosts'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l dry-run -d 'Validate and diff without writing'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-mounts -d 'Drop host from storage mount lists'
 complete -c medusactl -n '__fish_seen_subcommand_from remove-target' -l remove-exports -d 'Remove storage exports served by host'

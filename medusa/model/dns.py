@@ -1,23 +1,6 @@
-from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
-
-
-class ManagedMode(StrEnum):
-    """Three-state classification of a host's relationship to medusa.
-
-    - ``NONE``: DNS-only ("documented"). No ansible_user, ignored by deploy.
-    - ``FULL``: medusa-built template. Root SSH prep + hardening audit on.
-    - ``LIMITED``: pre-existing/baremetal managed host. No prep, no
-      root-SSH audit. Default when a host has ansible_user but no explicit
-      mode, because ``FULL`` enables destructive prep flows and must be
-      deliberate.
-    """
-
-    NONE = "none"
-    FULL = "full"
-    LIMITED = "limited"
 
 
 class DnsZone(BaseModel):
@@ -56,11 +39,9 @@ class HostRecord(BaseModel):
     zones: tuple[str, ...]
     aliases: tuple[str, ...]
     fqdns: tuple[str, ...]
-    # ansible_user is None for DNS-only hosts; when set, the host is
-    # ansible-managed and shows up in the rendered ansible inventory.
-    ansible_user: str | None = None
-    ansible_groups: tuple[str, ...] = ()
-    managed_mode: ManagedMode = ManagedMode.NONE
+    # SSH user deploy dispatch connects as. None = unmanaged host: it exists
+    # in DNS (and may be referenced by storage) but is not medusa's to touch.
+    deploy_user: str | None = None
     # IANA timezone; consumed by the NixOS render (time.timeZone). None means
     # the platform default (UTC, and no /etc/localtime on NixOS).
     timezone: str | None = None
@@ -71,12 +52,10 @@ class HostRecord(BaseModel):
     # host, independent of whether it runs a Medusa-managed proxy. Unioned
     # with proxy hosts when deriving rewrite_zones in normalize.
     wildcard: bool = False
-    # Deploy platform. "debian-docker" hosts render to Compose + fstab +
-    # systemd-networkd and deploy via Ansible; "nixos" hosts render to a Nix
-    # module/flake (T-074) and deploy via nixos-rebuild (T-075). Orthogonal to
-    # managed_mode. Renderers partition on this; they never branch on it
-    # themselves (renderer contract). See T-073.
-    platform: Literal["debian-docker", "nixos"] = "debian-docker"
+    # Deploy platform; None = unmanaged (no deploy engine, outside every
+    # platform partition). Renderers partition on this; they never branch on
+    # it themselves (renderer contract). See T-073/T-108.
+    platform: Literal["debian-docker", "nixos"] | None = None
     # Lifecycle state (T-091). "dormant" = declared expected downtime: DNS
     # records and artifacts still render, but the host is excluded from every
     # deploy-facing output (ansible inventory/groups, nixos deploy plan,
@@ -109,8 +88,8 @@ class HostRecord(BaseModel):
     controller: bool = False
 
     @property
-    def is_ansible_managed(self) -> bool:
-        return self.ansible_user is not None
+    def has_deploy_user(self) -> bool:
+        return self.deploy_user is not None
 
     @property
     def is_nixos(self) -> bool:

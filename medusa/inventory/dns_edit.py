@@ -73,9 +73,10 @@ class HostFields:
     ip: str
     zones: tuple[str, ...]
     aliases: tuple[str, ...] = ()
-    ansible_user: str | None = None
-    ansible_groups: tuple[str, ...] = ()
-    ansible_managed_mode: Literal["full", "limited"] | None = None
+    deploy_user: str | None = None
+    # Written only alongside deploy_user: a managed host must claim its
+    # deploy engine (T-108); an unmanaged record carries no platform.
+    platform: Literal["debian-docker", "nixos"] | None = None
     bootstrap_ip: str | None = None
     # Managed static-networking opt-in + optional per-host override. Unset
     # override fields fall back to the global `network:` defaults at
@@ -163,7 +164,7 @@ def list_hosts(doc: CommentedMap) -> tuple[dict[str, Any], ...]:
 
 
 def list_managed_hosts(doc: CommentedMap) -> tuple[dict[str, Any], ...]:
-    return tuple(h for h in list_hosts(doc) if h.get("ansible_user"))
+    return tuple(h for h in list_hosts(doc) if h.get("deploy_user"))
 
 
 def _serialize_host(fields: HostFields) -> CommentedMap:
@@ -176,13 +177,10 @@ def _serialize_host(fields: HostFields) -> CommentedMap:
     out["zones"].fa.set_flow_style()
     out["aliases"] = CommentedSeq(fields.aliases)
     out["aliases"].fa.set_flow_style()
-    if fields.ansible_user is not None:
-        out["ansible_user"] = fields.ansible_user
-    if fields.ansible_groups:
-        out["ansible_groups"] = CommentedSeq(fields.ansible_groups)
-        out["ansible_groups"].fa.set_flow_style()
-    if fields.ansible_managed_mode is not None:
-        out["ansible_managed_mode"] = fields.ansible_managed_mode
+    if fields.deploy_user is not None:
+        out["deploy_user"] = fields.deploy_user
+    if fields.platform is not None:
+        out["platform"] = fields.platform
     if fields.manage_network:
         out["manage_network"] = True
     network = CommentedMap()
@@ -209,9 +207,8 @@ def _hosts_equal(a: Any, b: Any) -> bool:
         "bootstrap_ip",
         "zones",
         "aliases",
-        "ansible_user",
-        "ansible_groups",
-        "ansible_managed_mode",
+        "deploy_user",
+        "platform",
         "manage_network",
         "network",
     }

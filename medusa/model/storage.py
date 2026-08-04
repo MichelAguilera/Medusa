@@ -18,7 +18,7 @@ class NfsExport(BaseModel):
 class ExportDirectory(BaseModel):
     """One directory the nfs_exports role creates/repairs, with the ownership
     it must converge to. The export path itself carries the export's declared
-    owner/group/mode; intermediate dirs keep the ansible-owned default."""
+    owner/group/mode; intermediate dirs keep the automation-owned default."""
 
     model_config = ConfigDict(frozen=True)
 

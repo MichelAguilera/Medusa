@@ -1,13 +1,11 @@
 from pydantic import BaseModel, ConfigDict
 
-from medusa.model.dns import ManagedMode
 
+class ManagedHost(BaseModel):
+    """One managed host in the deploy-facing derivation.
 
-class AnsibleHost(BaseModel):
-    """One ansible-managed host in the rendered inventory.
-
-    Derived in normalization from a HostRecord whose ansible_user is set.
-    The renderer iterates these tuples without filtering or reshaping.
+    Derived in normalization from a HostRecord whose deploy_user is set.
+    Consumers iterate these tuples without filtering or reshaping.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -15,9 +13,7 @@ class AnsibleHost(BaseModel):
     name: str               # short alias (matches HostRecord.name)
     hostname: str           # connection name; first FQDN for the host
     ip: str
-    ansible_user: str
-    groups: tuple[str, ...] = ()
-    managed_mode: ManagedMode = ManagedMode.LIMITED
+    deploy_user: str
 
 
 class BootstrapHost(BaseModel):
@@ -37,11 +33,11 @@ class BootstrapHost(BaseModel):
     ip: str
 
 
-class AnsibleInventoryModel(BaseModel):
-    """Inventory shape consumed by the ansible-inventory + bootstrap-blocks
-    renderer."""
+class ManagedHostsModel(BaseModel):
+    """Managed + bootstrap host shape consumed by the controller submodel
+    derivation (ssh aliases, /etc/hosts bootstrap block)."""
 
     model_config = ConfigDict(frozen=True)
 
-    managed_hosts: tuple[AnsibleHost, ...]
+    managed_hosts: tuple[ManagedHost, ...]
     bootstrap_hosts: tuple[BootstrapHost, ...] = ()

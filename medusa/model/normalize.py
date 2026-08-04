@@ -19,9 +19,9 @@ from medusa.model.compose import (
     validate_service_mount_refs,
 )
 from medusa.model.coredns import CorednsModel
-from medusa.model.dns import DnsModel, DnsZone, HostNetwork, HostRecord, ManagedMode
+from medusa.model.dns import DnsModel, DnsZone, HostNetwork, HostRecord
 from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
-from medusa.model.hosts import AnsibleHost, AnsibleInventoryModel, BootstrapHost
+from medusa.model.hosts import BootstrapHost, ManagedHost, ManagedHostsModel
 from medusa.model.monitoring import MonitoringModel, MonitoringTarget
 from medusa.model.native import (
     NativeModel,
@@ -66,27 +66,13 @@ from medusa.model.storage import (
 
 # Ownership the nfs_exports role applies to intermediate export directories
 # and, by default, to export paths that declare nothing (T-085). Matches the
-# ansible automation uid/gid contract (T-048).
+# automation uid/gid contract (T-048).
 DEFAULT_EXPORT_OWNER = 1000
 DEFAULT_EXPORT_GROUP = 1000
 DEFAULT_EXPORT_MODE = "0755"
 # Mode a shared-space export must declare: setgid + group-write, so files
 # created through any member's mount inherit the share group (T-084/T-085).
 SFTP_SHARED_EXPORT_MODE = "2775"
-
-
-def _derive_managed_mode(
-    ansible_user: str | None, ansible_managed_mode: str | None
-) -> ManagedMode:
-    if ansible_user is None:
-        # Inventory-layer validator already rejects mode-without-user, so
-        # this branch only fires for true DNS-only hosts.
-        return ManagedMode.NONE
-    if ansible_managed_mode is None:
-        # Safer default: "full" enables destructive prep flows and must be
-        # deliberate.
-        return ManagedMode.LIMITED
-    return ManagedMode(ansible_managed_mode)
 
 
 def _resolve_network(
@@ -130,11 +116,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
                 for zone in host.zones
                 for label in [host.name, *host.aliases]
             ),
-            ansible_user=host.ansible_user,
-            ansible_groups=tuple(host.ansible_groups),
-            managed_mode=_derive_managed_mode(
-                host.ansible_user, host.ansible_managed_mode
-            ),
+            deploy_user=host.deploy_user,
             timezone=host.timezone,
             network=_resolve_network(host, inventory.network),
             wildcard=host.wildcard,
@@ -158,9 +140,9 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
     )
 
 
-def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
-    """Build the ansible inventory model from DNS hosts whose ansible_user
-    is set. The hostname is the host's first FQDN, so day-zero SSH works
+def normalize_managed_hosts(dns_model: DnsModel) -> ManagedHostsModel:
+    """Build the managed-hosts model from DNS hosts whose deploy_user is
+    set. The hostname is the host's first FQDN, so day-zero SSH works
     once the /etc/hosts bootstrap block is applied (and once DNS is live
     it keeps working unchanged).
 
@@ -170,7 +152,7 @@ def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
     not the canonical DNS IP. A DNS-only host with no bootstrap_ip
     contributes nothing here.
     """
-    managed: list[AnsibleHost] = []
+    managed: list[ManagedHost] = []
     bootstrap: list[BootstrapHost] = []
     for host in dns_model.hosts:
         if host.bootstrap_ip is not None:
@@ -186,30 +168,28 @@ def normalize_ansible_inventory(dns_model: DnsModel) -> AnsibleInventoryModel:
                     ip=host.bootstrap_ip,
                 )
             )
-        if not host.is_ansible_managed:
+        if not host.has_deploy_user:
             continue
         # Dormant hosts keep their bootstrap /etc/hosts entry (name resolution
-        # is harmless) but get no connection metadata: absent from hosts.ini,
-        # Ansible cannot target them (T-091).
+        # is harmless) but get no connection metadata: deploy dispatch cannot
+        # target them (T-091).
         if host.is_dormant:
             continue
         if not host.fqdns:
             raise ValueError(
-                f"host {host.name} is ansible-managed but has no FQDN; "
+                f"host {host.name} is managed but has no FQDN; "
                 f"add at least one zone"
             )
-        assert host.ansible_user is not None  # narrow for type checkers
+        assert host.deploy_user is not None  # narrow for type checkers
         managed.append(
-            AnsibleHost(
+            ManagedHost(
                 name=host.name,
                 hostname=host.fqdns[0],
                 ip=host.ip,
-                ansible_user=host.ansible_user,
-                groups=host.ansible_groups,
-                managed_mode=host.managed_mode,
+                deploy_user=host.deploy_user,
             )
         )
-    return AnsibleInventoryModel(
+    return ManagedHostsModel(
         managed_hosts=tuple(managed),
         bootstrap_hosts=tuple(bootstrap),
     )
@@ -308,12 +288,12 @@ def validate_dormant_dependencies(
             )
 
     # The fleet resolver (layering ADR: DNS before everything). Derivation
-    # mirrors the ansible-groups builder.
+    # mirrors the managed-hosts builder.
     coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
     active_managed = any(
-        (host.is_ansible_managed or host.is_nixos) and not host.is_dormant
+        (host.has_deploy_user or host.is_nixos) and not host.is_dormant
         for host in dns_model.hosts
     )
     for name in coredns_hosts:
@@ -379,7 +359,7 @@ def normalize_nixos(
     secret_ciphertexts: dict[str, str] | None = None,
     homepage_model: HomepageModel | None = None,
     monitoring_model: MonitoringModel | None = None,
-    ansible_model: AnsibleInventoryModel | None = None,
+    managed_hosts_model: ManagedHostsModel | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
     Nix renderer formats. Crosscuts dns + storage + services + native services,
@@ -529,7 +509,7 @@ def normalize_nixos(
     # onto the host ride the flake tree instead -- same rendered bytes, never
     # re-rendered. traefik/homepage stage into the stack tree (the containers
     # bind them relatively); prometheus targets mirror the Debian deploy-root
-    # destination. Host derivations mirror the ansible-groups builder (service
+    # destination. Host derivations mirror the managed-hosts builder (service
     # NAME), so a host migrating platforms keeps the same delivery set.
     def _stack_with_service(host_name: str, service_name: str) -> str:
         for stack in stacks_by_host.get(host_name, ()):
@@ -673,16 +653,16 @@ def normalize_nixos(
             )
         controller_by_host[host.name] = NixosController(
             etc_hosts=(
-                ansible_model.bootstrap_hosts if ansible_model is not None else ()
+                managed_hosts_model.bootstrap_hosts if managed_hosts_model is not None else ()
             ),
             ssh_aliases=tuple(
                 NixosSshAlias(
                     name=managed.name,
                     hostname=managed.hostname,
-                    user=managed.ansible_user,
+                    user=managed.deploy_user,
                 )
                 for managed in (
-                    ansible_model.managed_hosts if ansible_model is not None else ()
+                    managed_hosts_model.managed_hosts if managed_hosts_model is not None else ()
                 )
                 if managed.name != host.name
             ),
@@ -738,7 +718,7 @@ def normalize_nixos(
             boot_loader=host.nixos_guest != "lxc",
             boot_bios_device=host.nixos_boot_device,
             state_version=host.nixos_state_version or DEFAULT_NIXOS_STATE_VERSION,
-            admin_user=host.ansible_user,
+            admin_user=host.deploy_user,
             admin_keys=host.nixos_admin_keys,
             disko_module=(
                 f"../disko/{host.name}.nix" if host.nixos_disko else None
@@ -902,10 +882,10 @@ def _nixos_deploy_target(host: HostRecord) -> str | None:
     the host has no managed SSH user (renderable but not reconcilable). Uses the
     canonical fqdn so the controller reaches it the same way Ansible reaches
     Debian hosts; falls back to the ip when no fqdn is declared. See T-075."""
-    if host.ansible_user is None:
+    if host.deploy_user is None:
         return None
     endpoint = host.fqdns[0] if host.fqdns else host.ip
-    return f"{host.ansible_user}@{endpoint}"
+    return f"{host.deploy_user}@{endpoint}"
 
 
 def _nixos_network(host: HostRecord) -> NixosNetwork | None:
@@ -1198,7 +1178,7 @@ def normalize_storage(
         )
         # The export path itself converges to the declared ownership; any
         # intermediate dirs (dataset mountpoint above a deeper export) stay
-        # ansible-owned (T-085).
+        # automation-owned (T-085).
         directories = tuple(
             ExportDirectory(
                 path=path,
@@ -1261,9 +1241,25 @@ def normalize_services(
         formatted = ", ".join(unknown_hosts)
         raise ValueError(f"services reference unknown hosts: {formatted}")
 
+    platform_by_host = {host.name: host.platform for host in dns_model.hosts}
+    # A workload needs a deploy engine; an unmanaged host (no platform) can
+    # be referenced by DNS and storage but cannot carry services (T-108).
+    unmanaged_hosts = sorted(
+        {
+            service.host
+            for service in services
+            if platform_by_host[service.host] is None
+        }
+    )
+    if unmanaged_hosts:
+        formatted = ", ".join(unmanaged_hosts)
+        raise ValueError(
+            f"services target unmanaged hosts (no platform): {formatted}. "
+            f"Set platform on the host record or move the services."
+        )
+
     # A stack whose services straddle a Debian and a NixOS host has no
     # coherent output target; reject it (T-073).
-    platform_by_host = {host.name: host.platform for host in dns_model.hosts}
     stack_platforms: dict[str, set[str]] = {}
     for service in services:
         if service.stack is None:
