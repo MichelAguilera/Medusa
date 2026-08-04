@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.31.3"
+VERSION="0.31.4"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -2932,8 +2932,13 @@ echo '==> inventory: git pull'
 git -C $(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH") pull --ff-only
 echo '==> uv sync'
 uv sync --quiet
-echo '==> ansible-galaxy'
-uv run --quiet ansible-galaxy collection install -r ansible/requirements.yml
+if uv run --quiet ansible-galaxy --version >/dev/null 2>&1; then
+    echo '==> ansible-galaxy'
+    uv run --quiet ansible-galaxy collection install -r ansible/requirements.yml
+else
+    # a nixos seat carries no ansible (T-099); the leg dies with the estate
+    echo '==> ansible-galaxy: skipped (no ansible on this seat)'
+fi
 EOF
 )"
 }
