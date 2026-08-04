@@ -1,7 +1,0 @@
----
-- name: Apply controller-side bootstrap blocks
-  hosts: medusa_control
-  gather_facts: false
-  become: true
-  roles:
-    - controller_bootstrap

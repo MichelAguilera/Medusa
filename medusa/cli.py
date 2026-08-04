@@ -85,7 +85,6 @@ from medusa.render.egress import render_egress
 from medusa.render.coredns import render_coredns
 from medusa.render.docs import render_docs
 from medusa.render.homepage import render_homepage
-from medusa.render.hosts import render_hosts
 from medusa.render.monitoring import render_monitoring
 from medusa.render.network import render_network
 from medusa.render.nginx import render_nginx
@@ -317,7 +316,6 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_secrets_manifest(services_model, templates_dir, generated_dir),
         **render_sops_config(loaded.sops_model, templates_dir, generated_dir),
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),
-        **render_hosts(loaded.ansible_inventory_model, templates_dir, generated_dir),
         **render_network(loaded.network_model, templates_dir, generated_dir),
         **render_nixos(loaded.nixos_model, templates_dir, generated_dir),
         **render_docs(

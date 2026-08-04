@@ -12,12 +12,6 @@ __pycache__/
 !.env.example
 *.secret
 
-# Ansible runtime/dependency artifacts.
-*.retry
-.ansible/
-ansible/.cache/
-ansible/collections/
-
 # Generated artifacts are never committed; they are produced from
 # inventory on the host that runs `medusa render`.
 /generated/
