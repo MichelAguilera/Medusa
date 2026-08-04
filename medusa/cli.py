@@ -476,6 +476,14 @@ def render(
     _succeed(f"Rendered {len(files)} file(s).")
 
 
+def _stale_display(path: Path, root: Path) -> str:
+    # generated_dir may live outside root (MEDUSA_GENERATED_DIR)
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
 @app.command(rich_help_panel=_PIPELINE_PANEL)
 def check(
     root: Path | None = ROOT_OPTION,
@@ -500,9 +508,7 @@ def check(
         _emit_json(
             {
                 "ok": not stale,
-                "stale": [
-                    str(path.relative_to(paths.root)) for path in stale
-                ],
+                "stale": [_stale_display(path, paths.root) for path in stale],
                 "diagnostics": _json_diagnostics(collected),
             }
         )
@@ -510,7 +516,9 @@ def check(
             raise typer.Exit(code=1)
         return
     if stale:
-        formatted = "\n".join(f"- {path.relative_to(paths.root)}" for path in stale)
+        formatted = "\n".join(
+            f"- {_stale_display(path, paths.root)}" for path in stale
+        )
         _fail(f"Generated files are stale:\n{formatted}")
 
     _succeed("Generated files are up to date.")
