@@ -104,6 +104,9 @@ class HostRecord(BaseModel):
     # .sops.yaml creation_rules so a host that references a secret is a recipient
     # of it and can decrypt host-side. None until harvested. See T-080.
     age_recipient: str | None = None
+    # Control-plane seat (T-099). Carried verbatim; normalize_nixos enforces
+    # compute-sterility and derives the control-plane module config from it.
+    controller: bool = False
 
     @property
     def is_ansible_managed(self) -> bool:

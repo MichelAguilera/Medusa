@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.29.0"
+VERSION="0.31.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -183,6 +183,64 @@ require_local_inventory_dir() {
 
 ssh_target() {
     printf "%s@%s" "$MEDUSA_CONTROLLER_USER" "$MEDUSA_CONTROLLER_HOST"
+}
+
+# --- Typed controller contract (T-099) ---------------------------------------
+#
+# Controller state crosses the SSH seam as versioned JSON (`medusa <verb>
+# --json`), parsed workstation-side with jq. The contract version is probed
+# once per run; a mismatch names the stale side instead of inferring payload
+# shapes from the binary in front of us (T-095).
+MEDUSACTL_CONTRACT=1
+_contract_probed=""
+
+require_jq() {
+    command -v jq >/dev/null 2>&1 \
+        || fail "jq is required on the workstation for the typed controller contract (T-099)"
+}
+
+_remote_medusa_env() {
+    printf 'export PATH="$HOME/.local/bin:$PATH"\n'
+    printf 'export MEDUSA_INVENTORY_DIR=%q\n' "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory"
+    printf 'export MEDUSA_SECRETS_DIR=%q\n' "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets"
+    printf 'export MEDUSA_GENERATED_DIR=%q\n' "$MEDUSA_CONTROLLER_GENERATED_PATH"
+    printf 'cd %q\n' "$MEDUSA_CONTROLLER_PATH"
+}
+
+remote_medusa_json() {
+    # $@ = medusa argv, e.g. `list-stacks --json`. Prints the payload.
+    require_jq
+    local target
+    target=$(ssh_target)
+    local -a ssh_opts
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    if [[ -z "$_contract_probed" ]]; then
+        local probe remote_contract
+        probe=$(ssh -n "${ssh_opts[@]}" "$target" \
+            "bash -c $(printf %q "$(_remote_medusa_env)
+uv run --quiet medusa contract-version")") \
+            || fail "contract probe failed: the controller cannot run 'medusa contract-version' (older release? run 'medusactl update')"
+        remote_contract=$(jq -r '.contract' <<< "$probe" 2>/dev/null) || remote_contract=""
+        [[ "$remote_contract" == "$MEDUSACTL_CONTRACT" ]] \
+            || fail "contract mismatch: controller speaks '${remote_contract:-unknown}', this medusactl speaks '$MEDUSACTL_CONTRACT' — update the stale side ('medusactl update' for the controller, 'medusactl self-update' for this tool)"
+        _contract_probed=1
+    fi
+    local quoted="" tok
+    for tok in "$@"; do quoted+=" $(printf %q "$tok")"; done
+    ssh -n "${ssh_opts[@]}" "$target" \
+        "bash -c $(printf %q "$(_remote_medusa_env)
+uv run --quiet medusa$quoted")"
+}
+
+local_medusa_json() {
+    # The same contract read from the LOCAL inventory checkout (T-037
+    # pattern). No probe: medusactl and the local medusa ship together.
+    require_jq
+    require_local_inventory_dir
+    ( cd "$MEDUSACTL_INVENTORY_DIR" \
+        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
+           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
+           medusa "$@" )
 }
 
 default_public_key() {
@@ -1065,35 +1123,23 @@ cmd_audit_targets() {
     target=$(ssh_target)
     log=$(log_path "audit-targets")
 
+    # Host list crosses the seam as the typed payload (T-099); the probes
+    # still hop FROM the controller so /etc/hosts bootstrap routing applies.
+    local hosts_tsv
+    hosts_tsv=$(remote_medusa_json list-hosts --json --managed-only \
+        | jq -r '.hosts[] | [.name, .ip, (.user // "ansible")] | @tsv') || {
+        echo "audit: medusa list-hosts --json failed on controller" >&2
+        return 0
+    }
+
     local remote
-    remote=$(cat <<REMOTE
+    remote=$(cat <<'REMOTE'
 set -uo pipefail
-export PATH="\$HOME/.local/bin:\$PATH"
-export MEDUSA_INVENTORY_ROOT=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH")
-export MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory")
-export MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets")
-export MEDUSA_GENERATED_DIR=$(printf %q "$MEDUSA_CONTROLLER_GENERATED_PATH")
-cd "$MEDUSA_CONTROLLER_PATH"
-hosts=\$(uv run --quiet medusa list-hosts --managed-only) || {
-    echo "audit: medusa list-hosts --managed-only failed on controller" >&2
-    exit 0
-}
-REMOTE
-)
-    remote+=$'\n'
-    remote+=$(cat <<'REMOTE'
 findings=0
 checked=0
-while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    # Skip rows that don't start with the managed-mode prefix letter.
-    [[ "$line" =~ ^[FL][[:space:]] ]] || continue
-
-    name=$(awk '{print $2}' <<< "$line")
-    ip=$(awk '{print $3}' <<< "$line")
-    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
+while IFS=$'\t' read -r name ip user; do
+    [[ -z "$name" || -z "$ip" ]] && continue
     [[ -z "$user" ]] && user="ansible"
-    [[ -z "$ip" || -z "$name" ]] && continue
 
     checked=$((checked + 1))
 
@@ -1114,7 +1160,7 @@ while IFS= read -r line; do
             "$name" "$user" "$ip"
         findings=$((findings + 1))
     fi
-done <<< "$hosts"
+done <<< "$HOSTS_TSV"
 
 echo ""
 if [[ "$checked" -eq 0 ]]; then
@@ -1134,7 +1180,8 @@ REMOTE
     printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
     printf "log:    %s\n" "$log"
 
-    if ssh "${ssh_opts[@]}" "$target" "bash -s" <<< "$remote" 2>&1 | tee "$log"; then
+    if ssh "${ssh_opts[@]}" "$target" \
+        "HOSTS_TSV=$(printf %q "$hosts_tsv") bash -s" <<< "$remote" 2>&1 | tee "$log"; then
         printf "%s✓%s audit-targets\n" "$color_green" "$color_reset"
         return 0
     else
@@ -1239,28 +1286,17 @@ EOF
 }
 
 # Fetch the rendered stack table from the controller: one tab-separated row
-# per stack, 'stack host services platform state'. The platform/state columns
-# are what the runtime-verb routing decides on (T-092); rows without
-# platform=nixos are a hard error since the ansible path retired (T-096).
+# per stack, 'stack host services platform state'. Crosses the seam as the
+# typed `list-stacks --json` payload (T-099) and is flattened to TSV here so
+# downstream filters stay awk. The platform/state columns are what the
+# runtime-verb routing decides on (T-092); rows without platform=nixos are a
+# hard error since the ansible path retired (T-096).
 fetch_stacks() {
-    local target
-    local -a ssh_opts
-    target=$(ssh_target)
-    mapfile -t ssh_opts < <(ssh_base_opts)
-    [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
-    local remote
-    remote=$(cat <<'REMOTE'
-set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-cd "$MEDUSA_CONTROLLER_PATH"
-uv run --quiet medusa list-stacks
-REMOTE
-)
-    ssh "${ssh_opts[@]}" "$target" \
-        "MEDUSA_CONTROLLER_PATH=$(printf %q "$MEDUSA_CONTROLLER_PATH") \
-         MEDUSA_INVENTORY_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/inventory") \
-         MEDUSA_SECRETS_DIR=$(printf %q "$MEDUSA_CONTROLLER_INVENTORY_PATH/secrets") \
-         bash -s" <<< "$remote"
+    local payload
+    payload=$(remote_medusa_json list-stacks --json) || return 1
+    jq -r \
+        '.stacks[] | [.stack, .host, (.services | join(",")), .platform, .state] | @tsv' \
+        <<< "$payload"
 }
 
 # Non-interactive runtime verb on a NixOS-hosted stack (T-092); no TTY, so
@@ -1337,29 +1373,26 @@ _compose_interactive() {
     local inner="cd \"\$HOME/medusa-stacks/$(printf %q "$stack")\" && exec docker compose${dc_quoted}"
     local hostcmd="sudo -Hu medusa bash -c $(printf %q "$inner")"
 
-    # Controller-side: resolve stack->host (unless --host) then hop with a TTY.
-    # Passed as the ssh COMMAND (no stdin heredoc) so the terminal stays attached.
+    # Stack->host resolution happens workstation-side over the typed contract
+    # (T-099); the controller-side hop receives HOST already resolved. Passed
+    # as the ssh COMMAND (no stdin heredoc) so the terminal stays attached.
+    if [[ -z "$host" ]]; then
+        local matches n
+        matches=$(fetch_stacks | awk -F'\t' -v s="$stack" '$1==s{print $2}') \
+            || fail "compose $verb: could not fetch the stack table from the controller"
+        n=$(grep -c . <<< "$matches" || true)
+        [[ "$n" -gt 0 ]] || fail "compose $verb: stack '$stack' not found on any host (run 'medusactl compose list')"
+        if [[ "$n" -gt 1 ]]; then
+            echo "compose $verb: stack '$stack' is on multiple hosts; pass --host <name>:" >&2
+            printf '  %s\n' $matches >&2
+            exit 4
+        fi
+        host="$matches"
+    fi
     local remote
     remote=$(cat <<'REMOTE'
 set -euo pipefail
-export PATH="$HOME/.local/bin:$PATH"
-cd "$MEDUSA_CONTROLLER_PATH"
-host="$HOST"
-if [ -z "$host" ]; then
-    matches=$(uv run --quiet medusa list-stacks | awk -F'\t' -v s="$STACK" '$1==s{print $2}')
-    n=$(printf '%s' "$matches" | grep -c . || true)
-    if [ "$n" -eq 0 ]; then
-        echo "compose: stack '$STACK' not found on any host (run 'medusactl compose list')" >&2
-        exit 3
-    fi
-    if [ "$n" -gt 1 ]; then
-        echo "compose: stack '$STACK' is on multiple hosts; pass --host <name>:" >&2
-        printf '  %s\n' $matches >&2
-        exit 4
-    fi
-    host="$matches"
-fi
-exec ssh -t "$host" "$HOSTCMD"
+exec ssh -t "$HOST" "$HOSTCMD"
 REMOTE
 )
 
@@ -1781,6 +1814,29 @@ rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
     echo "==> nixos-rebuild $ACTION: $host ($target)"
+    if [[ "$target" == "local" ]]; then
+        # The controller seat switches itself: it cannot --target-host itself
+        # mid-switch (T-099). Emitted first in the plan, so the seat is
+        # proven before any fleet host is touched.
+        actual=$(tr -d '[:space:]' < /proc/sys/kernel/hostname)
+        if [[ "$actual" != "$host" ]]; then
+            echo "  ✗ $host: refusing local $ACTION — this machine reports hostname '$actual' but the flake attribute names '$host' (T-098)" >&2
+            echo "RESULT $host failed"
+            rc=1
+            continue
+        fi
+        elevate=()
+        [[ "$(id -u)" -eq 0 ]] || elevate=(sudo -n)
+        if ! "${elevate[@]}" nixos-rebuild "$ACTION" \
+            --flake "$MEDUSA_GENERATED_DIR/nixos#$host" < /dev/null; then
+            echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
+            echo "RESULT $host failed"
+            rc=1
+        else
+            echo "RESULT $host ok"
+        fi
+        continue
+    fi
     # The machine at the target must BE the host the flake attribute names;
     # 'nixos' is allowed as the nixos-anywhere installer default on a first
     # deploy (T-098). -n: same stdin rule as the nixos-rebuild call below.
@@ -2595,6 +2651,13 @@ EOF
     target=$(ssh_target)
     mapfile -t ssh_opts < <(ssh_base_opts)
 
+    # User lookup crosses the seam as the typed payload (T-099).
+    local user
+    user=$(remote_medusa_json list-hosts --json --managed-only \
+        | jq -r --arg n "$name" \
+            '[.hosts[] | select(.name == $n) | .user // "ansible"][0] // "ansible"') \
+        || user=ansible
+
     local remote
     remote=$(cat <<REMOTE
 set -euo pipefail
@@ -2604,10 +2667,7 @@ if [[ -z "\$host" ]]; then
     echo "  could not resolve ${name}; trying name as-is" >&2
     host="${name}"
 fi
-# Look up user from medusa list-hosts.
-line=\$(uv run medusa list-hosts --managed-only | grep -E "^[FL][[:space:]]+${name}[[:space:]]" | head -n1) || true
-user=\$(awk '{for(i=1;i<=NF;i++) if(\$i~/^user=/){sub(/^user=/,"",\$i); print \$i}}' <<< "\$line")
-[[ -z "\$user" ]] && user=ansible
+user=$(printf %q "$user")
 echo "  authorizing key on \${user}@${name} (\${host})"
 if ! command -v sshpass >/dev/null 2>&1; then
     sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass
@@ -2693,27 +2753,22 @@ EOF
     # Resolve mode + ip + user from LOCAL inventory (T-037 pattern):
     # a freshly-added limited host visible only on the workstation can
     # still be seeded before the operator pushes + deploys.
-    require_local_inventory_dir
-    local lookup
-    lookup=$( cd "$MEDUSACTL_INVENTORY_DIR" \
-        && MEDUSA_INVENTORY_DIR="$MEDUSACTL_INVENTORY_DIR/inventory" \
-           MEDUSA_SECRETS_DIR="$MEDUSACTL_INVENTORY_DIR/secrets" \
-           medusa list-hosts --managed-only 2>&1 ) \
+    local entry
+    entry=$(local_medusa_json list-hosts --json --managed-only \
+        | jq -c --arg n "$name" '[.hosts[] | select(.name == $n)][0]') \
         || fail "seed-target: could not list managed hosts locally"
-
-    local line mode ip user
-    line=$(grep -E "^[FL][[:space:]]+${name}[[:space:]]" <<< "$lookup" | head -n1) || true
-    if [[ -z "$line" ]]; then
+    if [[ -z "$entry" || "$entry" == "null" ]]; then
         fail "seed-target: $name is not in the managed host list. DNS-only hosts have no ansible_user — set one with 'medusactl add-target' first."
     fi
-    mode=$(awk '{print $1}' <<< "$line")
-    if [[ "$mode" == "F" ]]; then
+
+    local mode ip user
+    mode=$(jq -r '.mode' <<< "$entry")
+    if [[ "$mode" == "full" ]]; then
         fail "seed-target: $name is in 'full' managed mode; seed-target is for pre-existing (limited) hosts only."
     fi
-    ip=$(awk '{print $3}' <<< "$line")
-    user=$(awk '{for(i=1;i<=NF;i++) if($i~/^user=/){sub(/^user=/,"",$i); print $i}}' <<< "$line")
-    [[ -z "$user" ]] && user="ansible"
-    [[ -n "$ip" ]] || fail "seed-target: could not determine IP for $name"
+    ip=$(jq -r '.ip' <<< "$entry")
+    user=$(jq -r '.user // "ansible"' <<< "$entry")
+    [[ -n "$ip" && "$ip" != "null" ]] || fail "seed-target: could not determine IP for $name"
 
     # Validate username early — it's interpolated into the sudoers
     # filename and the fragment content. Refuse anything sudoers

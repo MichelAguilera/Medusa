@@ -254,6 +254,11 @@ class HostInventory(BaseModel):
     # host-side (T-080). Unset until harvested; a secret-referencing host
     # without one is surfaced as a warning.
     age_recipient: str | None = None
+    # Control-plane seat (T-099). At most one host may set this. The
+    # controller is compute-sterile -- it renders only its own control-plane
+    # module and may not host stacks, routes, exports, native services, the
+    # egress gateway, or coredns (enforced in normalize_nixos). nixos-only.
+    controller: bool = False
 
     @field_validator("name")
     @classmethod
@@ -397,6 +402,27 @@ class HostInventory(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def validate_controller(self) -> Self:
+        if not self.controller:
+            return self
+        if self.platform != "nixos":
+            raise ValueError(
+                f"host {self.name}: controller requires platform: nixos "
+                f"(the control plane is a managed NixOS host, T-099)"
+            )
+        if self.ansible_user is None:
+            raise ValueError(
+                f"host {self.name}: controller requires ansible_user -- the "
+                f"deploy user whose authorized_keys carry the workstation keys"
+            )
+        if self.state == "dormant":
+            raise ValueError(
+                f"host {self.name}: the controller cannot be dormant -- the "
+                f"seat runs the deploys"
+            )
+        return self
+
 
 class DnsInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -412,6 +438,18 @@ class DnsInventory(BaseModel):
     # nixos_admin_keys) so key rotation stays deliberate. Empty = no installer
     # image is emitted. Public keys only.
     nixos_installer_keys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_single_controller(self) -> Self:
+        controllers = [host.name for host in self.hosts if host.controller]
+        if len(controllers) > 1:
+            raise ValueError(
+                f"at most one host may set controller "
+                f"(got: {', '.join(sorted(controllers))}); replacement is "
+                f"succession -- the successor joins as an ordinary host and "
+                f"flips the flag at seat handover (T-099)"
+            )
+        return self
 
     @field_validator("nixos_installer_keys")
     @classmethod

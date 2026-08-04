@@ -72,6 +72,30 @@
     networkConfig.DNS = [{% for ns in host.network.nameservers %} "{{ ns }}"{% endfor %} ];
   };
 {% endif %}
+{% if host.controller %}
+
+  # ---- Control plane (T-099) ------------------------------------------------
+  # The declared seat toolchain; never a secrets recipient (T-080).
+  environment.systemPackages = with pkgs; [ git uv ];
+{% if host.controller.etc_hosts %}
+  # Bootstrap block: cutover addresses while DNS is not yet authoritative for
+  # a host; an entry disappears at promote-host.
+  networking.hosts = {
+{% for entry in host.controller.etc_hosts %}
+    "{{ entry.ip }}" = [ "{{ entry.hostname }}" "{{ entry.name }}" ];
+{% endfor %}
+  };
+{% endif %}
+{% if host.controller.ssh_aliases %}
+  programs.ssh.extraConfig = ''
+{% for alias in host.controller.ssh_aliases %}
+    Host {{ alias.name }}
+      HostName {{ alias.hostname }}
+      User {{ alias.user }}
+{% endfor %}
+  '';
+{% endif %}
+{% endif %}
 {% for fs in host.file_systems %}
 
   fileSystems."{{ fs.mountpoint }}" = {

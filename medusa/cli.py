@@ -1,4 +1,5 @@
 import difflib
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from medusa.diagnostics import (
     sops_recipient_diagnostics,
     storage_diagnostics,
 )
+from medusa.contract import CONTRACT_VERSION
 from medusa.generated import stale_files, write_generated
 from medusa.inventory.dns import parse_dns_inventory
 from medusa.inventory.dns_edit import (
@@ -103,6 +105,22 @@ WARNINGS_OPTION = typer.Option(
     "--warnings/--no-warnings",
     help="Show non-fatal validation warnings.",
 )
+JSON_OPTION = typer.Option(
+    False,
+    "--json",
+    help="Emit the versioned JSON contract payload instead of text (T-099).",
+)
+
+
+def _emit_json(payload: dict[str, Any]) -> None:
+    typer.echo(json.dumps({"contract": CONTRACT_VERSION, **payload}))
+
+
+def _json_diagnostics(collected: list) -> list[dict[str, str]]:
+    return [
+        {"severity": diagnostic.severity.value, "message": diagnostic.message}
+        for diagnostic in collected
+    ]
 
 DiagnosticHandler = Callable[[tuple[Diagnostic, ...]], None]
 
@@ -189,6 +207,7 @@ def _load_all(
         _load_nixos_secret_ciphertexts(dns_model, services_model, paths),
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
+        ansible_model=ansible_inventory_model,
     )
     sops_model = normalize_sops(
         dns_model,
@@ -395,18 +414,33 @@ def _format_diagnostic(diagnostic: Diagnostic) -> str:
     )
 
 
+@app.command("contract-version", rich_help_panel=_PIPELINE_PANEL)
+def contract_version() -> None:
+    """Print the JSON contract version medusactl probes once per run (T-099)."""
+    _emit_json({})
+
+
 @app.command(rich_help_panel=_PIPELINE_PANEL)
 def validate(
     root: Path | None = ROOT_OPTION,
     warnings: bool = WARNINGS_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """Validate inventory files."""
     paths = _paths(root)
+    collected: list = []
+    handler = collected.extend if json_output else _diagnostic_handler(warnings)
     try:
-        _load_all(paths, on_diagnostics=_diagnostic_handler(warnings))
+        _load_all(paths, on_diagnostics=handler)
     except (ValidationError, ValueError, NotImplementedError) as error:
+        if json_output:
+            _emit_json({"ok": False, "error": str(error)})
+            raise typer.Exit(code=1)
         _fail(str(error))
 
+    if json_output:
+        _emit_json({"ok": True, "diagnostics": _json_diagnostics(collected)})
+        return
     _succeed("Inventory is valid.")
 
 
@@ -414,16 +448,31 @@ def validate(
 def render(
     root: Path | None = ROOT_OPTION,
     warnings: bool = WARNINGS_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """Render generated artifacts."""
     paths = _paths(root)
+    collected: list = []
+    handler = collected.extend if json_output else _diagnostic_handler(warnings)
     try:
-        loaded = _load_all(paths, on_diagnostics=_diagnostic_handler(warnings))
+        loaded = _load_all(paths, on_diagnostics=handler)
         files = _render(loaded)
         write_generated(files, paths.generated_dir)
     except (ValidationError, ValueError, NotImplementedError) as error:
+        if json_output:
+            _emit_json({"ok": False, "error": str(error)})
+            raise typer.Exit(code=1)
         _fail(str(error))
 
+    if json_output:
+        _emit_json(
+            {
+                "ok": True,
+                "rendered": len(files),
+                "diagnostics": _json_diagnostics(collected),
+            }
+        )
+        return
     _succeed(f"Rendered {len(files)} file(s).")
 
 
@@ -431,16 +480,35 @@ def render(
 def check(
     root: Path | None = ROOT_OPTION,
     warnings: bool = WARNINGS_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """Fail if generated artifacts are stale."""
     paths = _paths(root)
+    collected: list = []
+    handler = collected.extend if json_output else _diagnostic_handler(warnings)
     try:
-        loaded = _load_all(paths, on_diagnostics=_diagnostic_handler(warnings))
+        loaded = _load_all(paths, on_diagnostics=handler)
         files = _render(loaded)
     except (ValidationError, ValueError, NotImplementedError) as error:
+        if json_output:
+            _emit_json({"ok": False, "error": str(error)})
+            raise typer.Exit(code=1)
         _fail(str(error))
 
     stale = stale_files(files, paths.generated_dir)
+    if json_output:
+        _emit_json(
+            {
+                "ok": not stale,
+                "stale": [
+                    str(path.relative_to(paths.root)) for path in stale
+                ],
+                "diagnostics": _json_diagnostics(collected),
+            }
+        )
+        if stale:
+            raise typer.Exit(code=1)
+        return
     if stale:
         formatted = "\n".join(f"- {path.relative_to(paths.root)}" for path in stale)
         _fail(f"Generated files are stale:\n{formatted}")
@@ -451,16 +519,20 @@ def check(
 @app.command("nixos-deploy-plan", rich_help_panel=_PIPELINE_PANEL)
 def nixos_deploy_plan(
     root: Path | None = ROOT_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """Emit the per-host NixOS deploy plan consumed by `medusactl deploy`.
 
     One tab-separated ``<host>\\t<user@endpoint>`` line per NixOS host that has a
     managed SSH endpoint; the flake attribute is the host name (so the apply is
     ``nixos-rebuild switch --flake <generated>/nixos#<host> --target-host
-    <user@endpoint>``). Hosts with no ansible_user are warned to stderr and
-    skipped. Prints nothing (exit 0) when the fleet has no NixOS hosts, so a
-    pure-Debian deploy is a no-op. This is deploy dispatch seam 2 of the Platform
-    Fork Boundary; medusactl composes the invocation from these lines. See T-075.
+    <user@endpoint>``). The controller host emits ``<host>\\tlocal`` FIRST --
+    the seat switches itself locally (it cannot --target-host itself, T-099)
+    and takes the slot controller-apply held, before the fleet reconcile.
+    Hosts with no ansible_user are warned to stderr and skipped. Prints
+    nothing (exit 0) when the fleet has no NixOS hosts, so a pure-Debian
+    deploy is a no-op. This is deploy dispatch seam 2 of the Platform Fork
+    Boundary; medusactl composes the invocation from these lines. See T-075.
     """
     paths = _paths(root)
     try:
@@ -468,26 +540,41 @@ def nixos_deploy_plan(
     except (ValidationError, ValueError, NotImplementedError) as error:
         _fail(str(error))
 
-    for host in loaded.nixos_model.hosts:
+    hosts = sorted(
+        loaded.nixos_model.hosts, key=lambda host: host.controller is None
+    )
+    plan: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    for host in hosts:
         if host.dormant:
-            typer.echo(
-                f"nixos host '{host.name}' skipped (dormant)",
-                err=True,
-            )
+            skipped.append({"name": host.name, "reason": "dormant"})
+            continue
+        if host.controller is not None:
+            plan.append({"name": host.name, "target": "local"})
             continue
         if host.deploy_target is None:
-            typer.echo(
-                f"nixos host '{host.name}' has no ansible_user; cannot reconcile "
-                f"(skipping)",
-                err=True,
-            )
+            skipped.append({"name": host.name, "reason": "no-deploy-user"})
             continue
-        typer.echo(f"{host.name}\t{host.deploy_target}")
+        plan.append({"name": host.name, "target": host.deploy_target})
+
+    if json_output:
+        _emit_json({"hosts": plan, "skipped": skipped})
+        return
+    for entry in skipped:
+        reason = (
+            "skipped (dormant)"
+            if entry["reason"] == "dormant"
+            else "has no ansible_user; cannot reconcile (skipping)"
+        )
+        typer.echo(f"nixos host '{entry['name']}' {reason}", err=True)
+    for entry in plan:
+        typer.echo(f"{entry['name']}\t{entry['target']}")
 
 
 @app.command("list-stacks", rich_help_panel=_PIPELINE_PANEL)
 def list_stacks_cmd(
     root: Path | None = ROOT_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """List rendered Compose stacks, one per line.
 
@@ -511,7 +598,7 @@ def list_stacks_cmd(
             (
                 compose_file.stack or compose_file.host,
                 compose_file.host,
-                ",".join(sorted(service.name for service in compose_file.services)),
+                sorted(service.name for service in compose_file.services),
                 hosts_by_name[compose_file.host].platform,
                 "dormant" if hosts_by_name[compose_file.host].is_dormant else "active",
             )
@@ -519,8 +606,24 @@ def list_stacks_cmd(
         ),
         key=lambda row: (row[0], row[1]),
     )
+    if json_output:
+        _emit_json(
+            {
+                "stacks": [
+                    {
+                        "stack": stack,
+                        "host": host,
+                        "services": services,
+                        "platform": platform,
+                        "state": state,
+                    }
+                    for stack, host, services, platform, state in rows
+                ]
+            }
+        )
+        return
     for stack, host, services, platform, state in rows:
-        typer.echo(f"{stack}\t{host}\t{services}\t{platform}\t{state}")
+        typer.echo(f"{stack}\t{host}\t{','.join(services)}\t{platform}\t{state}")
 
 
 # --- Host inventory ops -----------------------------------------------------
@@ -1068,12 +1171,14 @@ def list_hosts_cmd(
         help="Filter by managed mode: 'full' or 'limited'. Implies --managed-only.",
     ),
     root: Path | None = ROOT_OPTION,
+    json_output: bool = JSON_OPTION,
 ) -> None:
     """Print the host inventory in a compact table.
 
     Mode prefix: ``F`` = full managed, ``L`` = limited managed, ``-`` =
-    DNS-only (documented). The medusactl wrapper greps this column, so
-    the prefix layout is a public contract.
+    DNS-only (documented). The prefix layout survives for eyeballs, but
+    machine consumers use ``--json`` (T-099); grepping the table is the
+    legacy contract.
     """
     paths = _paths(root)
     if mode is not None and mode not in ("full", "limited"):
@@ -1090,6 +1195,27 @@ def list_hosts_cmd(
 
     if mode is not None:
         hosts = tuple(h for h in hosts if _host_mode_letter(h) == mode[0].upper())
+
+    if json_output:
+        letter_to_mode = {"F": "full", "L": "limited", "-": None}
+        _emit_json(
+            {
+                "hosts": [
+                    {
+                        "name": host.get("name"),
+                        "ip": str(host.get("ip")),
+                        "zones": list(host.get("zones") or []),
+                        "user": host.get("ansible_user"),
+                        "mode": letter_to_mode[_host_mode_letter(host)],
+                        "platform": host.get("platform") or "debian-docker",
+                        "state": host.get("state") or "active",
+                        "controller": bool(host.get("controller")),
+                    }
+                    for host in _sort_hosts_by_ip(hosts)
+                ]
+            }
+        )
+        return
 
     if not hosts:
         _succeed("(no hosts)")

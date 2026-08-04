@@ -31,11 +31,13 @@ from medusa.model.native import (
 )
 from medusa.model.network import NetworkHost, NetworkModel
 from medusa.model.nixos import (
+    NixosController,
     NixosHost,
     NixosModel,
     NixosMount,
     NixosNetwork,
     NixosNfsServer,
+    NixosSshAlias,
     NixosSecretEnvFile,
     NixosSecretFile,
     NixosEgressGateway,
@@ -144,6 +146,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             nixos_admin_keys=tuple(host.nixos_admin_keys),
             nixos_state_version=host.nixos_state_version,
             age_recipient=host.age_recipient,
+            controller=host.controller,
         )
         for host in inventory.hosts
     )
@@ -376,6 +379,7 @@ def normalize_nixos(
     secret_ciphertexts: dict[str, str] | None = None,
     homepage_model: HomepageModel | None = None,
     monitoring_model: MonitoringModel | None = None,
+    ansible_model: AnsibleInventoryModel | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
     Nix renderer formats. Crosscuts dns + storage + services + native services,
@@ -636,6 +640,54 @@ def normalize_nixos(
             service.host: service.shares for service in native_model.sftp
         }
 
+    # Control-plane seat (T-099). Compute-sterile by ADR rule: inventory's
+    # reach into the deploy seat is its own control-plane module and nothing
+    # else, so every workload duty is rejected loudly here. The module data
+    # reshapes the same managed/bootstrap derivation the aliases and
+    # /etc/hosts artifacts consume (no fact derived twice).
+    controller_by_host: dict[str, NixosController] = {}
+    for host in dns_model.hosts:
+        if not host.controller:
+            continue
+        duties: list[str] = []
+        if stacks_by_host.get(host.name):
+            stack_names = ", ".join(
+                sorted(stack.name for stack in stacks_by_host[host.name])
+            )
+            duties.append(f"compose stacks ({stack_names})")
+        if services_model.traefik_routes_by_host.get(host.name):
+            duties.append("proxy routes")
+        if any(server == host.name for server, _ in storage_model.exports_by_server):
+            duties.append("NFS exports")
+        if sftp_users_by_host.get(host.name):
+            duties.append("native sftp services")
+        if egress is not None and egress.gateway == host.name:
+            duties.append("the egress gateway role")
+        if host.name in nixos_coredns_hosts:
+            duties.append("the coredns role")
+        if duties:
+            raise ValueError(
+                f"host '{host.name}' is the controller and must stay "
+                f"compute-sterile, but carries {'; '.join(duties)} -- move "
+                f"these to another host (T-099)"
+            )
+        controller_by_host[host.name] = NixosController(
+            etc_hosts=(
+                ansible_model.bootstrap_hosts if ansible_model is not None else ()
+            ),
+            ssh_aliases=tuple(
+                NixosSshAlias(
+                    name=managed.name,
+                    hostname=managed.hostname,
+                    user=managed.ansible_user,
+                )
+                for managed in (
+                    ansible_model.managed_hosts if ansible_model is not None else ()
+                )
+                if managed.name != host.name
+            ),
+        )
+
     disko_sources = disko_sources or {}
     for host in dns_model.hosts_by_platform("nixos"):
         if host.nixos_disko and host.name not in disko_sources:
@@ -696,6 +748,7 @@ def normalize_nixos(
             ),
             deploy_target=_nixos_deploy_target(host),
             dormant=host.is_dormant,
+            controller=controller_by_host.get(host.name),
         )
         for host in dns_model.hosts_by_platform("nixos")
     )

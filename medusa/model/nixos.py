@@ -1,5 +1,6 @@
 from pydantic import BaseModel, ConfigDict
 
+from medusa.model.hosts import BootstrapHost
 from medusa.model.native import NativeSftpShare, NativeSftpUser
 from medusa.model.services import (
     ComposeDataDir,
@@ -7,6 +8,32 @@ from medusa.model.services import (
     GeneratedEnvFile,
 )
 from medusa.model.storage import NfsServerExport
+
+
+class NixosSshAlias(BaseModel):
+    """One fleet ssh alias in the controller's system-wide ssh_config
+    (``Host <name> / HostName <fqdn> / User <user>``). Reshaped from the
+    managed-host derivation the aliases artifact consumes; the controller's
+    own record is excluded (no self-alias). See T-099."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    hostname: str
+    user: str
+
+
+class NixosController(BaseModel):
+    """Control-plane config for the controller host (T-099). Declares what
+    ``controller_bootstrap`` applied imperatively: the /etc/hosts bootstrap
+    entries (``networking.hosts``) and the fleet ssh aliases
+    (``programs.ssh.extraConfig``). Holds no key material; the controller is
+    never a secrets recipient (T-080)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    etc_hosts: tuple[BootstrapHost, ...] = ()
+    ssh_aliases: tuple[NixosSshAlias, ...] = ()
 
 
 class NixosNetwork(BaseModel):
@@ -291,6 +318,10 @@ class NixosHost(BaseModel):
     # config stays a complete picture of intent) but the deploy plan skips it
     # with a notice instead of failing on an unreachable machine.
     dormant: bool = False
+    # Control-plane seat (T-099): set when this host is the controller. Drives
+    # the control-plane block in the host module and the deploy plan's local
+    # switch (the seat cannot --target-host itself). None everywhere else.
+    controller: NixosController | None = None
 
 
 class NixosModel(BaseModel):
