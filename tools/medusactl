@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.31.2"
+VERSION="0.31.3"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -1261,25 +1261,44 @@ EOF
         esac
     done
     require_clean_for_deploy
+    # A nixos seat leads the plan with its local switch — controller-apply's
+    # old slot (T-099); the ansible leg only runs for a Debian controller.
+    local seat_leads=0
+    if remote_medusa_json nixos-deploy-plan --json 2>/dev/null \
+            | jq -e 'any(.hosts[]; .target == "local")' >/dev/null 2>&1; then
+        seat_leads=1
+    fi
     # controller-apply stays UNRESTRICTED under --limit: limiting it would
     # no-op the /etc/hosts + ssh-config refresh a targeted host needs to
     # stay resolvable.
     [[ -z "$limit" ]] || info "limiting the NixOS reconcile to: $limit (controller-apply always runs)"
     if [[ "$check" -eq 1 ]]; then
-        run_logged deploy-check \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff" \
-            || fail "deploy --check failed"
+        if [[ "$seat_leads" -eq 1 ]]; then
+            run_logged deploy-check \
+                "$(inventory_pull_cmd)uv run medusa render" \
+                || fail "deploy --check failed"
+        else
+            run_logged deploy-check \
+                "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml --check --diff" \
+                || fail "deploy --check failed"
+        fi
         # T-075: refresh=0 — the render above already refreshed the flake.
         _nixos_apply_run dry-activate 0 "$limit"
     else
-        require_controller_apply_prereqs deploy \
-            || fail "deploy prerequisites failed"
-        # controller-apply BEFORE the reconcile: it rewrites the controller's
-        # /etc/hosts + ~/.ssh/config aliases that nixos-rebuild's
-        # hostname-based SSH depends on.
-        run_logged deploy \
-            "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml" \
-            || fail "deploy failed"
+        if [[ "$seat_leads" -eq 1 ]]; then
+            run_logged deploy \
+                "$(inventory_pull_cmd)uv run medusa render" \
+                || fail "deploy failed"
+        else
+            require_controller_apply_prereqs deploy \
+                || fail "deploy prerequisites failed"
+            # controller-apply BEFORE the reconcile: it rewrites the controller's
+            # /etc/hosts + ~/.ssh/config aliases that nixos-rebuild's
+            # hostname-based SSH depends on.
+            run_logged deploy \
+                "$(inventory_pull_cmd)uv run medusa render && cd ansible && uv run ansible-playbook playbooks/controller-apply.yml" \
+                || fail "deploy failed"
+        fi
         # T-075: refresh=0 — the deploy step just rendered.
         _nixos_apply_run switch 0 "$limit"
     fi
