@@ -72,11 +72,20 @@
     networkConfig.DNS = [{% for ns in host.network.nameservers %} "{{ ns }}"{% endfor %} ];
   };
 {% endif %}
+
+  # ---- Base host tooling (T-109) --------------------------------------------
+  # ssh clients announce terminfo the stock db lacks (xterm-ghostty).
+  environment.enableAllTerminfo = true;
+{% if host.controller %}
+  # neovim fleet-wide; git/uv/python312 are the seat toolchain (T-099) --
+  # never a secrets recipient (T-080).
+  environment.systemPackages = with pkgs; [ neovim git uv python312 ];
+{% else %}
+  environment.systemPackages = with pkgs; [ neovim ];
+{% endif %}
 {% if host.controller %}
 
   # ---- Control plane (T-099) ------------------------------------------------
-  # The declared seat toolchain; never a secrets recipient (T-080).
-  environment.systemPackages = with pkgs; [ git uv python312 ];
   # uv's downloaded CPython is stub-ld broken on NixOS; force the nix one
   environment.variables.UV_PYTHON_PREFERENCE = "only-system";
 {% if host.controller.etc_hosts %}
