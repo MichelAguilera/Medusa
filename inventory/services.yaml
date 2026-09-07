@@ -27,6 +27,24 @@ services:
   #   credentials:
   #     CF_DNS_API_TOKEN:
   #       secret: infra/cloudflare_dns_token
+
+# Single sign-on: one service carries `auth: authelia` (a fleet role like
+# `proxy:`), inventory/auth.yaml names the fleet policy and secrets, routes
+# opt in with `auth: true`, and OIDC apps add an `oidc:` block. See
+# "Auth Role" in docs/inventory-schema.md.
+# - id: host02-infra-02-authelia
+#   name: authelia
+#   host: host02
+#   stack: infrastructure
+#   auth: authelia
+#   image: authelia/authelia:4.38
+#   compose:
+#     networks: [proxy]
+#     volumes:
+#     - ./authelia/config:/config
+#   route:
+#     host: auth.host02.internal.example.com
+#     port: 9091
   stack: infra
   proxy: traefik
   image: traefik:v3.6.1

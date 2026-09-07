@@ -1,3 +1,4 @@
+import re
 from ipaddress import ip_network
 from pathlib import PurePosixPath
 from typing import Any, Literal, Self
@@ -22,6 +23,7 @@ class RouteInventory(BaseModel):
     tls: bool | None = None
     middlewares: list[str] | None = None
     acme: bool | None = None
+    auth: bool | Literal["one_factor", "two_factor"] | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -55,6 +57,67 @@ class RouteInventory(BaseModel):
 
 
 ACME_STAGING_CA = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+OIDC_DEFAULT_SCOPES = ["openid", "profile", "email", "groups"]
+
+
+class OidcClientInventory(BaseModel):
+    """An OIDC relying party registered with the fleet auth provider. The
+    redirect URI is derived from the service's https route plus
+    ``redirect_path``; ``secret`` is shared with the app through the
+    operator's own settings binding."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    secret: str
+    redirect_path: str
+    client_id: str | None = None
+    name: str | None = None
+    scopes: list[str] = Field(default_factory=lambda: list(OIDC_DEFAULT_SCOPES))
+    policy: Literal["one_factor", "two_factor"] | None = None
+
+    @field_validator("secret")
+    @classmethod
+    def normalize_secret(cls, value: str) -> str:
+        normalized = value.strip().removesuffix(".sops.yaml")
+        if not normalized:
+            raise ValueError("oidc secret cannot be empty")
+        return normalized
+
+    @field_validator("redirect_path")
+    @classmethod
+    def normalize_redirect_path(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized.startswith("/"):
+            raise ValueError("oidc redirect_path must start with /")
+        return normalized
+
+    @field_validator("client_id", "name")
+    @classmethod
+    def normalize_optional(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("oidc client_id and name cannot be empty when set")
+        return normalized
+
+    @field_validator("client_id")
+    @classmethod
+    def validate_client_id_charset(cls, value: str | None) -> str | None:
+        if value is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+            raise ValueError("oidc client_id may only contain letters, digits, - and _")
+        return value
+
+    @field_validator("scopes")
+    @classmethod
+    def normalize_scopes(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if not normalized or any(not item for item in normalized):
+            raise ValueError("oidc scopes cannot be empty")
+        if "openid" not in normalized:
+            raise ValueError("oidc scopes must include openid")
+        return normalized
 
 
 class AcmeInventory(BaseModel):
@@ -377,6 +440,7 @@ class ServiceInventory(BaseModel):
     host: str
     stack: str | None = None
     proxy: Literal["traefik", "caddy", "nginx"] | None = None
+    auth: Literal["authelia", "authentik", "keycloak"] | None = None
     # Internet-egress policy. "direct" (default): traffic leaves via the host's
     # normal gateway. "tunnel": public egress is routed through a shared
     # WireGuard egress gateway while LAN traffic and inbound reachability stay
@@ -390,6 +454,7 @@ class ServiceInventory(BaseModel):
     route: RouteInventory | None = None
     routes: list[RouteInventory] = Field(default_factory=list)
     acme: AcmeInventory | None = None
+    oidc: OidcClientInventory | None = None
     settings: dict[str, ServiceSettingInventory] = Field(default_factory=dict)
     mounts: list[ServiceMountInventory] = Field(default_factory=list)
     homepage: HomepageEntryInventory | None = None

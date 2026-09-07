@@ -2,6 +2,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from medusa.model.auth import AuthModel
+
 
 class ServiceRecord(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -26,6 +28,7 @@ class TraefikRoute(BaseModel):
     cert_main: str | None = None
     cert_sans: tuple[str, ...] = ()
     redirect_host: str | None = None
+    auth_policy: str | None = None
 
 
 class ComposeService(BaseModel):
@@ -164,3 +167,4 @@ class ServicesModel(BaseModel):
     tunnel_services_by_host: dict[str, tuple[str, ...]]
     # Resolved egress gateway config; None when nothing is tunneled. T-066.
     egress: EgressGateway | None
+    auth: AuthModel | None = None

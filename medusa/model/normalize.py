@@ -1,6 +1,7 @@
 import hashlib
 import re
 
+from medusa.inventory.auth import AuthInventory
 from medusa.inventory.dns import (
     DnsInventory,
     HostInventory,
@@ -10,8 +11,13 @@ from medusa.inventory.dns import (
 from medusa.inventory.homepage import HomepageInventory
 from medusa.inventory.native import NativeServicesInventory
 from medusa.inventory.secrets import SecretsInventory
-from medusa.inventory.services import ServicesInventory, resolve_egress
+from medusa.inventory.services import (
+    ServiceSettingInventory,
+    ServicesInventory,
+    resolve_egress,
+)
 from medusa.inventory.storage import StorageInventory
+from medusa.model.auth import AuthModel, AuthRule, OidcClient
 from medusa.model.compose import (
     normalize_compose_data_dirs,
     normalize_compose_files,
@@ -547,6 +553,15 @@ def normalize_nixos(
                 NixosStagedConfig(
                     source=f"traefik/{host_name}/dynamic.yaml",
                     dest="traefik/dynamic/medusa-dynamic.yaml",
+                )
+            )
+        auth = services_model.auth
+        if auth is not None and auth.host == host_name:
+            stack_name = _stack_with_service(host_name, auth.service)
+            stack_configs.setdefault((host_name, stack_name), []).append(
+                NixosStagedConfig(
+                    source=f"auth/{host_name}/configuration.yml",
+                    dest=f"{auth.engine}/config/configuration.yml",
                 )
             )
         if host_name in homepage_hosts:
@@ -1230,8 +1245,10 @@ def normalize_services(
     inventory: ServicesInventory,
     dns_model: DnsModel,
     storage_model: StorageModel | None = None,
+    auth_inventory: AuthInventory | None = None,
 ) -> ServicesModel:
     services = [_apply_acme(service) for service in _effective_services(inventory)]
+    services = _apply_auth_settings(services, auth_inventory)
     known_hosts = {host.name for host in dns_model.hosts}
 
     unknown_hosts = sorted(
@@ -1302,6 +1319,7 @@ def normalize_services(
     )
     _validate_route_uniqueness(traefik_routes)
     _validate_acme_coverage(services, traefik_routes)
+    auth = _normalize_auth(services, traefik_routes, dns_model, auth_inventory)
 
     compose_services = normalize_compose_services(
         inventory, services, mount_index, egress
@@ -1345,6 +1363,7 @@ def normalize_services(
         proxies=proxies,
         tunnel_services_by_host=tunnel_services_by_host,
         egress=egress,
+        auth=auth,
     )
 
 
@@ -1589,6 +1608,11 @@ def _normalize_traefik_routes(service, dns_model: DnsModel) -> list[TraefikRoute
         target_url = f"http://{service.name}:{route.port}"
         middlewares = tuple(route.middlewares or [])
         canonical, acme = canonical_route_host(route.host, zones)
+        if route.auth and (not acme or route.acme is False):
+            raise ValueError(
+                f"service {service.id}: route {route.host} sets auth but is not "
+                f"served over https from a tls: acme zone"
+            )
         if not acme or route.acme is False:
             routes.append(
                 TraefikRoute(
@@ -1622,6 +1646,7 @@ def _normalize_traefik_routes(service, dns_model: DnsModel) -> list[TraefikRoute
                 cert_resolver=ACME_RESOLVER,
                 cert_main=f"*.{parent}",
                 cert_sans=(parent,),
+                auth_policy=_route_auth_policy(route),
             )
         )
         routes.append(
@@ -1664,6 +1689,164 @@ def _normalize_traefik_routes(service, dns_model: DnsModel) -> list[TraefikRoute
                 )
             )
     return routes
+
+
+AUTH_SECRET_SETTINGS = {
+    "users": "AUTH_USERS",
+    "session": "AUTH_SESSION",
+    "storage": "AUTH_STORAGE",
+    "jwt": "AUTH_JWT",
+    "oidc_hmac": "AUTH_OIDC_HMAC",
+    "oidc_key": "AUTH_OIDC_KEY",
+}
+AUTH_ENGINE_ENVIRONMENT = {"authelia": {"X_AUTHELIA_CONFIG_FILTERS": "template"}}
+FORWARD_AUTH_PATH = "/api/authz/forward-auth"
+
+
+def _route_auth_policy(route) -> str | None:
+    if route.auth is None or route.auth is False:
+        return None
+    return "default" if route.auth is True else route.auth
+
+
+def _secret_container_path(setting_name: str) -> str:
+    return f"/run/secrets/{setting_name.lower().replace('_', '-')}"
+
+
+def _oidc_setting_name(client_id: str) -> str:
+    return "OIDC_CLIENT_" + client_id.upper().replace("-", "_")
+
+
+def _oidc_client_id(service) -> str:
+    return service.oidc.client_id or service.name
+
+
+def _apply_auth_settings(services, auth_inventory: AuthInventory | None):
+    """Fold the fleet auth secrets and every OIDC client secret onto the
+    auth-role service as file-delivered settings, and set the engine's
+    config-templating switch, so the rendered config reads secrets on the
+    host."""
+    providers = [service for service in services if service.auth is not None]
+    if len(providers) > 1:
+        formatted = ", ".join(sorted(service.id for service in providers))
+        raise ValueError(f"more than one service declares an auth role: {formatted}")
+    if not providers:
+        return services
+    provider = providers[0]
+    if auth_inventory is None:
+        raise ValueError(
+            f"service {provider.id} declares auth: {provider.auth} but "
+            f"inventory/auth.yaml is missing"
+        )
+    settings = dict(provider.settings)
+    for name, value in AUTH_ENGINE_ENVIRONMENT.get(provider.auth, {}).items():
+        settings[name] = ServiceSettingInventory(value=value)
+    for key, setting_name in AUTH_SECRET_SETTINGS.items():
+        settings[setting_name] = ServiceSettingInventory(
+            secret=getattr(auth_inventory.secrets, key), delivery="file"
+        )
+    for service in services:
+        if service.oidc is None:
+            continue
+        settings[_oidc_setting_name(_oidc_client_id(service))] = (
+            ServiceSettingInventory(secret=service.oidc.secret, delivery="file")
+        )
+    updated = provider.model_copy(update={"settings": settings})
+    return [updated if service is provider else service for service in services]
+
+
+def _normalize_auth(
+    services,
+    traefik_routes: tuple[TraefikRoute, ...],
+    dns_model: DnsModel,
+    auth_inventory: AuthInventory | None,
+) -> AuthModel | None:
+    providers = [service for service in services if service.auth is not None]
+    protected = [route for route in traefik_routes if route.auth_policy is not None]
+    clients = [service for service in services if service.oidc is not None]
+    if not providers:
+        if protected or clients:
+            wanting = sorted(
+                {route.name for route in protected} | {s.id for s in clients}
+            )
+            raise ValueError(
+                f"routes or services want auth but no service declares an auth "
+                f"role: {', '.join(wanting)}"
+            )
+        return None
+    provider = providers[0]
+    assert auth_inventory is not None
+    zones = {zone.name: zone for zone in dns_model.zones}
+    own_routes = _service_routes(provider)
+    if not own_routes:
+        raise ValueError(f"auth service {provider.id} must declare a route")
+    portal, acme = canonical_route_host(own_routes[0].host, zones)
+    if not acme or own_routes[0].acme is False:
+        raise ValueError(
+            f"auth service {provider.id}: its route {own_routes[0].host} must be "
+            f"served over https from a tls: acme zone"
+        )
+    cookie_domain = _zone_of(portal, zones).name
+    url = f"https://{portal}"
+    rules = [AuthRule(domain=portal, policy="bypass")]
+    for route in protected:
+        domain = route.rule.removeprefix("Host(`").removesuffix("`)")
+        if _zone_of(domain, zones).name != cookie_domain:
+            raise ValueError(
+                f"route {route.name} ({domain}) is outside the auth cookie "
+                f"domain {cookie_domain}"
+            )
+        policy = (
+            auth_inventory.default_policy
+            if route.auth_policy == "default"
+            else route.auth_policy
+        )
+        rules.append(AuthRule(domain=domain, policy=policy))
+    oidc_clients = []
+    for service in sorted(clients, key=lambda item: item.id):
+        routes = _service_routes(service)
+        if not routes:
+            raise ValueError(f"service {service.id} declares oidc but has no route")
+        host, acme = canonical_route_host(routes[0].host, zones)
+        if not acme or routes[0].acme is False:
+            raise ValueError(
+                f"service {service.id}: oidc requires its route to be served over "
+                f"https from a tls: acme zone"
+            )
+        client_id = _oidc_client_id(service)
+        oidc_clients.append(
+            OidcClient(
+                client_id=client_id,
+                name=service.oidc.name or service.name,
+                secret_file=_secret_container_path(_oidc_setting_name(client_id)),
+                redirect_uris=(f"https://{host}{service.oidc.redirect_path}",),
+                scopes=tuple(service.oidc.scopes),
+                policy=service.oidc.policy or auth_inventory.default_policy,
+            )
+        )
+    client_ids = [client.client_id for client in oidc_clients]
+    if len(set(client_ids)) != len(client_ids):
+        raise ValueError("oidc client_id values must be unique across the fleet")
+    return AuthModel(
+        engine=provider.auth,
+        host=provider.host,
+        stack=provider.stack,
+        service=provider.name,
+        url=url,
+        forward_auth_url=f"{url}{FORWARD_AUTH_PATH}",
+        cookie_domain=cookie_domain,
+        display_name=auth_inventory.display_name,
+        default_policy=auth_inventory.default_policy,
+        session_inactivity=auth_inventory.session.inactivity,
+        session_expiration=auth_inventory.session.expiration,
+        session_remember_me=auth_inventory.session.remember_me,
+        secret_files={
+            key: _secret_container_path(name)
+            for key, name in AUTH_SECRET_SETTINGS.items()
+        },
+        rules=tuple(rules),
+        clients=tuple(oidc_clients),
+    )
 
 
 def _validate_route_uniqueness(routes: tuple[TraefikRoute, ...]) -> None:

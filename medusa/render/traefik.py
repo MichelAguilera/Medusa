@@ -13,7 +13,12 @@ def render_traefik(
         generated_dir / "traefik" / host / "dynamic.yaml": render_template(
             templates_dir,
             "traefik/dynamic.yaml.j2",
-            {"traefik": {"routes": model.traefik_routes_by_host.get(host, ())}},
+            {
+                "traefik": {
+                    "routes": model.traefik_routes_by_host.get(host, ()),
+                    "auth": model.auth,
+                }
+            },
         )
         for host, engine in model.proxies.items()
         if engine == "traefik"

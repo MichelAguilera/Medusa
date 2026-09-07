@@ -20,6 +20,7 @@ from medusa.diagnostics import (
 )
 from medusa.contract import CONTRACT_VERSION
 from medusa.generated import stale_files, write_generated
+from medusa.inventory.auth import AuthInventory, parse_auth_inventory
 from medusa.inventory.dns import parse_dns_inventory
 from medusa.inventory.dns_edit import (
     HostFields,
@@ -79,6 +80,7 @@ from medusa.model.services import ServicesModel
 from medusa.model.sops import SopsConfigModel
 from medusa.model.storage import StorageModel
 from medusa.paths import ProjectPaths
+from medusa.render.auth import render_auth
 from medusa.render.caddy import render_caddy
 from medusa.render.compose import render_compose
 from medusa.render.egress import render_egress
@@ -168,7 +170,8 @@ def _load_all(
     storage_model = normalize_storage(storage_inventory, dns_model)
 
     services_inventory = parse_services_inventory(load_yaml(paths.services_inventory))
-    _validate_secret_sources(services_inventory, paths)
+    auth_inventory = parse_auth_inventory(load_optional_yaml(paths.auth_inventory))
+    _validate_secret_sources(services_inventory, paths, auth_inventory)
 
     diagnostics = service_diagnostics(services_inventory) + storage_diagnostics(
         storage_inventory
@@ -176,7 +179,9 @@ def _load_all(
     on_diagnostics(diagnostics)
     _fail_on_diagnostic_errors(diagnostics)
 
-    services_model = normalize_services(services_inventory, dns_model, storage_model)
+    services_model = normalize_services(
+        services_inventory, dns_model, storage_model, auth_inventory
+    )
     homepage_model = normalize_homepage(
         services_inventory,
         parse_homepage_inventory(load_optional_yaml(paths.homepage_inventory)),
@@ -277,11 +282,17 @@ def _load_nixos_secret_ciphertexts(
 
 
 def _validate_secret_sources(
-    inventory: ServicesInventory, paths: ProjectPaths
+    inventory: ServicesInventory,
+    paths: ProjectPaths,
+    auth_inventory: AuthInventory | None = None,
 ) -> None:
-    missing = sorted(
-        source for source in _secret_sources(inventory, paths) if not source.exists()
-    )
+    sources = _secret_sources(inventory, paths)
+    if auth_inventory is not None:
+        sources |= {
+            paths.secrets_dir / f"{ref}.sops.yaml"
+            for ref in auth_inventory.secrets.model_dump().values()
+        }
+    missing = sorted(source for source in sources if not source.exists())
     if missing:
         formatted = ", ".join(
             str(path.relative_to(paths.secrets_dir.parent)) for path in missing
@@ -296,6 +307,7 @@ def _secret_sources(inventory: ServicesInventory, paths: ProjectPaths) -> set[Pa
         for setting in [
             *service.settings.values(),
             *(service.acme.credentials.values() if service.acme else []),
+            *([service.oidc] if service.oidc else []),
         ]
         if setting.secret is not None
     }
@@ -311,6 +323,7 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_coredns(loaded.coredns_model, templates_dir, generated_dir),
         **render_homepage(loaded.homepage_model, templates_dir, generated_dir),
         **render_traefik(services_model, templates_dir, generated_dir),
+        **render_auth(services_model, templates_dir, generated_dir),
         **render_caddy(services_model, templates_dir, generated_dir),
         **render_nginx(services_model, templates_dir, generated_dir),
         **render_compose(services_model, templates_dir, generated_dir),

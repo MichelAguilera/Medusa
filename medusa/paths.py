@@ -47,5 +47,9 @@ class ProjectPaths:
         return self.inventory_dir / "native.yaml"
 
     @property
+    def auth_inventory(self) -> Path:
+        return self.inventory_dir / "auth.yaml"
+
+    @property
     def secrets_inventory(self) -> Path:
         return self.inventory_dir / "secrets.yaml"

@@ -23,9 +23,10 @@ http:
 {% elif route.tls %}
       tls: {}
 {% endif %}
-{% if route.middlewares %}
+{% set middlewares = (["medusa-auth"] if route.auth_policy else []) + (route.middlewares | list) %}
+{% if middlewares %}
       middlewares:
-{% for middleware in route.middlewares %}
+{% for middleware in middlewares %}
         - {{ middleware | tojson }}
 {% endfor %}
 {% endif %}
@@ -34,8 +35,19 @@ http:
     {}
 {% endif %}
 {% set redirects = traefik.routes | selectattr("redirect_host") | list %}
-{% if redirects %}
+{% if redirects or traefik.auth %}
   middlewares:
+{% if traefik.auth %}
+    medusa-auth:
+      forwardAuth:
+        address: {{ traefik.auth.forward_auth_url | tojson }}
+        trustForwardHeader: true
+        authResponseHeaders:
+          - "Remote-User"
+          - "Remote-Groups"
+          - "Remote-Email"
+          - "Remote-Name"
+{% endif %}
 {% for route in redirects %}
     {{ route.middlewares[0] }}:
       redirectRegex:
