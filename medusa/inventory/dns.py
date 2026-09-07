@@ -14,6 +14,8 @@ class ZoneInventory(BaseModel):
     # validation.
     forwarder_mode: Literal["udp", "dot"] = "udp"
     forwarder_tls_servername: str | None = None
+    # plain UDP so pool lookups survive a bad clock (T-110)
+    plaintext_domains: list[str] = Field(default_factory=list)
 
     @field_validator("name")
     @classmethod
@@ -45,6 +47,23 @@ class ZoneInventory(BaseModel):
             )
         return normalized
 
+    @field_validator("plaintext_domains")
+    @classmethod
+    def normalize_plaintext_domains(cls, value: list[str]) -> list[str]:
+        normalized = []
+        for item in value:
+            domain = item.strip().lower().removesuffix(".")
+            if not domain:
+                raise ValueError("plaintext_domains cannot contain empty values")
+            if " " in domain:
+                raise ValueError(
+                    f"plaintext_domains entry {item!r} must be a single domain"
+                )
+            normalized.append(domain)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("plaintext_domains cannot contain duplicates")
+        return normalized
+
     @model_validator(mode="after")
     def validate_forwarder_combo(self) -> Self:
         if self.forwarder_mode == "dot" and self.forwarder_tls_servername is None:
@@ -56,6 +75,11 @@ class ZoneInventory(BaseModel):
             raise ValueError(
                 f"zone {self.name}: forwarder_tls_servername is only valid "
                 f"with forwarder_mode 'dot'"
+            )
+        if self.plaintext_domains and self.forwarder_mode != "dot":
+            raise ValueError(
+                f"zone {self.name}: plaintext_domains is only valid with "
+                f"forwarder_mode 'dot'"
             )
         return self
 

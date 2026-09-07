@@ -98,6 +98,7 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             upstreams=tuple(zone.upstreams),
             forwarder_mode=zone.forwarder_mode,
             forwarder_tls_servername=zone.forwarder_tls_servername,
+            plaintext_domains=tuple(zone.plaintext_domains),
         )
         for zone in inventory.zones
     )
@@ -1678,6 +1679,16 @@ def normalize_coredns(
         forwarder_mode, forwarder_tls_servername = forwarder_configs.pop()
     else:
         forwarder_mode, forwarder_tls_servername = "udp", None
+    plaintext_domains = tuple(
+        sorted(
+            {
+                domain
+                for zone in dns_model.zones
+                if zone.upstreams
+                for domain in zone.plaintext_domains
+            }
+        )
+    )
 
     host_zones = {host.name: host.zones for host in dns_model.hosts}
     # A host gets a wildcard rewrite block if it runs a Medusa-managed proxy
@@ -1697,6 +1708,7 @@ def normalize_coredns(
         rewrite_zones=rewrite_zones,
         forwarder_mode=forwarder_mode,
         forwarder_tls_servername=forwarder_tls_servername,
+        plaintext_domains=plaintext_domains,
     )
 
 

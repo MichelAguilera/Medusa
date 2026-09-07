@@ -22,3 +22,4 @@ class CorednsModel(BaseModel):
     rewrite_zones: tuple[str, ...]
     forwarder_mode: Literal["udp", "dot"] = "udp"
     forwarder_tls_servername: str | None = None
+    plaintext_domains: tuple[str, ...] = ()

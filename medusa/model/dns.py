@@ -10,6 +10,7 @@ class DnsZone(BaseModel):
     upstreams: tuple[str, ...]
     forwarder_mode: Literal["udp", "dot"] = "udp"
     forwarder_tls_servername: str | None = None
+    plaintext_domains: tuple[str, ...] = ()
 
 
 class HostNetwork(BaseModel):
