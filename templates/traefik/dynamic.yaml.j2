@@ -11,7 +11,16 @@ http:
         - {{ entrypoint | tojson }}
 {% endfor %}
       service: {{ route.name | tojson }}
-{% if route.tls %}
+{% if route.tls and route.cert_resolver %}
+      tls:
+        certResolver: {{ route.cert_resolver | tojson }}
+        domains:
+          - main: {{ route.cert_main | tojson }}
+            sans:
+{% for san in route.cert_sans %}
+              - {{ san | tojson }}
+{% endfor %}
+{% elif route.tls %}
       tls: {}
 {% endif %}
 {% if route.middlewares %}
@@ -23,6 +32,17 @@ http:
 {% endfor %}
 {% else %}
     {}
+{% endif %}
+{% set redirects = traefik.routes | selectattr("redirect_host") | list %}
+{% if redirects %}
+  middlewares:
+{% for route in redirects %}
+    {{ route.middlewares[0] }}:
+      redirectRegex:
+        regex: "^https?://[^/]+/(.*)"
+        replacement: {{ ("https://" ~ route.redirect_host ~ "/${1}") | tojson }}
+        permanent: true
+{% endfor %}
 {% endif %}
   services:
 {% if traefik.routes %}

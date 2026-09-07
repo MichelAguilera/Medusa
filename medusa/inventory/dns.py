@@ -16,6 +16,8 @@ class ZoneInventory(BaseModel):
     forwarder_tls_servername: str | None = None
     # plain UDP so pool lookups survive a bad clock (T-110)
     plaintext_domains: list[str] = Field(default_factory=list)
+    tls: Literal["acme"] | None = None
+    redirect_to: str | None = None
 
     @field_validator("name")
     @classmethod
@@ -45,6 +47,16 @@ class ZoneInventory(BaseModel):
             raise ValueError(
                 "forwarder_tls_servername must be a single hostname, not a list"
             )
+        return normalized
+
+    @field_validator("redirect_to")
+    @classmethod
+    def normalize_redirect_to(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower().removesuffix(".")
+        if not normalized:
+            raise ValueError("redirect_to cannot be empty when set")
         return normalized
 
     @field_validator("plaintext_domains")
@@ -81,6 +93,12 @@ class ZoneInventory(BaseModel):
                 f"zone {self.name}: plaintext_domains is only valid with "
                 f"forwarder_mode 'dot'"
             )
+        if self.tls is not None and self.redirect_to is not None:
+            raise ValueError(
+                f"zone {self.name}: a tls zone cannot also redirect_to another"
+            )
+        if self.redirect_to == self.name:
+            raise ValueError(f"zone {self.name}: redirect_to cannot name itself")
         return self
 
 
@@ -443,6 +461,25 @@ class DnsInventory(BaseModel):
     # nixos_admin_keys) so key rotation stays deliberate. Empty = no installer
     # image is emitted. Public keys only.
     nixos_installer_keys: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_zone_redirects(self) -> Self:
+        zones = {zone.name: zone for zone in self.zones}
+        for zone in self.zones:
+            if zone.redirect_to is None:
+                continue
+            target = zones.get(zone.redirect_to)
+            if target is None:
+                raise ValueError(
+                    f"zone {zone.name}: redirect_to names unknown zone "
+                    f"{zone.redirect_to}"
+                )
+            if target.tls != "acme":
+                raise ValueError(
+                    f"zone {zone.name}: redirect_to target {target.name} must "
+                    f"declare tls: acme"
+                )
+        return self
 
     @model_validator(mode="after")
     def validate_single_controller(self) -> Self:

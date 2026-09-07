@@ -22,6 +22,10 @@ class TraefikRoute(BaseModel):
     tls: bool
     middlewares: tuple[str, ...]
     target_url: str
+    cert_resolver: str | None = None
+    cert_main: str | None = None
+    cert_sans: tuple[str, ...] = ()
+    redirect_host: str | None = None
 
 
 class ComposeService(BaseModel):

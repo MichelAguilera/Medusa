@@ -21,6 +21,7 @@ class RouteInventory(BaseModel):
     entrypoints: list[str] | None = None
     tls: bool | None = None
     middlewares: list[str] | None = None
+    acme: bool | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -51,6 +52,69 @@ class RouteInventory(BaseModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("route lists cannot contain duplicates")
         return normalized
+
+
+ACME_STAGING_CA = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+
+class AcmeInventory(BaseModel):
+    """DNS-01 certificate resolver on a traefik proxy service. Provider and
+    credential names pass through to Traefik's ACME driver verbatim."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    dns_provider: str
+    ca: str = "production"
+    resolvers: list[str] = Field(
+        default_factory=lambda: ["1.1.1.1:53", "9.9.9.9:53"]
+    )
+    credentials: dict[str, "ServiceSettingInventory"] = Field(default_factory=dict)
+
+    @field_validator("email", "dns_provider")
+    @classmethod
+    def normalize_required(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("acme email and dns_provider cannot be empty")
+        return normalized
+
+    @field_validator("ca")
+    @classmethod
+    def normalize_ca(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized in {"production", "staging"}:
+            return normalized
+        if not normalized.startswith("https://"):
+            raise ValueError(
+                "acme ca must be 'production', 'staging', or an https:// URL"
+            )
+        return normalized
+
+    @field_validator("resolvers")
+    @classmethod
+    def normalize_resolvers(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if not normalized or any(not item for item in normalized):
+            raise ValueError("acme resolvers cannot be empty")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_credentials(self) -> Self:
+        for name, binding in self.credentials.items():
+            if binding.secret is None:
+                raise ValueError(f"acme credential {name} must reference a secret")
+            if binding.delivery not in {None, "env"}:
+                raise ValueError(f"acme credential {name} must use env delivery")
+        return self
+
+    @property
+    def ca_server(self) -> str | None:
+        if self.ca == "production":
+            return None
+        if self.ca == "staging":
+            return ACME_STAGING_CA
+        return self.ca
 
 
 class ComposeInventory(BaseModel):
@@ -324,10 +388,20 @@ class ServiceInventory(BaseModel):
     use: list[str] = Field(default_factory=list)
     image: str | None = None
     route: RouteInventory | None = None
+    routes: list[RouteInventory] = Field(default_factory=list)
+    acme: AcmeInventory | None = None
     settings: dict[str, ServiceSettingInventory] = Field(default_factory=dict)
     mounts: list[ServiceMountInventory] = Field(default_factory=list)
     homepage: HomepageEntryInventory | None = None
     monitoring: MonitoringTargetInventory | None = None
+
+    @model_validator(mode="after")
+    def validate_acme_on_traefik(self) -> Self:
+        if self.acme is not None and self.proxy != "traefik":
+            raise ValueError(
+                f"service {self.id}: acme is only valid on a traefik proxy service"
+            )
+        return self
 
     @model_validator(mode="after")
     def imply_compose_from_stack(self) -> Self:

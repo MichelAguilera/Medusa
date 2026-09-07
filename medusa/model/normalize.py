@@ -99,6 +99,8 @@ def normalize_dns(inventory: DnsInventory) -> DnsModel:
             forwarder_mode=zone.forwarder_mode,
             forwarder_tls_servername=zone.forwarder_tls_servername,
             plaintext_domains=tuple(zone.plaintext_domains),
+            tls=zone.tls,
+            redirect_to=zone.redirect_to,
         )
         for zone in inventory.zones
     )
@@ -492,6 +494,7 @@ def normalize_nixos(
         route.rule.removeprefix("Host(`").removesuffix("`)")
         for routes in services_model.traefik_routes_by_host.values()
         for route in routes
+        if route.cert_resolver is None and route.redirect_host is None
     }
     insecure_registries_by_host: dict[str, tuple[str, ...]] = {}
     for host_name, stacks in stacks_by_host.items():
@@ -1228,7 +1231,7 @@ def normalize_services(
     dns_model: DnsModel,
     storage_model: StorageModel | None = None,
 ) -> ServicesModel:
-    services = _effective_services(inventory)
+    services = [_apply_acme(service) for service in _effective_services(inventory)]
     known_hosts = {host.name for host in dns_model.hosts}
 
     unknown_hosts = sorted(
@@ -1295,9 +1298,10 @@ def normalize_services(
     traefik_routes = tuple(
         route
         for service in sorted(services, key=lambda item: item.id)
-        for route in [_normalize_traefik_route(service)]
-        if route is not None
+        for route in _normalize_traefik_routes(service, dns_model)
     )
+    _validate_route_uniqueness(traefik_routes)
+    _validate_acme_coverage(services, traefik_routes)
 
     compose_services = normalize_compose_services(
         inventory, services, mount_index, egress
@@ -1457,7 +1461,20 @@ def _effective_service(inventory: ServicesInventory, service):
     local.pop("use", None)
     merged = _merge_dicts(merged, local)
     merged.setdefault("name", merged["id"])
+    routes = merged.pop("routes", None)
+    if routes:
+        defaults = merged.pop("route", None) or {}
+        merged["routes"] = [_merge_dicts(defaults, route) for route in routes]
+        merged["route"] = merged["routes"][0]
     return service.__class__.model_validate(merged)
+
+
+def _service_routes(service) -> list:
+    if service.routes:
+        return list(service.routes)
+    if service.route is not None and service.route.host is not None:
+        return [service.route]
+    return []
 
 
 def _resolved_preset(inventory: ServicesInventory, name: str) -> dict:
@@ -1479,24 +1496,208 @@ def _merge_dicts(base: dict, override: dict) -> dict:
     return merged
 
 
-def _normalize_traefik_route(service) -> TraefikRoute | None:
-    if service.route is None or service.route.host is None:
-        return None
+ACME_RESOLVER = "medusa"
+ACME_STORAGE_DIR = "/etc/traefik/acme"
 
-    if service.route.port is None:
+
+def _apply_acme(service):
+    """Fold a proxy's ``acme`` block into its compose definition: resolver
+    flags on the command line, a persistent storage mount, and the provider
+    credentials as env-delivered secret settings."""
+    acme = service.acme
+    if acme is None:
+        return service
+    command = service.compose.command if service.compose else None
+    if not isinstance(command, list):
         raise ValueError(
-            f"route service {service.id} must define port"
+            f"service {service.id}: acme requires compose.command as a list"
         )
-
-    return TraefikRoute(
-        name=service.route.name or service.name,
-        host=service.host,
-        rule=f"Host(`{service.route.host}`)",
-        entrypoints=tuple(service.route.entrypoints or ["web"]),
-        tls=False if service.route.tls is None else service.route.tls,
-        middlewares=tuple(service.route.middlewares or []),
-        target_url=f"http://{service.name}:{service.route.port}",
+    prefix = f"--certificatesresolvers.{ACME_RESOLVER}.acme"
+    args = [
+        f"{prefix}.email={acme.email}",
+        f"{prefix}.storage={ACME_STORAGE_DIR}/acme.json",
+    ]
+    if acme.ca_server is not None:
+        args.append(f"{prefix}.caserver={acme.ca_server}")
+    args += [
+        f"{prefix}.dnschallenge=true",
+        f"{prefix}.dnschallenge.provider={acme.dns_provider}",
+        f"{prefix}.dnschallenge.resolvers={','.join(acme.resolvers)}",
+    ]
+    compose = service.compose.model_copy(
+        update={
+            "command": [*command, *args],
+            "volumes": [*service.compose.volumes, f"./traefik/acme:{ACME_STORAGE_DIR}"],
+        }
     )
+    settings = dict(service.settings)
+    for name, binding in acme.credentials.items():
+        settings[name] = binding.model_copy(update={"delivery": "env"})
+    return service.model_copy(update={"compose": compose, "settings": settings})
+
+
+def _zone_of(name: str, zones: dict[str, DnsZone]) -> DnsZone | None:
+    matches = [
+        zone
+        for zone in zones.values()
+        if name == zone.name or name.endswith(f".{zone.name}")
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda zone: len(zone.name))
+
+
+def canonical_route_host(
+    name: str, zones: dict[str, DnsZone]
+) -> tuple[str, bool]:
+    """Resolve a route hostname to the name it is served on and whether that
+    name carries an ACME certificate: an alias zone (``redirect_to``) maps
+    the label onto its target zone; a ``tls: acme`` zone answers https."""
+    zone = _zone_of(name, zones)
+    if zone is None:
+        return name, False
+    if zone.redirect_to is not None:
+        label = name[: -len(zone.name) - 1]
+        target = zones[zone.redirect_to]
+        return f"{label}.{target.name}", True
+    return name, zone.tls == "acme"
+
+
+def _zone_slug(zone_name: str) -> str:
+    return zone_name.replace(".", "-")
+
+
+def _normalize_traefik_routes(service, dns_model: DnsModel) -> list[TraefikRoute]:
+    zones = {zone.name: zone for zone in dns_model.zones}
+    host_zones = {host.name: set(host.zones) for host in dns_model.hosts}
+    routes: list[TraefikRoute] = []
+    for index, route in enumerate(_service_routes(service)):
+        if route.host is None:
+            raise ValueError(
+                f"service {service.id}: every routes entry must define host"
+            )
+        if route.port is None:
+            raise ValueError(f"route service {service.id} must define port")
+        if index == 0:
+            name = route.name or service.name
+        elif route.name is None:
+            raise ValueError(
+                f"service {service.id}: routes after the first must define name"
+            )
+        else:
+            name = f"{service.name}-{route.name}"
+        target_url = f"http://{service.name}:{route.port}"
+        middlewares = tuple(route.middlewares or [])
+        canonical, acme = canonical_route_host(route.host, zones)
+        if not acme or route.acme is False:
+            routes.append(
+                TraefikRoute(
+                    name=name,
+                    host=service.host,
+                    rule=f"Host(`{route.host}`)",
+                    entrypoints=tuple(route.entrypoints or ["web"]),
+                    tls=False if route.tls is None else route.tls,
+                    middlewares=middlewares,
+                    target_url=target_url,
+                )
+            )
+            continue
+        alias_zone = _zone_of(route.host, zones)
+        target_zone = _zone_of(canonical, zones)
+        if target_zone.name not in host_zones.get(service.host, set()):
+            raise ValueError(
+                f"service {service.id}: route {route.host} maps to {canonical} "
+                f"but host {service.host} is not in zone {target_zone.name}"
+            )
+        parent = canonical.split(".", 1)[1]
+        routes.append(
+            TraefikRoute(
+                name=name,
+                host=service.host,
+                rule=f"Host(`{canonical}`)",
+                entrypoints=("websecure",),
+                tls=True,
+                middlewares=middlewares,
+                target_url=target_url,
+                cert_resolver=ACME_RESOLVER,
+                cert_main=f"*.{parent}",
+                cert_sans=(parent,),
+            )
+        )
+        routes.append(
+            TraefikRoute(
+                name=f"{name}-http",
+                host=service.host,
+                rule=f"Host(`{canonical}`)",
+                entrypoints=("web",),
+                tls=False,
+                middlewares=(f"{name}-http-redirect",),
+                target_url=target_url,
+                redirect_host=canonical,
+            )
+        )
+        if canonical == route.host:
+            continue
+        alias = f"{name}-{_zone_slug(alias_zone.name)}"
+        routes.append(
+            TraefikRoute(
+                name=alias,
+                host=service.host,
+                rule=f"Host(`{route.host}`)",
+                entrypoints=("web",),
+                tls=False,
+                middlewares=(f"{alias}-redirect",),
+                target_url=target_url,
+                redirect_host=canonical,
+            )
+        )
+        if route.tls is True:
+            routes.append(
+                TraefikRoute(
+                    name=f"{alias}-tls",
+                    host=service.host,
+                    rule=f"Host(`{route.host}`)",
+                    entrypoints=("websecure",),
+                    tls=True,
+                    middlewares=middlewares,
+                    target_url=target_url,
+                )
+            )
+    return routes
+
+
+def _validate_route_uniqueness(routes: tuple[TraefikRoute, ...]) -> None:
+    seen_names: set[tuple[str, str]] = set()
+    seen_bindings: set[tuple[str, str, str]] = set()
+    for route in routes:
+        key = (route.host, route.name)
+        if key in seen_names:
+            raise ValueError(
+                f"host {route.host} has duplicate traefik router name {route.name}"
+            )
+        seen_names.add(key)
+        for entrypoint in route.entrypoints:
+            binding = (route.host, route.rule, entrypoint)
+            if binding in seen_bindings:
+                raise ValueError(
+                    f"host {route.host} routes {route.rule} twice on "
+                    f"entrypoint {entrypoint}"
+                )
+            seen_bindings.add(binding)
+
+
+def _validate_acme_coverage(services, routes: tuple[TraefikRoute, ...]) -> None:
+    acme_hosts = {service.host for service in services if service.acme is not None}
+    missing = sorted(
+        {route.host for route in routes if route.cert_resolver is not None}
+        - acme_hosts
+    )
+    if missing:
+        formatted = ", ".join(missing)
+        raise ValueError(
+            f"hosts have routes in a tls: acme zone but their proxy declares "
+            f"no acme block: {formatted}"
+        )
 
 
 def normalize_homepage(
@@ -1505,6 +1706,7 @@ def normalize_homepage(
     dns_model: DnsModel,
 ) -> HomepageModel:
     known_hosts = {host.name for host in dns_model.hosts}
+    zones = {zone.name: zone for zone in dns_model.zones}
 
     unknown = sorted(
         host.name
@@ -1528,7 +1730,7 @@ def normalize_homepage(
         if service.homepage is None:
             continue
 
-        card = _build_homepage_card(service)
+        card = _build_homepage_card(service, zones)
         order = service.homepage.order if service.homepage.order is not None else 0
         cards_by_host.setdefault(service.host, []).append((order, card.name, card))
 
@@ -1568,7 +1770,7 @@ def normalize_homepage(
     )
 
 
-def _build_homepage_card(service) -> HomepageCard:
+def _build_homepage_card(service, zones: dict[str, DnsZone]) -> HomepageCard:
     entry = service.homepage
     dumped = entry.model_dump(exclude_none=True)
     dumped.pop("order", None)
@@ -1579,8 +1781,11 @@ def _build_homepage_card(service) -> HomepageCard:
         if service.route is not None and service.route.host is not None:
             # Follow the route's TLS setting; an http-only route (tls falsey,
             # the default) must not produce an https:// tile that dead-links.
-            scheme = "https" if getattr(service.route, "tls", None) else "http"
-            href = f"{scheme}://{service.route.host}"
+            host, acme = canonical_route_host(service.route.host, zones)
+            if service.route.acme is False:
+                host, acme = service.route.host, False
+            scheme = "https" if acme or service.route.tls else "http"
+            href = f"{scheme}://{host}"
         else:
             raise ValueError(
                 f"service {service.id} homepage entry requires href or route.host"

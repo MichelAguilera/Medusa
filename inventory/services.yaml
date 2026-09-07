@@ -17,6 +17,16 @@ services:
 - id: host02-infra-01-traefik
   name: traefik
   host: host02
+  # DNS-01 certificates for a `tls: acme` zone (see dns.yaml). The provider
+  # name and credential variables are Traefik's; the secret is a normal SOPS
+  # file under secrets/. Use `ca: staging` until the first issue succeeds.
+  # acme:
+  #   email: ops@example.com
+  #   dns_provider: cloudflare
+  #   ca: staging
+  #   credentials:
+  #     CF_DNS_API_TOKEN:
+  #       secret: infra/cloudflare_dns_token
   stack: infra
   proxy: traefik
   image: traefik:v3.6.1

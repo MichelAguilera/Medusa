@@ -293,7 +293,10 @@ def _secret_sources(inventory: ServicesInventory, paths: ProjectPaths) -> set[Pa
     return {
         paths.secrets_dir / f"{setting.secret}.sops.yaml"
         for service in inventory.services
-        for setting in service.settings.values()
+        for setting in [
+            *service.settings.values(),
+            *(service.acme.credentials.values() if service.acme else []),
+        ]
         if setting.secret is not None
     }
 

@@ -5,6 +5,13 @@
 zones:
 - name: lan
   upstreams: [9.9.9.9, 1.1.1.1]
+  # HTTPS on a public domain you own, with .lan kept as redirects: uncomment
+  # both blocks, list the second zone on every proxy host below, and give the
+  # traefik service an `acme` block (see services.yaml). Public DNS needs no
+  # records for the second zone; CoreDNS answers for it locally.
+  # redirect_to: internal.example.com
+# - name: internal.example.com
+#   tls: acme
 
 hosts:
 - name: host01

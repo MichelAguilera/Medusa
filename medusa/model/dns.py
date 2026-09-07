@@ -11,6 +11,8 @@ class DnsZone(BaseModel):
     forwarder_mode: Literal["udp", "dot"] = "udp"
     forwarder_tls_servername: str | None = None
     plaintext_domains: tuple[str, ...] = ()
+    tls: Literal["acme"] | None = None
+    redirect_to: str | None = None
 
 
 class HostNetwork(BaseModel):
