@@ -21,6 +21,7 @@ class OidcClient(BaseModel):
     redirect_uris: tuple[str, ...]
     scopes: tuple[str, ...]
     policy: Literal["one_factor", "two_factor"]
+    token_auth: Literal["client_secret_basic", "client_secret_post"]
 
 
 class AuthModel(BaseModel):

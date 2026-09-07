@@ -77,6 +77,9 @@ class OidcClientInventory(BaseModel):
     name: str | None = None
     scopes: list[str] = Field(default_factory=lambda: list(OIDC_DEFAULT_SCOPES))
     policy: Literal["one_factor", "two_factor"] | None = None
+    token_auth: Literal["client_secret_basic", "client_secret_post"] = (
+        "client_secret_basic"
+    )
 
     @field_validator("secret")
     @classmethod

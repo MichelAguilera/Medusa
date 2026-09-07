@@ -1857,6 +1857,7 @@ def _normalize_auth(
                     ),
                     scopes=tuple(service.oidc.scopes),
                     policy=service.oidc.policy or auth_inventory.default_policy,
+                    token_auth=service.oidc.token_auth,
                 )
             )
         client_ids = [client.client_id for client in oidc_clients]
