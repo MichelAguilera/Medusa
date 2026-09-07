@@ -1,7 +1,7 @@
 import hashlib
 import re
 
-from medusa.inventory.auth import AuthInventory
+from medusa.inventory.auth import AuthInventory, AuthSecretsInventory
 from medusa.inventory.dns import (
     DnsInventory,
     HostInventory,
@@ -1721,6 +1721,21 @@ def _oidc_client_id(service) -> str:
     return service.oidc.client_id or service.name
 
 
+def resolve_auth_secrets(provider, auth_inventory: AuthInventory) -> dict[str, str]:
+    """Per-host secret references for an auth service: its own
+    ``auth_secrets`` over the fleet defaults, every key required."""
+    own = provider.auth_secrets or AuthSecretsInventory()
+    resolved = own.merged_over(auth_inventory.secrets)
+    missing = sorted(key for key, value in resolved.items() if value is None)
+    if missing:
+        raise ValueError(
+            f"auth service {provider.id}: no secret reference for "
+            f"{', '.join(missing)} (set auth_secrets on the service or "
+            f"secrets in inventory/auth.yaml)"
+        )
+    return resolved
+
+
 def _apply_auth_settings(services, auth_inventory: AuthInventory | None):
     """Fold the fleet auth secrets and the host's OIDC client secrets onto
     each auth-role service as file-delivered settings, and set the engine's
@@ -1749,9 +1764,9 @@ def _apply_auth_settings(services, auth_inventory: AuthInventory | None):
         settings = dict(provider.settings)
         for name, value in AUTH_ENGINE_ENVIRONMENT.get(provider.auth, {}).items():
             settings[name] = ServiceSettingInventory(value=value)
-        for key, setting_name in AUTH_SECRET_SETTINGS.items():
-            settings[setting_name] = ServiceSettingInventory(
-                secret=getattr(auth_inventory.secrets, key), delivery="file"
+        for key, secret in resolve_auth_secrets(provider, auth_inventory).items():
+            settings[AUTH_SECRET_SETTINGS[key]] = ServiceSettingInventory(
+                secret=secret, delivery="file"
             )
         for service in services:
             if service.oidc is None or service.host != provider.host:

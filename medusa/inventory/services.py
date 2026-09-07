@@ -12,6 +12,8 @@ from pydantic import (
     model_validator,
 )
 
+from medusa.inventory.auth import AuthSecretsInventory
+
 
 class RouteInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -441,6 +443,7 @@ class ServiceInventory(BaseModel):
     stack: str | None = None
     proxy: Literal["traefik", "caddy", "nginx"] | None = None
     auth: Literal["authelia", "authentik", "keycloak"] | None = None
+    auth_secrets: AuthSecretsInventory | None = None
     # Internet-egress policy. "direct" (default): traffic leaves via the host's
     # normal gateway. "tunnel": public egress is routed through a shared
     # WireGuard egress gateway while LAN traffic and inbound reachability stay
@@ -459,6 +462,14 @@ class ServiceInventory(BaseModel):
     mounts: list[ServiceMountInventory] = Field(default_factory=list)
     homepage: HomepageEntryInventory | None = None
     monitoring: MonitoringTargetInventory | None = None
+
+    @model_validator(mode="after")
+    def validate_auth_secrets_on_auth_role(self) -> Self:
+        if self.auth_secrets is not None and self.auth is None:
+            raise ValueError(
+                f"service {self.id}: auth_secrets is only valid on an auth service"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_acme_on_traefik(self) -> Self:

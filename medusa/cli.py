@@ -67,6 +67,7 @@ from medusa.model.normalize import (
     normalize_coredns,
     normalize_dns,
     normalize_homepage,
+    resolve_auth_secrets,
     normalize_monitoring,
     normalize_native,
     normalize_network,
@@ -288,10 +289,13 @@ def _validate_secret_sources(
 ) -> None:
     sources = _secret_sources(inventory, paths)
     if auth_inventory is not None:
-        sources |= {
-            paths.secrets_dir / f"{ref}.sops.yaml"
-            for ref in auth_inventory.secrets.model_dump().values()
-        }
+        for service in inventory.services:
+            if service.auth is None:
+                continue
+            sources |= {
+                paths.secrets_dir / f"{ref}.sops.yaml"
+                for ref in resolve_auth_secrets(service, auth_inventory).values()
+            }
     missing = sorted(source for source in sources if not source.exists())
     if missing:
         formatted = ", ".join(

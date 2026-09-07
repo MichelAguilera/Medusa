@@ -21,26 +21,39 @@ class AuthSessionInventory(BaseModel):
         return normalized
 
 
+AUTH_SECRET_KEYS = ("users", "session", "storage", "jwt", "oidc_hmac", "oidc_key")
+
+
 class AuthSecretsInventory(BaseModel):
     """SOPS secret references the identity provider consumes, each a path
-    under secrets/ without the .sops.yaml suffix."""
+    under secrets/ without the .sops.yaml suffix. Fleet-level values are
+    defaults; an auth service's own ``auth_secrets`` overrides per host, and
+    every key must resolve one way or the other."""
 
     model_config = ConfigDict(extra="forbid")
 
-    users: str
-    session: str
-    storage: str
-    jwt: str
-    oidc_hmac: str
-    oidc_key: str
+    users: str | None = None
+    session: str | None = None
+    storage: str | None = None
+    jwt: str | None = None
+    oidc_hmac: str | None = None
+    oidc_key: str | None = None
 
-    @field_validator("users", "session", "storage", "jwt", "oidc_hmac", "oidc_key")
+    @field_validator(*AUTH_SECRET_KEYS)
     @classmethod
-    def normalize_secret(cls, value: str) -> str:
+    def normalize_secret(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         normalized = value.strip().removesuffix(".sops.yaml")
         if not normalized:
             raise ValueError("auth secret references cannot be empty")
         return normalized
+
+    def merged_over(
+        self, defaults: "AuthSecretsInventory | None"
+    ) -> dict[str, str | None]:
+        base = defaults.model_dump() if defaults is not None else {}
+        return {key: getattr(self, key) or base.get(key) for key in AUTH_SECRET_KEYS}
 
 
 class AuthInventory(BaseModel):
@@ -49,7 +62,7 @@ class AuthInventory(BaseModel):
     display_name: str = "Medusa"
     default_policy: AuthPolicy = "one_factor"
     session: AuthSessionInventory = Field(default_factory=AuthSessionInventory)
-    secrets: AuthSecretsInventory
+    secrets: AuthSecretsInventory | None = None
 
     @field_validator("display_name")
     @classmethod
