@@ -228,7 +228,7 @@ class NixosHost(BaseModel):
     network: NixosNetwork | None
     file_systems: tuple[NixosMount, ...]
     # Compose stacks this host runs (T-087). Empty when the host is
-    # native-services-only (the charon shape). Non-empty enables docker, the
+    # native-services-only. Non-empty enables docker, the
     # medusa runtime user, the stacks sync unit, and one unit per stack.
     stacks: tuple[NixosStack, ...]
     # Bind-mount data dirs under the stacks root for this host, created and

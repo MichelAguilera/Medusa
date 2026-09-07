@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.34.0"
+VERSION="0.34.1"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -983,7 +983,7 @@ medusactl deploy [--check] [--limit <pattern>] — render and apply the fleet.
 
 Pulls inventory and renders on the seat, then reconciles every host with
 nixos-rebuild. A controller seat leads the plan with its own local switch
-(T-099); the ansible era ended with the zeus succession.
+(T-099); the ansible era ended with the controller succession.
 
   --check            Dry run (render + NixOS dry-activate).
   --limit <pattern>  Reconcile only hosts whose NAME matches <pattern>
