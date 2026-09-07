@@ -71,6 +71,7 @@ notifier:
   filesystem:
     filename: /config/notification.txt
 
+{% if auth.clients %}
 identity_providers:
   oidc:
     hmac_secret: '{{ secret(auth.secret_files["oidc_hmac"]) }}'
@@ -78,7 +79,6 @@ identity_providers:
       - algorithm: RS256
         key: |
           {{ "{{- fileContent \"%s\" | nindent 10 }}" | format(auth.secret_files["oidc_key"]) }}
-{% if auth.clients %}
     clients:
 {% for client in auth.clients %}
       - client_id: {{ client.client_id | tojson }}
@@ -100,6 +100,4 @@ identity_providers:
         token_endpoint_auth_method: client_secret_basic
         userinfo_signed_response_alg: none
 {% endfor %}
-{% else %}
-    clients: []
 {% endif %}
