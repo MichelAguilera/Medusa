@@ -555,8 +555,8 @@ def normalize_nixos(
                     dest="traefik/dynamic/medusa-dynamic.yaml",
                 )
             )
-        auth = services_model.auth
-        if auth is not None and auth.host == host_name:
+        auth = services_model.auth_by_host.get(host_name)
+        if auth is not None:
             stack_name = _stack_with_service(host_name, auth.service)
             stack_configs.setdefault((host_name, stack_name), []).append(
                 NixosStagedConfig(
@@ -1319,7 +1319,7 @@ def normalize_services(
     )
     _validate_route_uniqueness(traefik_routes)
     _validate_acme_coverage(services, traefik_routes)
-    auth = _normalize_auth(services, traefik_routes, dns_model, auth_inventory)
+    auth_by_host = _normalize_auth(services, traefik_routes, dns_model, auth_inventory)
 
     compose_services = normalize_compose_services(
         inventory, services, mount_index, egress
@@ -1363,7 +1363,7 @@ def normalize_services(
         proxies=proxies,
         tunnel_services_by_host=tunnel_services_by_host,
         egress=egress,
-        auth=auth,
+        auth_by_host=auth_by_host,
     )
 
 
@@ -1722,37 +1722,45 @@ def _oidc_client_id(service) -> str:
 
 
 def _apply_auth_settings(services, auth_inventory: AuthInventory | None):
-    """Fold the fleet auth secrets and every OIDC client secret onto the
-    auth-role service as file-delivered settings, and set the engine's
+    """Fold the fleet auth secrets and the host's OIDC client secrets onto
+    each auth-role service as file-delivered settings, and set the engine's
     config-templating switch, so the rendered config reads secrets on the
     host."""
     providers = [service for service in services if service.auth is not None]
-    if len(providers) > 1:
-        formatted = ", ".join(sorted(service.id for service in providers))
-        raise ValueError(f"more than one service declares an auth role: {formatted}")
     if not providers:
         return services
-    provider = providers[0]
     if auth_inventory is None:
         raise ValueError(
-            f"service {provider.id} declares auth: {provider.auth} but "
+            f"service {providers[0].id} declares auth: {providers[0].auth} but "
             f"inventory/auth.yaml is missing"
         )
-    settings = dict(provider.settings)
-    for name, value in AUTH_ENGINE_ENVIRONMENT.get(provider.auth, {}).items():
-        settings[name] = ServiceSettingInventory(value=value)
-    for key, setting_name in AUTH_SECRET_SETTINGS.items():
-        settings[setting_name] = ServiceSettingInventory(
-            secret=getattr(auth_inventory.secrets, key), delivery="file"
+    by_host: dict[str, list] = {}
+    for provider in providers:
+        by_host.setdefault(provider.host, []).append(provider)
+    crowded = {host: group for host, group in by_host.items() if len(group) > 1}
+    if crowded:
+        formatted = "; ".join(
+            f"{host}: {', '.join(sorted(s.id for s in group))}"
+            for host, group in sorted(crowded.items())
         )
-    for service in services:
-        if service.oidc is None:
-            continue
-        settings[_oidc_setting_name(_oidc_client_id(service))] = (
-            ServiceSettingInventory(secret=service.oidc.secret, delivery="file")
-        )
-    updated = provider.model_copy(update={"settings": settings})
-    return [updated if service is provider else service for service in services]
+        raise ValueError(f"hosts declare more than one auth service: {formatted}")
+    updated = {}
+    for provider in providers:
+        settings = dict(provider.settings)
+        for name, value in AUTH_ENGINE_ENVIRONMENT.get(provider.auth, {}).items():
+            settings[name] = ServiceSettingInventory(value=value)
+        for key, setting_name in AUTH_SECRET_SETTINGS.items():
+            settings[setting_name] = ServiceSettingInventory(
+                secret=getattr(auth_inventory.secrets, key), delivery="file"
+            )
+        for service in services:
+            if service.oidc is None or service.host != provider.host:
+                continue
+            settings[_oidc_setting_name(_oidc_client_id(service))] = (
+                ServiceSettingInventory(secret=service.oidc.secret, delivery="file")
+            )
+        updated[provider.id] = provider.model_copy(update={"settings": settings})
+    return [updated.get(service.id, service) for service in services]
 
 
 def _normalize_auth(
@@ -1760,93 +1768,109 @@ def _normalize_auth(
     traefik_routes: tuple[TraefikRoute, ...],
     dns_model: DnsModel,
     auth_inventory: AuthInventory | None,
-) -> AuthModel | None:
-    providers = [service for service in services if service.auth is not None]
+) -> dict[str, AuthModel]:
+    providers = {
+        service.host: service for service in services if service.auth is not None
+    }
     protected = [route for route in traefik_routes if route.auth_policy is not None]
     clients = [service for service in services if service.oidc is not None]
+    uncovered = sorted(
+        {route.host for route in protected} | {s.host for s in clients}
+    )
+    uncovered = [host for host in uncovered if host not in providers]
+    if uncovered:
+        raise ValueError(
+            f"hosts have protected routes or oidc clients but no service "
+            f"declaring an auth role: {', '.join(uncovered)}"
+        )
     if not providers:
-        if protected or clients:
-            wanting = sorted(
-                {route.name for route in protected} | {s.id for s in clients}
-            )
-            raise ValueError(
-                f"routes or services want auth but no service declares an auth "
-                f"role: {', '.join(wanting)}"
-            )
-        return None
-    provider = providers[0]
+        return {}
     assert auth_inventory is not None
     zones = {zone.name: zone for zone in dns_model.zones}
-    own_routes = _service_routes(provider)
-    if not own_routes:
-        raise ValueError(f"auth service {provider.id} must declare a route")
-    portal, acme = canonical_route_host(own_routes[0].host, zones)
-    if not acme or own_routes[0].acme is False:
-        raise ValueError(
-            f"auth service {provider.id}: its route {own_routes[0].host} must be "
-            f"served over https from a tls: acme zone"
-        )
-    cookie_domain = _zone_of(portal, zones).name
-    url = f"https://{portal}"
-    rules = [AuthRule(domain=portal, policy="bypass")]
-    for route in protected:
-        domain = route.rule.removeprefix("Host(`").removesuffix("`)")
-        if _zone_of(domain, zones).name != cookie_domain:
+    models: dict[str, AuthModel] = {}
+    for host, provider in sorted(providers.items()):
+        own_routes = _service_routes(provider)
+        if not own_routes:
+            raise ValueError(f"auth service {provider.id} must declare a route")
+        portal, acme = canonical_route_host(own_routes[0].host, zones)
+        if not acme or own_routes[0].acme is False:
             raise ValueError(
-                f"route {route.name} ({domain}) is outside the auth cookie "
-                f"domain {cookie_domain}"
+                f"auth service {provider.id}: its route {own_routes[0].host} must "
+                f"be served over https from a tls: acme zone"
             )
-        policy = (
-            auth_inventory.default_policy
-            if route.auth_policy == "default"
-            else route.auth_policy
+        cookie_domain = portal.split(".", 1)[1]
+        url = f"https://{portal}"
+        rules = [AuthRule(domain=portal, policy="bypass")]
+        for route in protected:
+            if route.host != host:
+                continue
+            domain = route.rule.removeprefix("Host(`").removesuffix("`)")
+            if not domain.endswith(f".{cookie_domain}"):
+                raise ValueError(
+                    f"route {route.name} ({domain}) is outside the auth cookie "
+                    f"domain {cookie_domain} of host {host}"
+                )
+            policy = (
+                auth_inventory.default_policy
+                if route.auth_policy == "default"
+                else route.auth_policy
+            )
+            rules.append(AuthRule(domain=domain, policy=policy))
+        oidc_clients = []
+        for service in sorted(clients, key=lambda item: item.id):
+            if service.host != host:
+                continue
+            routes = _service_routes(service)
+            if not routes:
+                raise ValueError(
+                    f"service {service.id} declares oidc but has no route"
+                )
+            app_host, app_acme = canonical_route_host(routes[0].host, zones)
+            if not app_acme or routes[0].acme is False:
+                raise ValueError(
+                    f"service {service.id}: oidc requires its route to be served "
+                    f"over https from a tls: acme zone"
+                )
+            client_id = _oidc_client_id(service)
+            oidc_clients.append(
+                OidcClient(
+                    client_id=client_id,
+                    name=service.oidc.name or service.name,
+                    secret_file=_secret_container_path(_oidc_setting_name(client_id)),
+                    redirect_uris=(
+                        f"https://{app_host}{service.oidc.redirect_path}",
+                    ),
+                    scopes=tuple(service.oidc.scopes),
+                    policy=service.oidc.policy or auth_inventory.default_policy,
+                )
+            )
+        client_ids = [client.client_id for client in oidc_clients]
+        if len(set(client_ids)) != len(client_ids):
+            raise ValueError(f"oidc client_id values must be unique on host {host}")
+        models[host] = AuthModel(
+            engine=provider.auth,
+            host=host,
+            stack=provider.stack,
+            service=provider.name,
+            port=own_routes[0].port,
+            url=url,
+            forward_auth_url=(
+                f"http://{provider.name}:{own_routes[0].port}{FORWARD_AUTH_PATH}"
+            ),
+            cookie_domain=cookie_domain,
+            display_name=auth_inventory.display_name,
+            default_policy=auth_inventory.default_policy,
+            session_inactivity=auth_inventory.session.inactivity,
+            session_expiration=auth_inventory.session.expiration,
+            session_remember_me=auth_inventory.session.remember_me,
+            secret_files={
+                key: _secret_container_path(name)
+                for key, name in AUTH_SECRET_SETTINGS.items()
+            },
+            rules=tuple(rules),
+            clients=tuple(oidc_clients),
         )
-        rules.append(AuthRule(domain=domain, policy=policy))
-    oidc_clients = []
-    for service in sorted(clients, key=lambda item: item.id):
-        routes = _service_routes(service)
-        if not routes:
-            raise ValueError(f"service {service.id} declares oidc but has no route")
-        host, acme = canonical_route_host(routes[0].host, zones)
-        if not acme or routes[0].acme is False:
-            raise ValueError(
-                f"service {service.id}: oidc requires its route to be served over "
-                f"https from a tls: acme zone"
-            )
-        client_id = _oidc_client_id(service)
-        oidc_clients.append(
-            OidcClient(
-                client_id=client_id,
-                name=service.oidc.name or service.name,
-                secret_file=_secret_container_path(_oidc_setting_name(client_id)),
-                redirect_uris=(f"https://{host}{service.oidc.redirect_path}",),
-                scopes=tuple(service.oidc.scopes),
-                policy=service.oidc.policy or auth_inventory.default_policy,
-            )
-        )
-    client_ids = [client.client_id for client in oidc_clients]
-    if len(set(client_ids)) != len(client_ids):
-        raise ValueError("oidc client_id values must be unique across the fleet")
-    return AuthModel(
-        engine=provider.auth,
-        host=provider.host,
-        stack=provider.stack,
-        service=provider.name,
-        url=url,
-        forward_auth_url=f"{url}{FORWARD_AUTH_PATH}",
-        cookie_domain=cookie_domain,
-        display_name=auth_inventory.display_name,
-        default_policy=auth_inventory.default_policy,
-        session_inactivity=auth_inventory.session.inactivity,
-        session_expiration=auth_inventory.session.expiration,
-        session_remember_me=auth_inventory.session.remember_me,
-        secret_files={
-            key: _secret_container_path(name)
-            for key, name in AUTH_SECRET_SETTINGS.items()
-        },
-        rules=tuple(rules),
-        clients=tuple(oidc_clients),
-    )
+    return models
 
 
 def _validate_route_uniqueness(routes: tuple[TraefikRoute, ...]) -> None:

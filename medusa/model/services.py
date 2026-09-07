@@ -167,4 +167,4 @@ class ServicesModel(BaseModel):
     tunnel_services_by_host: dict[str, tuple[str, ...]]
     # Resolved egress gateway config; None when nothing is tunneled. T-066.
     egress: EgressGateway | None
-    auth: AuthModel | None = None
+    auth_by_host: dict[str, AuthModel] = {}

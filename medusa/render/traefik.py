@@ -16,7 +16,7 @@ def render_traefik(
             {
                 "traefik": {
                     "routes": model.traefik_routes_by_host.get(host, ()),
-                    "auth": model.auth,
+                    "auth": model.auth_by_host.get(host),
                 }
             },
         )

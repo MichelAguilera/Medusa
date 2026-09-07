@@ -9,16 +9,14 @@ def render_auth(
     templates_dir: Path,
     generated_dir: Path,
 ) -> dict[Path, str]:
-    auth = model.auth
-    if auth is None:
-        return {}
-    if auth.engine != "authelia":
-        raise NotImplementedError(
-            f"{auth.engine} auth rendering is not implemented (host: {auth.host}). "
-            f"See medusa/render/auth.py; only authelia has a renderer today."
-        )
-    return {
-        generated_dir / "auth" / auth.host / "configuration.yml": render_template(
+    files: dict[Path, str] = {}
+    for host, auth in sorted(model.auth_by_host.items()):
+        if auth.engine != "authelia":
+            raise NotImplementedError(
+                f"{auth.engine} auth rendering is not implemented (host: {host}). "
+                f"See medusa/render/auth.py; only authelia has a renderer today."
+            )
+        files[generated_dir / "auth" / host / "configuration.yml"] = render_template(
             templates_dir, "auth/authelia.yml.j2", {"auth": auth}
         )
-    }
+    return files

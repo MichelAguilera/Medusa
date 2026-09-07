@@ -24,9 +24,10 @@ class OidcClient(BaseModel):
 
 
 class AuthModel(BaseModel):
-    """Engine-neutral identity-provider role: where it runs, the URL every
-    proxy calls, the cookie domain, and the rules and clients derived from
-    routes. Renderers map this onto a concrete engine's config."""
+    """Engine-neutral identity-provider role for one host: its portal URL,
+    the in-host address the proxy calls, the cookie domain (the host's own
+    subdomain, so sessions never cross hosts), and the rules and clients
+    derived from that host's routes. Renderers map it onto an engine."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -34,6 +35,7 @@ class AuthModel(BaseModel):
     host: str
     stack: str | None
     service: str
+    port: int
     url: str
     forward_auth_url: str
     cookie_domain: str
