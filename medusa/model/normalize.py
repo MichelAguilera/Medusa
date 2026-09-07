@@ -1321,8 +1321,9 @@ def normalize_services(
     _validate_acme_coverage(services, traefik_routes)
     auth_by_host = _normalize_auth(services, traefik_routes, dns_model, auth_inventory)
 
-    compose_services = normalize_compose_services(
-        inventory, services, mount_index, egress
+    compose_services = _stamp_auth_config(
+        normalize_compose_services(inventory, services, mount_index, egress),
+        auth_by_host,
     )
     compose_files = normalize_compose_files(inventory, compose_services, egress)
     compose_data_dirs = normalize_compose_data_dirs(compose_services)
@@ -1887,6 +1888,25 @@ def _normalize_auth(
             clients=tuple(oidc_clients),
         )
     return models
+
+
+def _stamp_auth_config(compose_services, auth_by_host: dict[str, AuthModel]):
+    """Label each auth service with a digest of its derived config so a
+    config-only change recreates the container; the engine reads its file
+    at startup, unlike the proxy's watched dynamic config."""
+    stamped = []
+    for service in compose_services:
+        auth = auth_by_host.get(service.host)
+        if auth is None or service.name != auth.service:
+            stamped.append(service)
+            continue
+        digest = hashlib.sha256(auth.model_dump_json().encode()).hexdigest()[:16]
+        stamped.append(
+            service.model_copy(
+                update={"labels": (*service.labels, f"medusa.auth-config={digest}")}
+            )
+        )
+    return stamped
 
 
 def _validate_route_uniqueness(routes: tuple[TraefikRoute, ...]) -> None:
