@@ -12,6 +12,12 @@ services:
 {% if service.init is not none %}
     init: {{ service.init | lower }}
 {% endif %}
+{% if service.stdin_open is not none %}
+    stdin_open: {{ service.stdin_open | lower }}
+{% endif %}
+{% if service.tty is not none %}
+    tty: {{ service.tty | lower }}
+{% endif %}
 {% if service.restart %}
     restart: {{ service.restart | tojson }}
 {% endif %}

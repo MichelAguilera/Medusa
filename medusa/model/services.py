@@ -43,6 +43,8 @@ class ComposeService(BaseModel):
     image: str | None
     build: Any
     init: bool | None
+    stdin_open: bool | None
+    tty: bool | None
     restart: str | None
     command: Any
     ports: tuple[str, ...]

@@ -49,6 +49,8 @@ def normalize_compose_services(
                 image=service.image,
                 build=service.compose.build,
                 init=service.compose.init,
+                stdin_open=service.compose.stdin_open,
+                tty=service.compose.tty,
                 restart=service.compose.restart,
                 command=service.compose.command,
                 ports=tuple(service.compose.ports),

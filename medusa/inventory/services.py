@@ -193,6 +193,8 @@ class ComposeInventory(BaseModel):
     image: str | None = None
     build: Any = None
     init: bool | None = None
+    stdin_open: bool | None = None
+    tty: bool | None = None
     restart: str | None = None
     command: Any = None
     ports: list[str] = Field(default_factory=list)
