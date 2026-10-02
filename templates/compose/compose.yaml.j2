@@ -66,13 +66,21 @@ services:
 {% endif %}
 {% if service.networks %}
     networks:
-{% if service.gateway_network %}
+{% if service.gateway_network or service.network_aliases %}
 {# Mapping form: the gateway network gets a high gw_priority so it is always
    the container's default route (egress can't fall back to another network). #}
 {% for network in service.networks %}
-{% if network == service.gateway_network %}
+{% if network == service.gateway_network or service.network_aliases %}
       {{ network | tojson }}:
+{% if network == service.gateway_network %}
         gw_priority: 100
+{% endif %}
+{% if service.network_aliases %}
+        aliases:
+{% for alias in service.network_aliases %}
+          - {{ alias | tojson }}
+{% endfor %}
+{% endif %}
 {% else %}
       {{ network | tojson }}: {}
 {% endif %}

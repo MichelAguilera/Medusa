@@ -1321,9 +1321,13 @@ def normalize_services(
     _validate_acme_coverage(services, traefik_routes)
     auth_by_host = _normalize_auth(services, traefik_routes, dns_model, auth_inventory)
 
-    compose_services = _stamp_auth_config(
-        normalize_compose_services(inventory, services, mount_index, egress),
+    compose_services = _alias_auth_portal(
+        _stamp_auth_config(
+            normalize_compose_services(inventory, services, mount_index, egress),
+            auth_by_host,
+        ),
         auth_by_host,
+        services,
     )
     compose_files = normalize_compose_files(inventory, compose_services, egress)
     compose_data_dirs = normalize_compose_data_dirs(compose_services)
@@ -1907,6 +1911,26 @@ def _stamp_auth_config(compose_services, auth_by_host: dict[str, AuthModel]):
             )
         )
     return stamped
+
+
+def _alias_auth_portal(compose_services, auth_by_host: dict[str, AuthModel], services):
+    """Give each auth host's proxy a network alias for the portal name so
+    OIDC clients reach the issuer over the shared network; a container's
+    request to its own host's address is not DNATed by docker."""
+    proxy_by_host = {s.host: s.name for s in services if s.proxy is not None}
+    aliased = []
+    for service in compose_services:
+        auth = auth_by_host.get(service.host)
+        if auth is None or service.name != proxy_by_host.get(service.host):
+            aliased.append(service)
+            continue
+        portal = auth.url.removeprefix("https://")
+        aliased.append(
+            service.model_copy(
+                update={"network_aliases": (*service.network_aliases, portal)}
+            )
+        )
+    return aliased
 
 
 def _validate_route_uniqueness(routes: tuple[TraefikRoute, ...]) -> None:

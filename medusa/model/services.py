@@ -70,6 +70,10 @@ class ComposeService(BaseModel):
     # back to another attached network (e.g. `proxy`) on docker's undocumented
     # multi-network tie-break. None = leave docker's default. See T-066.
     gateway_network: str | None
+    # Extra names the container answers to on every network it joins. Set on
+    # a proxy whose host runs an auth role: containers reach the portal over
+    # the shared network instead of hairpinning through the host firewall.
+    network_aliases: tuple[str, ...] = ()
 
 
 class ComposeDataDir(BaseModel):
