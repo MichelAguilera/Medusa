@@ -1853,8 +1853,8 @@ def _normalize_auth(
                     client_id=client_id,
                     name=service.oidc.name or service.name,
                     secret_file=_secret_container_path(_oidc_setting_name(client_id)),
-                    redirect_uris=(
-                        f"https://{app_host}{service.oidc.redirect_path}",
+                    redirect_uris=tuple(
+                        f"https://{app_host}{path}" for path in service.oidc.redirect_paths
                     ),
                     scopes=tuple(service.oidc.scopes),
                     policy=service.oidc.policy or auth_inventory.default_policy,

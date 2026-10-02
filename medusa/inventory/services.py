@@ -65,14 +65,14 @@ OIDC_DEFAULT_SCOPES = ["openid", "profile", "email", "groups"]
 
 class OidcClientInventory(BaseModel):
     """An OIDC relying party registered with the fleet auth provider. The
-    redirect URI is derived from the service's https route plus
-    ``redirect_path``; ``secret`` is shared with the app through the
+    redirect URIs are the service's https route plus each of
+    ``redirect_paths``; ``secret`` is shared with the app through the
     operator's own settings binding."""
 
     model_config = ConfigDict(extra="forbid")
 
     secret: str
-    redirect_path: str
+    redirect_paths: list[str]
     client_id: str | None = None
     name: str | None = None
     scopes: list[str] = Field(default_factory=lambda: list(OIDC_DEFAULT_SCOPES))
@@ -89,12 +89,16 @@ class OidcClientInventory(BaseModel):
             raise ValueError("oidc secret cannot be empty")
         return normalized
 
-    @field_validator("redirect_path")
+    @field_validator("redirect_paths")
     @classmethod
-    def normalize_redirect_path(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized.startswith("/"):
-            raise ValueError("oidc redirect_path must start with /")
+    def normalize_redirect_paths(cls, value: list[str]) -> list[str]:
+        normalized = [item.strip() for item in value]
+        if not normalized:
+            raise ValueError("oidc redirect_paths cannot be empty")
+        if any(not item.startswith("/") for item in normalized):
+            raise ValueError("oidc redirect_paths must start with /")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("oidc redirect_paths cannot contain duplicates")
         return normalized
 
     @field_validator("client_id", "name")
