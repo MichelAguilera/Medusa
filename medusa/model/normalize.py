@@ -1,4 +1,5 @@
 import hashlib
+import json
 import re
 
 from medusa.inventory.auth import AuthInventory, AuthSecretsInventory
@@ -369,6 +370,7 @@ def normalize_nixos(
     homepage_model: HomepageModel | None = None,
     monitoring_model: MonitoringModel | None = None,
     managed_hosts_model: ManagedHostsModel | None = None,
+    flake_lock: str | None = None,
 ) -> NixosModel:
     """Partition the fleet by platform and build the per-host NixOS modules the
     Nix renderer formats. Crosscuts dns + storage + services + native services,
@@ -751,11 +753,39 @@ def normalize_nixos(
         )
         for host in dns_model.hosts_by_platform("nixos")
     )
+    if flake_lock is not None:
+        _validate_flake_lock(flake_lock)
+
     return NixosModel(
         nixpkgs_ref=NIXPKGS_REF,
         hosts=hosts,
         installer_keys=dns_model.installer_keys,
+        flake_lock=flake_lock,
     )
+
+
+def _validate_flake_lock(flake_lock: str) -> None:
+    """Reject a lock that cannot pin the generated flake: unparseable, or
+    locking nixpkgs against a different ref than NIXPKGS_REF (a stale lock
+    would otherwise only fail at deploy time)."""
+    hint = "run 'medusactl lock-update' and commit the result"
+    try:
+        lock = json.loads(flake_lock)
+        node = lock["nodes"][lock["nodes"][lock["root"]]["inputs"]["nixpkgs"]]
+        original = node["original"]
+        locked_ref = (
+            f"{original['type']}:{original['owner']}/{original['repo']}"
+            f"/{original['ref']}"
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f"inventory/nixos/flake.lock is not a usable flake lock -- {hint}"
+        ) from error
+    if locked_ref != NIXPKGS_REF:
+        raise ValueError(
+            f"inventory/nixos/flake.lock pins nixpkgs to '{locked_ref}' but "
+            f"the generated flake wants '{NIXPKGS_REF}' -- {hint}"
+        )
 
 
 def normalize_native(

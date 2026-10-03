@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.40.2"
+VERSION="0.40.5"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -71,6 +71,7 @@ Usage:
     medusactl repin-target <name> [--ip <addr>]
     medusactl list-targets [--managed-only]
     medusactl build-installer
+    medusactl lock-update   (re-pin the NixOS flake inputs into inventory)
 
   Seat (controller):
     medusactl controller-status
@@ -417,6 +418,14 @@ summarize_failure_log() {
     printf "\n  full log: %s%s%s\n" "$color_blue" "$log" "$color_reset" >&2
 }
 
+# Anchors on the deploy plan's "nixos host '<name>' skipped (dormant)" lines.
+warn_dormant_targets() {
+    local log=$1 dormant
+    [[ -s "$log" ]] || return 0
+    dormant=$(sed -n "s/^nixos host '\(.*\)' skipped (dormant)\$/\1/p" "$log" | paste -sd, - | sed 's/,/, /g')
+    [[ -z "$dormant" ]] || warn "dormant targets not deployed: $dormant"
+}
+
 # Summarize a nixos-apply failure log: host / error / per-host recap / hint,
 # the same block shape as summarize_failure_log. Only named error lines are
 # surfaced — never a raw tail, except the no-structured-failure fallback.
@@ -535,7 +544,7 @@ spin_progress() {
 }
 
 run_logged() {
-    local name=$1 command=$2 target log remote
+    local name=$1 command=$2 display=${3:-$2} target log remote
     local -a ssh_opts
     target=$(ssh_target)
     log=$(log_path "$name")
@@ -545,8 +554,11 @@ run_logged() {
     printf "%s==>%s %s\n" "$color_blue" "$color_reset" "$name"
     printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
     printf "workdir: %s\n" "$MEDUSA_CONTROLLER_PATH"
-    printf "command: %s\n" "$command"
+    printf "command: %s\n" "$display"
     printf "log:    %s\n" "$log"
+    : >"$log"
+    # A display banner hides the executable string; the log keeps it.
+    [[ "$display" == "$command" ]] || printf "command: %s\n" "$command" >"$log"
 
     if [[ ! -t 0 ]]; then
         ssh_opts+=(-o BatchMode=yes)
@@ -566,7 +578,7 @@ run_logged() {
         local rc_file="${log}.rc"
         rm -f "$rc_file"
         {
-            if ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1; then
+            if ssh "${ssh_opts[@]}" "$target" "$remote" >>"$log" 2>&1; then
                 echo 0
             else
                 echo "$?"
@@ -578,7 +590,7 @@ run_logged() {
         rc=$(cat "$rc_file" 2>/dev/null || echo 1)
         rm -f "$rc_file"
     else
-        ssh "${ssh_opts[@]}" "$target" "$remote" >"$log" 2>&1 || rc=$?
+        ssh "${ssh_opts[@]}" "$target" "$remote" >>"$log" 2>&1 || rc=$?
     fi
 
     if [[ "$rc" -eq 0 ]]; then
@@ -764,6 +776,31 @@ cmd_controller_status() {
     printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
     printf "workdir: %s\n" "$MEDUSA_CONTROLLER_PATH"
     ssh "${ssh_opts[@]}" "$target" "$remote"
+}
+
+cmd_lock_update() {
+    # Re-resolve the generated flake's inputs on the seat and write the lock
+    # into the LOCAL inventory checkout; it takes effect once published.
+    load_config
+    require_local_inventory_dir
+    require_jq
+    local target remote lock dest="$MEDUSACTL_INVENTORY_DIR/inventory/nixos/flake.lock"
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
+    # Locking needs only the inputs, so flake.nix is locked alone in a scratch
+    # dir: the generated tree is never written.
+    remote=$(remote_command 'set -e; f="$MEDUSA_GENERATED_DIR/nixos/flake.nix"; [ -f "$f" ] || { echo "no rendered flake; run medusactl render first" >&2; exit 70; }; d=$(mktemp -d); trap "rm -rf $d" EXIT; cp "$f" "$d/"; (cd "$d" && nix --extra-experimental-features "nix-command flakes" flake update >&2); cat "$d/flake.lock"')
+    printf "%s==>%s lock-update\n" "$color_blue" "$color_reset"
+    printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
+    lock=$(ssh "${ssh_opts[@]}" "$target" "$remote") || fail "lock-update: could not lock the flake on the controller"
+    jq -e '.nodes.root' <<< "$lock" >/dev/null 2>&1 || fail "lock-update: the controller returned no usable flake lock"
+    mkdir -p "$(dirname "$dest")"
+    printf '%s\n' "$lock" > "$dest"
+    printf "%s✓%s lock-update: wrote %s\n" "$color_green" "$color_reset" "$dest"
+    jq -r '.nodes | to_entries[] | select(.value.locked.rev != null) | "  \(.key): \(.value.locked.rev[0:12]) (\(.value.locked.lastModified | strftime("%Y-%m-%d")))"' <<< "$lock"
+    info "review with 'medusactl diff', then 'medusactl publish \"...\"' and deploy"
 }
 
 cmd_diff() {
@@ -1065,7 +1102,8 @@ _compose_runtime_direct() {
     local inner="cd \"\$HOME/medusa-stacks/$(printf %q "$stack")\" && exec docker compose${dc_quoted}"
     local hostcmd="sudo -Hu medusa bash -c $(printf %q "$inner")"
     run_logged "compose-$action-${stack//\//-}" \
-        "ssh -o BatchMode=yes $(printf %q "$target_host") $(printf %q "$hostcmd")"
+        "ssh -o BatchMode=yes $(printf %q "$target_host") $(printf %q "$hostcmd")" \
+        "$target_host: docker compose ${dcargs[*]} [$stack]"
 }
 
 # Interactive compose passthrough (T-083). Runs `docker compose <verb>` on the
@@ -1383,6 +1421,10 @@ if ! command -v nixos-rebuild >/dev/null 2>&1; then
     echo "nixos-rebuild not found on controller; install Nix to reconcile NixOS hosts" >&2
     exit 70
 fi
+# The lock is inventory input, never written by a deploy; a rendered lock
+# must already satisfy the flake.
+lock_flags=(--no-write-lock-file)
+[[ ! -f "$MEDUSA_GENERATED_DIR/nixos/flake.lock" ]] || lock_flags=(--no-update-lock-file)
 rc=0
 while IFS=$'\t' read -r host target; do
     [[ -n "$host" ]] || continue
@@ -1401,7 +1443,7 @@ while IFS=$'\t' read -r host target; do
         elevate=()
         [[ "$(id -u)" -eq 0 ]] || elevate=(sudo -n)
         if ! "${elevate[@]}" nixos-rebuild "$ACTION" \
-            --flake "$MEDUSA_GENERATED_DIR/nixos#$host" < /dev/null; then
+            --flake "$MEDUSA_GENERATED_DIR/nixos#$host" "${lock_flags[@]}" < /dev/null; then
             echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
             echo "RESULT $host failed"
             rc=1
@@ -1441,7 +1483,7 @@ while IFS=$'\t' read -r host target; do
     if ! nixos-rebuild "$ACTION" \
         --flake "$MEDUSA_GENERATED_DIR/nixos#$host" \
         --target-host "$target" \
-        "${flags[@]}" < /dev/null; then
+        "${lock_flags[@]}" "${flags[@]}" < /dev/null; then
         echo "  ✗ $host: nixos-rebuild $ACTION failed" >&2
         # RESULT lines are the machine-readable per-host recap the workstation
         # formats — sturdier than regexing nix output for outcomes (T-088).
@@ -1504,6 +1546,7 @@ REMOTE
             || rc=${PIPESTATUS[0]}
     fi
     sanitize_log "$log"
+    [[ -n "$limit" ]] || warn_dormant_targets "$log"
     if [[ "$rc" -eq 0 ]]; then
         if [[ "$action" == "switch" ]]; then
             local ok_count skip_line
@@ -1649,7 +1692,8 @@ if ! command -v nix >/dev/null 2>&1; then
 fi
 echo "==> nix build installer ISO (first build downloads + compresses the live image; takes a while)"
 out=$(nix --extra-experimental-features 'nix-command flakes' build \
-    "$MEDUSA_GENERATED_DIR/nixos#installer" --print-out-paths --no-link)
+    "$MEDUSA_GENERATED_DIR/nixos#installer" --print-out-paths --no-link \
+    --no-write-lock-file)
 iso=$(find "$out/iso" -name '*.iso' | head -1)
 echo "ISO: $iso"
 echo "next: copy it to hypervisor ISO storage and boot new NixOS targets from it"
@@ -2204,7 +2248,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="status controller-status shell check render deploy compose add-target install-nixos-target build-installer remove-target promote-target list-targets repin-target update self-update completion ssh-disconnect undo history uninstall config version diff commit push publish discard"
+    commands="status controller-status shell check render deploy compose add-target install-nixos-target build-installer lock-update remove-target promote-target list-targets repin-target update self-update completion ssh-disconnect undo history uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -2675,6 +2719,9 @@ case "${1:-}" in
         # Internal: same, for a nixos-apply log (T-088).
         summarize_nixos_failure_log "${2:-}"
         ;;
+    __warn-dormant-targets)
+        warn_dormant_targets "${2:-}"
+        ;;
     status)
         shift
         cmd_status "$@"
@@ -2682,6 +2729,10 @@ case "${1:-}" in
     controller-status)
         shift
         cmd_controller_status "$@"
+        ;;
+    lock-update)
+        shift
+        cmd_lock_update "$@"
         ;;
     diff)
         shift

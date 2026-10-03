@@ -4,6 +4,7 @@ from enum import StrEnum
 from medusa.inventory.services import ServicesInventory
 from medusa.inventory.storage import StorageInventory
 from medusa.model.dns import DnsModel
+from medusa.model.nixos import NixosModel
 from medusa.model.services import ServicesModel
 from medusa.model.volumes import is_bind_source
 
@@ -76,6 +77,21 @@ def sops_recipient_diagnostics(
             f"(ssh-to-age) and set as age_recipient in inventory (T-080).",
         )
         for name in missing
+    )
+
+
+def flake_lock_diagnostics(nixos_model: NixosModel) -> tuple[Diagnostic, ...]:
+    """Warn when NixOS hosts exist but the inventory carries no flake lock:
+    every deploy then re-resolves the flake inputs to their newest revision."""
+    if not nixos_model.hosts or nixos_model.flake_lock is not None:
+        return ()
+    return (
+        Diagnostic(
+            Severity.WARNING,
+            "no inventory/nixos/flake.lock; the flake inputs (nixpkgs, disko) "
+            "are unpinned and re-resolve on every deploy. Run 'medusactl "
+            "lock-update' and commit the result.",
+        ),
     )
 
 

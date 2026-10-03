@@ -340,3 +340,6 @@ class NixosModel(BaseModel):
     # `packages.<system>.installer` output (`nix build <flake>#installer`).
     # One generic image serves every host -- it carries only these keys.
     installer_keys: tuple[str, ...] = ()
+    # Operator-committed lock (inventory/nixos/flake.lock), staged verbatim so
+    # deploys build against reviewed input revisions. None = inputs float.
+    flake_lock: str | None = None

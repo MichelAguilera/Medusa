@@ -14,6 +14,7 @@ from medusa.diagnostics import (
     Severity,
     diagnostic_errors,
     diagnostic_warnings,
+    flake_lock_diagnostics,
     service_diagnostics,
     sops_recipient_diagnostics,
     storage_diagnostics,
@@ -213,7 +214,9 @@ def _load_all(
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
         managed_hosts_model=managed_hosts_model,
+        flake_lock=_load_flake_lock(paths),
     )
+    on_diagnostics(flake_lock_diagnostics(nixos_model))
     sops_model = normalize_sops(
         dns_model,
         services_model,
@@ -239,6 +242,13 @@ def _load_all(
         nixos_model=nixos_model,
         sops_model=sops_model,
     )
+
+
+def _load_flake_lock(paths: ProjectPaths) -> str | None:
+    """Read the operator-committed lock (``inventory/nixos/flake.lock``) that
+    pins the generated flake's inputs; None when the inventory has none."""
+    path = paths.inventory_dir / "nixos" / "flake.lock"
+    return path.read_text(encoding="utf-8") if path.is_file() else None
 
 
 def _load_disko_sources(

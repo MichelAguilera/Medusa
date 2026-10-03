@@ -14,6 +14,8 @@ def render_nixos(
 
     - ``generated/nixos/flake.nix`` -- one shared flake pinning nixpkgs and
       exposing ``nixosConfigurations.<host>`` per NixOS host.
+    - ``generated/nixos/flake.lock`` -- the operator-committed lock, verbatim,
+      when the inventory carries one.
     - ``generated/nixos/hosts/<host>.nix`` -- the per-host module: hostname,
       systemd-networkd, storage ``fileSystems``, the compose substrate (docker,
       medusa user, sync + per-stack units), and the medusa-secrets unit.
@@ -40,6 +42,8 @@ def render_nixos(
             templates_dir, "nixos/flake.nix.j2", {"nixos": model}
         )
     }
+    if model.flake_lock is not None:
+        files[generated_dir / "nixos" / "flake.lock"] = model.flake_lock
     if model.installer_keys:
         # One generic installer image per fleet, carrying only the installer
         # keys (T-089).
