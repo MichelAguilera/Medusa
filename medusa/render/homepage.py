@@ -12,15 +12,14 @@ def render_homepage(
     if not homepage_model.hosts:
         return {}
 
-    services_yaml = render_template(
-        templates_dir,
-        "homepage/services.yaml.j2",
-        {"homepage": homepage_model},
-    )
     files: dict[Path, str] = {}
     for host in homepage_model.hosts:
         host_dir = generated_dir / "homepage" / host
-        files[host_dir / "services.yaml"] = services_yaml
+        files[host_dir / "services.yaml"] = render_template(
+            templates_dir,
+            "homepage/services.yaml.j2",
+            {"homepage": {"groups": homepage_model.groups_by_host.get(host, ())}},
+        )
         if homepage_model.settings is not None:
             files[host_dir / "settings.yaml"] = render_template(
                 templates_dir,

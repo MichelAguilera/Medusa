@@ -1984,7 +1984,6 @@ def normalize_homepage(
         formatted = ", ".join(unknown)
         raise ValueError(f"homepage references unknown hosts: {formatted}")
 
-    declared_order = [host.name for host in homepage_inventory.hosts]
     titles = {
         host.name: host.title or host.name
         for host in homepage_inventory.hosts
@@ -2001,28 +2000,26 @@ def normalize_homepage(
         order = service.homepage.order if service.homepage.order is not None else 0
         cards_by_host.setdefault(service.host, []).append((order, card.name, card))
 
-    declared_hosts_with_cards = [
-        host for host in declared_order if host in cards_by_host
-    ]
-    extra_hosts = sorted(set(cards_by_host) - set(declared_order))
-    ordered_hosts = declared_hosts_with_cards + extra_hosts
-
-    groups = tuple(
-        HomepageGroup(
-            host=host,
-            title=titles.get(host, host),
-            cards=tuple(
-                card for _, _, card in sorted(
-                    cards_by_host[host], key=lambda item: (item[0], item[1])
-                )
+    # Host-scoped (ADR, Inventory Modeling): an instance lists only its own
+    # host's cards.
+    groups_by_host = {
+        host: (
+            HomepageGroup(
+                host=host,
+                title=titles.get(host, host),
+                cards=tuple(
+                    card for _, _, card in sorted(
+                        cards, key=lambda item: (item[0], item[1])
+                    )
+                ),
             ),
         )
-        for host in ordered_hosts
-    )
+        for host, cards in sorted(cards_by_host.items())
+    }
 
     return HomepageModel(
         hosts=_platform_hosts_from_inventory(effective_services, {"homepage"}),
-        groups=groups,
+        groups_by_host=groups_by_host,
         settings=homepage_inventory.settings,
         bookmarks=(
             tuple(homepage_inventory.bookmarks)

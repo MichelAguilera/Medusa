@@ -22,7 +22,7 @@ class HomepageModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     hosts: tuple[str, ...]
-    groups: tuple[HomepageGroup, ...]
+    groups_by_host: dict[str, tuple[HomepageGroup, ...]]
     settings: dict[str, Any] | None
     bookmarks: tuple[Any, ...] | None
     widgets: tuple[Any, ...] | None
