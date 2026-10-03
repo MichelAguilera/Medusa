@@ -1,57 +1,32 @@
 # Medusa
 
-Homelab infrastructure source-of-truth and config generator. Model your
-homelab once in YAML, then generate runnable configs for CoreDNS,
-Traefik, Homepage, Docker Compose, monitoring, and NixOS hosts — and
-deploy them with `nixos-rebuild`.
+Medusa is a homelab infrastructure source-of-truth and config generator.
+You describe your hosts, DNS, services, storage, and secrets once in
+YAML, and Medusa generates the configuration that runs them: CoreDNS,
+Traefik, Homepage, Docker Compose stacks, monitoring, and NixOS host
+definitions.
 
-## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/MichelAguilera/Medusa/main/install.sh | bash
-```
-
-The installer bootstraps a controller (a small Debian LXC or VM that
-holds the rendered artifacts and runs the deploys) and can optionally
-install the `medusactl` workstation CLI. Run `medusactl --help` for the
-full command surface: inventory git porcelain (`status`, `diff`,
-`commit`, `push`), render/deploy (`check`, `render`, `deploy`,
-`nixos-apply`, `compose`), and target onboarding (`add-target`,
-`install-nixos-target`, `seed-target`).
-
-## Deploying
-
-Targets are NixOS hosts. `medusactl deploy` renders the inventory,
-refreshes the controller's `/etc/hosts` + SSH aliases
-(`controller-apply.yml`, the one Ansible playbook), then reconciles
-each host with `nixos-rebuild switch --flake` — with a hostname
-preflight that refuses to activate a configuration on the wrong
-machine. A first stand-up is `medusactl install-nixos-target`
-(nixos-anywhere + disko; the operator authors the disk layout).
-Compose remains the container layer: stacks are rendered per host,
-delivered by the flake, and driven at runtime with
-`medusactl compose <up|down|restart|pull|logs|ps|exec>` directly over
-SSH.
-
-## Layout
-
-This repo holds the **runnable code**: the `medusa` Python package, the
-`medusactl` workstation CLI, the controller bootstrap
-(`tools/bootstrap-controller.sh` + `ansible/`), and Jinja2 templates.
-Operator inventory (DNS, services, storage, secrets) lives in a
-separate private repo that you supply at bootstrap time; the demo
-`inventory/` here shows the expected shape.
-
-## Pipeline
+## How it works
 
 ```
 inventory YAML → validated model → normalized model → renderers → generated artifacts → nixos-rebuild
 ```
 
-- Human-authored: `inventory/` (in your inventory repo), `templates/`.
-- Generated: never committed to either repo; written to an XDG state dir
-  on the controller (`~/.local/state/medusa/generated` by default).
+- **Inventory** is the only thing you author by hand. It lives in your
+  own repo, separate from this one; the demo `inventory/` here shows the
+  expected shape.
+- **Validation and normalization** turn the YAML into typed models and
+  reject anything inconsistent before it reaches a host.
+- **Renderers** turn those models into per-host artifacts from Jinja2
+  templates. Generated files are never edited by hand.
+- **Deployment** reconciles each NixOS host against its rendered
+  configuration with `nixos-rebuild`. Containers stay on Docker Compose,
+  with each host receiving only its own stacks.
+
+This repo holds the runnable code: the `medusa` Python package, the
+`medusactl` workstation CLI, and the templates.
 
 ## Status
 
-This project is at an early stage and things may break. I do not recommend using it until a stable branch is released.
+Medusa is under fast-paced development. Documentation may be outdated,
+and things may break between releases.
