@@ -345,7 +345,7 @@ def normalize_network(dns_model: DnsModel) -> NetworkModel:
 
 # Pinned nixpkgs the generated flake builds against; exact rev frozen by
 # flake.lock (T-075).
-NIXPKGS_REF = "github:NixOS/nixpkgs/nixos-25.05"
+NIXPKGS_REF = "github:NixOS/nixpkgs/nixos-26.05"
 # Deliberately separate from NIXPKGS_REF: stateVersion is pinned at install and
 # must NOT move when the nixpkgs pin is bumped (it guards stateful defaults).
 # Per-host override: nixos_state_version (T-078).

@@ -164,6 +164,7 @@ def _load_all(
     paths: ProjectPaths,
     *,
     on_diagnostics: DiagnosticHandler = lambda _: None,
+    use_flake_lock: bool = True,
 ) -> _Inventory:
     dns_model = normalize_dns(parse_dns_inventory(load_yaml(paths.dns_inventory)))
     storage_inventory = parse_storage_inventory(
@@ -214,9 +215,10 @@ def _load_all(
         homepage_model=homepage_model,
         monitoring_model=monitoring_model,
         managed_hosts_model=managed_hosts_model,
-        flake_lock=_load_flake_lock(paths),
+        flake_lock=_load_flake_lock(paths) if use_flake_lock else None,
     )
-    on_diagnostics(flake_lock_diagnostics(nixos_model))
+    if use_flake_lock:
+        on_diagnostics(flake_lock_diagnostics(nixos_model))
     sops_model = normalize_sops(
         dns_model,
         services_model,
@@ -605,6 +607,26 @@ def nixos_deploy_plan(
         typer.echo(f"nixos host '{entry['name']}' {reason}", err=True)
     for entry in plan:
         typer.echo(f"{entry['name']}\t{entry['target']}")
+
+
+@app.command("nixos-flake", rich_help_panel=_PIPELINE_PANEL)
+def nixos_flake(root: Path | None = ROOT_OPTION) -> None:
+    """Print the generated flake.nix, ignoring any committed lock.
+
+    Consumed by `medusactl lock-update`: a lock for an older nixpkgs ref fails
+    every other command, so the flake to re-lock must be obtainable without
+    it. Prints nothing when the fleet has no NixOS hosts."""
+    paths = _paths(root)
+    try:
+        loaded = _load_all(
+            paths, on_diagnostics=lambda _: None, use_flake_lock=False
+        )
+    except (ValidationError, ValueError, NotImplementedError) as error:
+        _fail(str(error))
+    files = render_nixos(loaded.nixos_model, paths.templates_dir, paths.generated_dir)
+    flake = files.get(paths.generated_dir / "nixos" / "flake.nix")
+    if flake is not None:
+        typer.echo(flake, nl=False)
 
 
 @app.command("list-stacks", rich_help_panel=_PIPELINE_PANEL)

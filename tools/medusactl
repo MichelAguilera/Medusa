@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.40.5"
+VERSION="0.41.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -789,9 +789,9 @@ cmd_lock_update() {
     target=$(ssh_target)
     mapfile -t ssh_opts < <(ssh_base_opts)
     [[ -t 0 ]] || ssh_opts+=(-o BatchMode=yes)
-    # Locking needs only the inputs, so flake.nix is locked alone in a scratch
-    # dir: the generated tree is never written.
-    remote=$(remote_command 'set -e; f="$MEDUSA_GENERATED_DIR/nixos/flake.nix"; [ -f "$f" ] || { echo "no rendered flake; run medusactl render first" >&2; exit 70; }; d=$(mktemp -d); trap "rm -rf $d" EXIT; cp "$f" "$d/"; (cd "$d" && nix --extra-experimental-features "nix-command flakes" flake update >&2); cat "$d/flake.lock"')
+    # Locking needs only the inputs, so the flake is locked alone in a scratch
+    # dir, taken from nixos-flake so a lock for an older ref cannot block it.
+    remote=$(remote_command 'set -e; d=$(mktemp -d); trap "rm -rf $d" EXIT; uv run --quiet medusa nixos-flake > "$d/flake.nix"; [ -s "$d/flake.nix" ] || { echo "the fleet has no NixOS hosts; nothing to lock" >&2; exit 70; }; (cd "$d" && nix --extra-experimental-features "nix-command flakes" flake update >&2); cat "$d/flake.lock"')
     printf "%s==>%s lock-update\n" "$color_blue" "$color_reset"
     printf "remote:  %s:%s\n" "$target" "$MEDUSA_CONTROLLER_PORT"
     lock=$(ssh "${ssh_opts[@]}" "$target" "$remote") || fail "lock-update: could not lock the flake on the controller"
