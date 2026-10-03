@@ -80,6 +80,8 @@
   # neovim fleet-wide; git/uv/python312 are the seat toolchain (T-099) --
   # never a secrets recipient (T-080).
   environment.systemPackages = with pkgs; [ neovim git uv python312 ];
+  # python312's doc output does not build on nixos-26.05 (T-119).
+  documentation.doc.enable = false;
 {% else %}
   environment.systemPackages = with pkgs; [ neovim ];
 {% endif %}
