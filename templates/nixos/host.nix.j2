@@ -180,6 +180,8 @@
   boot.supportedFilesystems = [ "zfs" ];
   # Datasets carry their own mountpoints; the pool is not a fileSystems entry.
   boot.zfs.extraPools = [ "{{ host.nfs.zfs_pool }}" ];
+  # Never force an import past the in-use-elsewhere check.
+  boot.zfs.forceImportRoot = false;
   # ZFS module requires it; must be stable -- a changed hostid forces
   # `zpool import -f` (derived from the host name in normalize, T-096).
   networking.hostId = "{{ host.nfs.host_id }}";
