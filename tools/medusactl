@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.41.2"
+VERSION="0.42.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -686,34 +686,6 @@ check_workstation_dependencies() {
     command -v scp >/dev/null 2>&1 || fail "scp is required on the workstation"
 }
 
-controller_preflight() {
-    local target=$1 port=$2
-    info "Checking SSH connectivity..."
-    ssh -n "${SSH_CONFIG_OPTS[@]}" -p "$port" -o StrictHostKeyChecking=accept-new \
-        "$target" 'printf "controller-ssh-ok\n"' >/dev/null \
-        || fail "unable to connect to $target over SSH"
-
-    info "Checking controller prerequisites..."
-    ssh "${SSH_CONFIG_OPTS[@]}" -p "$port" -o StrictHostKeyChecking=accept-new "$target" 'bash -s' <<'REMOTE_PREFLIGHT' \
-        || fail "controller prerequisite check failed"
-set -euo pipefail
-command -v sh >/dev/null 2>&1 || { echo "missing sh" >&2; exit 10; }
-command -v bash >/dev/null 2>&1 || { echo "missing bash" >&2; exit 11; }
-command -v sudo >/dev/null 2>&1 || { echo "missing sudo" >&2; exit 12; }
-timeout 5 bash -c "</dev/tcp/1.1.1.1/80" >/dev/null 2>&1 || {
-    echo "no outbound IPv4 connectivity" >&2
-    exit 13
-}
-getent hosts deb.debian.org >/dev/null 2>&1 || {
-    echo "cannot resolve deb.debian.org" >&2
-    exit 14
-}
-sudo -n true >/dev/null 2>&1 || {
-    echo "sudo is present; controller bootstrap may prompt for the sudo password" >&2
-}
-REMOTE_PREFLIGHT
-}
-
 cmd_version() {
     printf "medusactl %s\n" "$VERSION"
 }
@@ -1069,9 +1041,8 @@ EOF
 # Fetch the rendered stack table from the controller: one tab-separated row
 # per stack, 'stack host services platform state'. Crosses the seam as the
 # typed `list-stacks --json` payload (T-099) and is flattened to TSV here so
-# downstream filters stay awk. The platform/state columns are what the
-# runtime-verb routing decides on (T-092); rows without platform=nixos are a
-# hard error since the ansible path retired (T-096).
+# downstream filters stay awk. The state column is what the runtime-verb
+# routing decides on (T-092).
 fetch_stacks() {
     local payload
     payload=$(remote_medusa_json list-stacks --json) || return 1
@@ -1144,7 +1115,7 @@ _compose_interactive() {
             ;;
     esac
 
-    # Inner script runs as the medusa runtime user. -H (not -i): the Debian
+    # Inner script runs as the medusa runtime user. -H (not -i): the
     # medusa user is a nologin system account, so a login shell (-i) dies with
     # "This account is currently not available"; -H still sets HOME to
     # medusa's home and `bash -c` runs regardless of the account shell.
@@ -1217,8 +1188,8 @@ Lifecycle verbs:
 Runtime routing (T-092): up/down/restart/pull resolve the stack on the
 controller first, then run 'docker compose' on its host directly over SSH
 (up->up -d, down->stop, restart->restart, pull->up -d --pull always) -- no
-clean-tree requirement, works mid-edit. The Debian ansible path was retired
-with T-096 phase 3; dormant hosts' stacks are skipped with a notice.
+clean-tree requirement, works mid-edit. Dormant hosts' stacks are skipped
+with a notice.
 
 Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
   logs      Stream a stack's logs (pass -f to follow, via -- ).
@@ -1226,12 +1197,11 @@ Interactive verbs (run 'docker compose' on the target host over SSH; T-083):
   exec      Run a command in a service's container (interactive TTY).
 
 Targeting:
-  [stack]            Lifecycle: act on one stack (its path under
-                     generated/compose/, e.g. 'media/immich'); omit for all.
+  [stack]            Lifecycle: act on one stack (its name in the inventory,
+                     e.g. 'media/immich'); omit for all.
                      Interactive verbs REQUIRE a <stack>. 'compose list' lists names.
   --service <name>   Act on one service within the stack (REQUIRED for exec).
-  --host <pattern>   Lifecycle: limit to docker hosts matching an Ansible pattern
-                     (direct NixOS path: exact host name).
+  --host <pattern>   Lifecycle: limit to the stack's host (exact host name).
                      Interactive: the host a stack lives on, when it is on >1 host.
   --pull             (up only) force an image re-pull on apply.
   -- <args...>       (interactive only) forward args verbatim to 'docker compose'.
@@ -1302,8 +1272,7 @@ EOF
     [[ "$action" == "up" && "$pull" -eq 1 ]] && direct_action=pull
 
     # T-092: resolve the target against the controller's stack table BEFORE
-    # dispatch. Only the direct NixOS path remains (the ansible plays retired
-    # with T-096 phase 3); a non-nixos row is a hard error, never a silent skip.
+    # dispatch.
     local stacks_tsv direct_failures=0
     stacks_tsv=$(fetch_stacks) \
         || fail "compose $action: 'medusa list-stacks' failed on the controller (is the controller updated? run 'medusactl update')"
@@ -1319,55 +1288,44 @@ EOF
             fail "compose $action: stack '$stack' is on multiple hosts; pass --host <name>:
 $(awk -F'\t' '{print "  " $2}' <<<"$matches")"
         fi
-        local row_host row_platform row_state
-        IFS=$'\t' read -r _ row_host _ row_platform row_state <<<"$matches"
-        [[ "$row_platform" == "nixos" ]] \
-            || fail "compose $action: '$stack' is on '$row_host' (platform '${row_platform:-?}'); the ansible compose path was retired with T-096 phase 3 — migrate the host to nixos or run docker compose there by hand"
+        local row_host row_state
+        IFS=$'\t' read -r _ row_host _ _ row_state <<<"$matches"
         [[ "$row_state" != "dormant" ]] || fail "compose $action: '$stack' is on '$row_host', which is declared dormant (T-091); wake it in dns.yaml first"
-        [[ "$action" != "up" ]] || info "nixos: starting '$stack' from the materialized generation (runtime only; config changes deliver via 'medusactl deploy')"
+        [[ "$action" != "up" ]] || info "starting '$stack' from the materialized generation (runtime only; config changes deliver via 'medusactl deploy')"
         _compose_runtime_direct "$direct_action" "$row_host" "$stack" "$service"
         return $?
     else
         # Fleet-wide. Dormant hosts' stacks are declared downtime (T-091):
-        # skipped with a notice, never an error. A surviving non-nixos row is
-        # a hard error — nothing can deliver to it anymore.
-        local nixos_rows legacy_rows dormant_rows
-        nixos_rows=$(awk -F'\t' '$4=="nixos" && $5!="dormant"' <<<"$stacks_tsv")
-        legacy_rows=$(awk -F'\t' '$4!="nixos" && $5!="dormant"' <<<"$stacks_tsv")
+        # skipped with a notice, never an error.
+        local active_rows dormant_rows
+        active_rows=$(awk -F'\t' '$5!="dormant"' <<<"$stacks_tsv")
         dormant_rows=$(awk -F'\t' '$5=="dormant"' <<<"$stacks_tsv")
-        if [[ -n "$legacy_rows" ]]; then
-            fail "compose $action: non-nixos stack(s) in the render; the ansible compose path was retired with T-096 phase 3:
-$(awk -F'\t' '{print "  " $1 " (" $2 ")"}' <<<"$legacy_rows")"
-        fi
         if [[ -n "$dormant_rows" ]]; then
             local d_stack d_host d_rest
             while IFS=$'\t' read -r d_stack d_host d_rest; do
                 info "skipping $d_stack ($d_host is dormant)"
             done <<<"$dormant_rows"
         fi
-        if [[ -n "$nixos_rows" ]]; then
+        if [[ -n "$active_rows" ]]; then
             local n_stack n_host n_rest
             while IFS=$'\t' read -r n_stack n_host n_rest; do
                 # </dev/null: the inner ssh must not eat the rows this loop
                 # is still reading from its own stdin.
                 _compose_runtime_direct "$direct_action" "$n_host" "$n_stack" "" </dev/null \
                     || direct_failures=$((direct_failures + 1))
-            done <<<"$nixos_rows"
+            done <<<"$active_rows"
         fi
         [[ "$direct_failures" -eq 0 ]] \
-            || fail "compose $action: $direct_failures NixOS-hosted stack(s) failed (see logs above)"
+            || fail "compose $action: $direct_failures stack(s) failed (see logs above)"
         return 0
     fi
 }
 
 # --- NixOS deploy dispatch (T-075) ------------------------------------------
 #
-# Beside (not replacing) the Ansible path. The fleet partition is the tested
-# `medusa nixos-deploy-plan` (Platform Fork Boundary, seam 2): one
-# `<host>\t<user@endpoint>` line per reconcilable NixOS host, empty for an
-# all-Debian fleet. NixOS atomic activation rolls a bad switch back to the
-# prior generation, so this path needs none of the Debian prove-then-consume
-# guards.
+# The fleet partition is the tested `medusa nixos-deploy-plan`: one
+# `<host>\t<user@endpoint>` line per reconcilable NixOS host. NixOS atomic
+# activation rolls a bad switch back to the prior generation.
 
 _nixos_apply_run() {
     # Shared SSH runner for the nixos-rebuild apply. $1 = action
@@ -1395,9 +1353,8 @@ fi
 if [[ -n "${LIMIT:-}" ]]; then
     # Restrict the reconcile to NixOS hosts named by the deploy --limit pattern.
     # Split on ',' and ':' into match tokens; keep a plan host if it matches a
-    # token via shell glob. Group names and negations (!foo, &foo) don't name a
-    # NixOS host so they simply won't match here — the Debian deploy still
-    # honors the full ansible pattern; target NixOS hosts by name or glob.
+    # token via shell glob. Negations (!foo, &foo) are ignored: target hosts by
+    # name or glob.
     IFS=',:' read -r -a _toks <<< "$LIMIT"
     filtered=""
     while IFS=$'\t' read -r host target; do

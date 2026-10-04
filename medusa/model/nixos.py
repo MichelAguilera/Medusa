@@ -38,8 +38,7 @@ class NixosController(BaseModel):
 
 class NixosNetwork(BaseModel):
     """Render-ready systemd-networkd config for a NixOS host. Derived from the
-    same dns.yaml inputs as the Debian systemd-networkd unit (interface, prefix,
-    gateway, nameservers) so both platforms agree on the host's canonical IP.
+    host's dns.yaml network block (interface, prefix, gateway, nameservers).
     ``address`` is the canonical ip joined with the prefix as CIDR. See T-074."""
 
     model_config = ConfigDict(frozen=True)
@@ -51,9 +50,8 @@ class NixosNetwork(BaseModel):
 
 
 class NixosMount(BaseModel):
-    """One ``fileSystems."<mountpoint>"`` entry. Mirrors the Debian managed
-    fstab region exactly -- same source, type, and options -- so a host's NFS
-    client mounts are identical whichever platform renders them (T-074)."""
+    """One ``fileSystems."<mountpoint>"`` entry: source, type, and options of
+    one of the host's NFS client mounts (T-074)."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -65,12 +63,11 @@ class NixosMount(BaseModel):
 
 class NixosTunnelClient(BaseModel):
     """Tunnel-routing client config for a NixOS host that runs `egress: tunnel`
-    services (T-087/D6; the T-066 mechanism). Same split policy routing as the
-    Debian tunnel_routing role: mark tunnel-subnet traffic, route LAN-bound
+    services (T-087/D6; the T-066 mechanism). Split policy routing: mark
+    tunnel-subnet traffic, route LAN-bound
     traffic direct, everything else into a table whose ONLY route is the
     default via the gateway (fail-closed: gateway down = drop, never a leak).
-    Values come from the resolved EgressGateway so both platforms route
-    identically."""
+    Values come from the resolved EgressGateway."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -117,13 +114,12 @@ class NixosNfsServer(BaseModel):
 
 
 class NixosStagedConfig(BaseModel):
-    """One per-host config artifact a Debian role would copy onto the host
-    (traefik dynamic config, homepage services config, prometheus targets),
-    staged into the flake tree instead (T-087 config-staging slice).
+    """One per-host config artifact (traefik dynamic config, homepage services
+    config, prometheus targets) staged into the flake tree (T-087
+    config-staging slice).
 
     ``source`` is the artifact's path under ``generated/``; the staging step
-    copies those exact bytes -- it never re-renders, so the file is
-    byte-identical to what the Debian role ships. ``dest`` is where the file
+    copies those exact bytes -- it never re-renders. ``dest`` is where the file
     materializes on the host, relative to the stack project dir (stack
     configs) or to the deploy root ``/home/medusa/medusa`` (deploy
     configs)."""
@@ -137,11 +133,10 @@ class NixosStagedConfig(BaseModel):
 class NixosStack(BaseModel):
     """One compose stack this NixOS host runs (T-087, compose-on-NixOS).
 
-    The compose file and env files are the SAME platform-neutral models the
-    Debian compose renderer consumes, formatted with the same templates and
-    staged into the flake tree (``generated/nixos/stacks/<host>/<name>/``);
-    on the host they sync to the Debian-identical stacks root and a per-stack
-    unit runs compose up. ``unit_suffix`` is the stack name made unit-safe
+    The compose file and env files are formatted with the compose templates
+    and staged into the flake tree (``generated/nixos/stacks/<host>/<name>/``);
+    on the host they sync to the stacks root and a per-stack unit runs compose
+    up. ``unit_suffix`` is the stack name made unit-safe
     (``media/immich`` -> ``media-immich``)."""
 
     model_config = ConfigDict(frozen=True)
@@ -151,8 +146,7 @@ class NixosStack(BaseModel):
     compose_file: ComposeFile
     env_files: tuple[GeneratedEnvFile, ...]
     # Resources declared `external: true` in the stack: `docker compose up`
-    # refuses to create them, so the stack unit pre-creates them idempotently
-    # (mirror of the Debian compose role's external-resources step).
+    # refuses to create them, so the stack unit pre-creates them idempotently.
     external_networks: tuple[str, ...]
     external_volumes: tuple[str, ...]
     # Per-host configs staged INTO this stack's tree (traefik/homepage): the
@@ -221,8 +215,7 @@ class NixosHost(BaseModel):
     # docker auto-create the missing source as a directory (mount failure).
     timezone: str | None = None
     # In-fleet registries served over plain HTTP behind the fleet proxy
-    # (image registry component matches a fleet route host). Debian hosts
-    # carry the same trust in daemon.json; here it renders to
+    # (image registry component matches a fleet route host); renders to
     # virtualisation.docker.daemon.settings."insecure-registries".
     insecure_registries: tuple[str, ...] = ()
     network: NixosNetwork | None
@@ -232,16 +225,15 @@ class NixosHost(BaseModel):
     # medusa runtime user, the stacks sync unit, and one unit per stack.
     stacks: tuple[NixosStack, ...]
     # Bind-mount data dirs under the stacks root for this host, created and
-    # owned before compose up (same derivation the Debian role consumes from
-    # compose-data-dirs.yaml; here they render to tmpfiles rules).
+    # owned before compose up; rendered as tmpfiles rules.
     data_dirs: tuple[ComposeDataDir, ...]
     # Shared WireGuard egress gateway (T-066 port): set when this host is the
     # resolved egress gateway. Mutually exclusive with stacks (dedicated
     # host). None everywhere else.
     egress_gateway: NixosEgressGateway | None = None
     # CoreDNS host (T-056 port): true when this host is the fleet's DNS
-    # resolver. Runs CoreDNS on the same generated Corefile + lan.hosts the
-    # Debian role deploys (byte-identical, staged in-generation).
+    # resolver. Runs CoreDNS on the generated Corefile + lan.hosts, staged
+    # in-generation.
     coredns: bool = False
     # Set when this host serves NFS exports (T-096); None everywhere else.
     nfs: NixosNfsServer | None = None
@@ -251,9 +243,8 @@ class NixosHost(BaseModel):
     # pre-create; stack units hard-require the tunnel units so a container
     # can never start before the fail-closed routing is in place.
     tunnel: NixosTunnelClient | None = None
-    # Per-host configs materialized under the deploy root /home/medusa/medusa,
-    # mirroring the Debian medusa_deploy_root destination. Empty for most
-    # hosts.
+    # Per-host configs materialized under the deploy root /home/medusa/medusa.
+    # Empty for most hosts.
     deploy_configs: tuple[NixosStagedConfig, ...] = ()
     # Host-side-decrypted secrets this host's services reference (T-087 port of
     # the T-080 seam). staged_secrets drives ciphertext staging + etc entries;
@@ -311,8 +302,8 @@ class NixosHost(BaseModel):
     # SSH endpoint for `nixos-rebuild switch --target-host`, as "<user>@<host>".
     # None when the host has no deploy_user (no managed SSH endpoint) -- such a
     # host can be rendered but not reconciled; the deploy plan warns and skips
-    # it. Derived in normalize_nixos so deploy dispatch stays model-driven
-    # (Platform Fork Boundary, seam 2). See T-075.
+    # it. Derived in normalize_nixos so deploy dispatch stays model-driven.
+    # See T-075.
     deploy_target: str | None
     # Declared expected downtime (T-091). The host still renders (its flake
     # config stays a complete picture of intent) but the deploy plan skips it

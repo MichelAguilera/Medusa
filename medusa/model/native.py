@@ -49,8 +49,8 @@ class NativeSftpService(BaseModel):
 
 class NativeModel(BaseModel):
     """Host-native daemons with users (T-076). Empty when no native service is
-    declared. A native service on a non-NixOS host is rejected in
-    ``normalize_native`` -- no Debian native renderer exists."""
+    declared. A native service on an unmanaged host is rejected in
+    ``normalize_native``."""
 
     model_config = ConfigDict(frozen=True)
 

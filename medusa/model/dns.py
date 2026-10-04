@@ -58,7 +58,7 @@ class HostRecord(BaseModel):
     # Deploy platform; None = unmanaged (no deploy engine, outside every
     # platform partition). Renderers partition on this; they never branch on
     # it themselves (renderer contract). See T-073/T-108.
-    platform: Literal["debian-docker", "nixos"] | None = None
+    platform: Literal["nixos"] | None = None
     # Lifecycle state (T-091). "dormant" = declared expected downtime: DNS
     # records and artifacts still render, but the host is excluded from every
     # deploy-facing output (ansible inventory/groups, nixos deploy plan,

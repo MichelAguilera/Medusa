@@ -157,11 +157,8 @@ class ServicesModel(BaseModel):
     services: tuple[ServiceRecord, ...]
     traefik: tuple[TraefikRoute, ...]
     traefik_routes_by_host: dict[str, tuple[TraefikRoute, ...]]
-    # Platform-neutral container layer (T-087): every docker-running host's
-    # compose files, regardless of platform. Rendered once to generated/compose/
-    # for all hosts (cloud-portable); NixOS hosts additionally get the same
-    # models staged into the flake by normalize_nixos/render_nixos. Only the
-    # SUBSTRATE forks per platform. See the Platform Fork Boundary ADR.
+    # Every docker-running host's compose files (T-087), staged into the
+    # flake per host by normalize_nixos/render_nixos.
     compose: tuple[ComposeFile, ...]
     env_files: tuple[GeneratedEnvFile, ...]
     data_dirs: tuple[ComposeDataDir, ...]

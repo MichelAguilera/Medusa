@@ -20,8 +20,8 @@ def render_nixos(
       systemd-networkd, storage ``fileSystems``, the compose substrate (docker,
       medusa user, sync + per-stack units), and the medusa-secrets unit.
     - ``generated/nixos/stacks/<host>/<stack>/…`` -- the host's compose stacks
-      staged into the flake tree (T-087), formatted with the SAME compose
-      templates/helpers the Debian path uses. Host-keyed because stack NAMES
+      staged into the flake tree (T-087), formatted with the compose templates.
+      Host-keyed because stack NAMES
       repeat across hosts; a name-keyed tree lets the last-rendered host
       clobber the others' staging.
     - ``generated/nixos/secrets-enc/…`` -- ciphertext staged verbatim
@@ -30,8 +30,8 @@ def render_nixos(
       the operator-authored layout (carried verbatim on the model as
       ``disko_source``) written into the flake root (T-078).
 
-    Nothing is emitted when no host is on the NixOS platform, so a pure-Debian
-    fleet renders no flake. The model is already fully derived by
+    Nothing is emitted when no host is on the NixOS platform. The model is
+    already fully derived by
     ``normalize_nixos``; this renderer only chooses paths and formats. See
     T-074, T-087."""
     if not model.hosts:
@@ -81,9 +81,8 @@ def stage_nixos_configs(
     the NixOS staging trees (T-087 config-staging slice; T-096 exports).
 
     Runs AFTER all renderers, over the assembled files dict: each staged config
-    names its source under ``generated/`` (the exact artifact the Debian role
-    ships) and the bytes are copied from the dict entry -- byte-identical to
-    the Debian delivery by construction, never re-rendered. Stack configs land
+    names its source under ``generated/`` and the bytes are copied from the
+    dict entry, never re-rendered. Stack configs land
     inside ``generated/nixos/stacks/<host>/<stack>/`` where the existing etc staging,
     sync unit, and restart triggers already cover them; deploy configs land in
     ``generated/nixos/deploy/<host>/`` for the host module's deploy-src block."""
@@ -119,7 +118,7 @@ def stage_nixos_configs(
     # Tunnel-routing client artifacts (T-087/D6): fleet-level, staged once.
     # A flake cannot reference paths outside its own tree, so the host module
     # interpolates these from generated/nixos/egress/ rather than reading
-    # generated/egress/ directly. Same bytes the Debian role deploys.
+    # generated/egress/ directly.
     if any(host.tunnel is not None for host in model.hosts):
         for artifact in ("tunnel-routing.nft", "tunnel-routes.sh"):
             source = generated_dir / "egress" / artifact
@@ -129,8 +128,8 @@ def stage_nixos_configs(
                     f"but a NixOS host runs tunneled services"
                 )
             files[generated_dir / "nixos" / "egress" / artifact] = files[source]
-    # CoreDNS artifacts (T-056 port): the Corefile + lan.hosts the Debian role
-    # deploys to /etc/coredns, staged for the DNS host's module. Same bytes.
+    # CoreDNS artifacts (T-056): the Corefile + lan.hosts, staged for the DNS
+    # host's module.
     if any(host.coredns for host in model.hosts):
         for artifact in ("Corefile", "lan.hosts"):
             source = generated_dir / "coredns" / artifact
@@ -140,9 +139,8 @@ def stage_nixos_configs(
                     f"but a NixOS host serves CoreDNS"
                 )
             files[generated_dir / "nixos" / "coredns" / artifact] = files[source]
-    # NFS exports artifact (T-096, nfs_exports role port): the exports file
-    # the Debian role deploys to /etc/exports, staged for the server host's
-    # module to readFile. Same bytes.
+    # NFS exports artifact (T-096): the exports file, staged for the server
+    # host's module to readFile.
     for host in model.hosts:
         if host.nfs is None:
             continue
@@ -156,9 +154,9 @@ def stage_nixos_configs(
         files[
             generated_dir / "nixos" / "storage" / host.name / "medusa.exports"
         ] = files[source]
-    # Egress gateway artifacts (T-066 port): the NAT + kill-switch ruleset and
-    # split-DNS resolver config the Debian wireguard_gateway role deploys,
-    # staged for the gateway host's module to interpolate. Same bytes.
+    # Egress gateway artifacts (T-066): the NAT + kill-switch ruleset and
+    # split-DNS resolver config, staged for the gateway host's module to
+    # interpolate.
     for host in model.hosts:
         if host.egress_gateway is None:
             continue

@@ -9,20 +9,10 @@ def render_egress(
     templates_dir: Path,
     generated_dir: Path,
 ) -> dict[Path, str]:
-    """Render the egress manifest (always) plus, when a gateway is configured,
-    its split-DNS resolver config. The manifest drives the WireGuard gateway
-    role and the host-routing role; the resolver config is deployed onto the
-    gateway host. See T-066."""
-    files: dict[Path, str] = {
-        generated_dir / "egress-manifest.yaml": render_template(
-            templates_dir,
-            "compose/egress-manifest.yaml.j2",
-            {
-                "egress": model.egress,
-                "tunnel_services_by_host": model.tunnel_services_by_host,
-            },
-        )
-    }
+    """Render the egress gateway's firewall and split-DNS resolver config and
+    the tunnel-routing artifacts for hosts running tunnelled services; nothing
+    when no gateway is configured. See T-066."""
+    files: dict[Path, str] = {}
     if model.egress is not None:
         ctx = {"egress": model.egress}
         gateway_dir = generated_dir / "egress" / model.egress.gateway
@@ -34,8 +24,7 @@ def render_egress(
             templates_dir, "egress/nftables.conf.j2", ctx
         )
         # Docker-host routing artifacts (host-agnostic: keyed on subnets, not a
-        # specific host). The tunnel_routing role deploys these to every host
-        # running a tunneled service.
+        # specific host), staged to every host running a tunneled service.
         egress_dir = generated_dir / "egress"
         files[egress_dir / "tunnel-routing.nft"] = render_template(
             templates_dir, "egress/tunnel-routing.nft.j2", ctx

@@ -76,7 +76,7 @@ class HostFields:
     deploy_user: str | None = None
     # Written only alongside deploy_user: a managed host must claim its
     # deploy engine (T-108); an unmanaged record carries no platform.
-    platform: Literal["debian-docker", "nixos"] | None = None
+    platform: Literal["nixos"] | None = None
     bootstrap_ip: str | None = None
     # Managed static-networking opt-in + optional per-host override. Unset
     # override fields fall back to the global `network:` defaults at

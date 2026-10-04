@@ -36,7 +36,6 @@ from medusa.model.native import (
     NativeSftpShare,
     NativeSftpUser,
 )
-from medusa.model.network import NetworkHost, NetworkModel
 from medusa.model.nixos import (
     NixosController,
     NixosHost,
@@ -321,28 +320,6 @@ def validate_dormant_dependencies(
         )
 
 
-def normalize_network(dns_model: DnsModel) -> NetworkModel:
-    """Build the static-networking model from hosts that opted in
-    (``manage_network: true``, surfaced as ``HostRecord.network``). The
-    canonical ip and prefix are joined into a CIDR ``address`` here so the
-    renderer/template only formats. Hosts that did not opt in contribute
-    nothing; the model is empty when none did. See T-055."""
-    return NetworkModel(
-        hosts=tuple(
-            NetworkHost(
-                name=host.name,
-                ip=host.ip,
-                address=f"{host.ip}/{host.network.prefix}",
-                interface=host.network.interface,
-                gateway=host.network.gateway,
-                nameservers=host.network.nameservers,
-            )
-            for host in dns_model.hosts
-            if host.network is not None
-        )
-    )
-
-
 # Pinned nixpkgs the generated flake builds against; exact rev frozen by
 # flake.lock (T-075).
 NIXPKGS_REF = "github:NixOS/nixpkgs/nixos-26.05"
@@ -382,7 +359,7 @@ def normalize_nixos(
 
     # Tunnel-routing client (T-087/D6): a NixOS host running `egress: tunnel`
     # services gets nft marking + fail-closed policy routing, derived from the
-    # same resolved EgressGateway the Debian tunnel_routing role consumes.
+    # resolved EgressGateway.
     tunnel_by_host: dict[str, NixosTunnelClient] = {}
     for host_name in services_model.tunnel_services_by_host:
         if host_name not in nixos_names:
@@ -407,8 +384,7 @@ def normalize_nixos(
     coredns_hosts = _platform_hosts(services_model, {"coredns"}) or tuple(
         host.name for host in dns_model.hosts if host.name == "coredns"
     )
-    # CoreDNS on NixOS (T-056 port): same generated Corefile + lan.hosts the
-    # Debian role deployed.
+    # CoreDNS on NixOS (T-056): runs on the generated Corefile + lan.hosts.
     nixos_coredns_hosts = {
         name for name in coredns_hosts if name in nixos_names
     }
@@ -473,8 +449,7 @@ def normalize_nixos(
 
     # Shared WireGuard egress gateway (T-066 port). The T-080 seam already
     # routes the gateway's WireGuard secret here, so staged_secrets need no
-    # special-casing. The dedicated-host contract the Debian role only
-    # documents is ENFORCED here: the kill-switch forward chain (policy drop)
+    # special-casing. The dedicated-host contract is ENFORCED here: the kill-switch forward chain (policy drop)
     # would silently break a co-located stack's forwarded traffic.
     egress_gateway_by_host: dict[str, NixosEgressGateway] = {}
     egress = services_model.egress
@@ -517,11 +492,10 @@ def normalize_nixos(
         if registries:
             insecure_registries_by_host[host_name] = tuple(sorted(registries))
 
-    # Config staging (T-087): the per-host artifacts the Debian roles copy
-    # onto the host ride the flake tree instead -- same rendered bytes, never
+    # Config staging (T-087): the per-host artifacts ride the flake tree --
+    # the rendered bytes, never
     # re-rendered. traefik/homepage stage into the stack tree (the containers
-    # bind them relatively); prometheus targets mirror the Debian deploy-root
-    # destination. Host derivations mirror the managed-hosts builder (service
+    # bind them relatively); prometheus targets land under the deploy root. Host derivations mirror the managed-hosts builder (service
     # NAME), so a host migrating platforms keeps the same delivery set.
     def _stack_with_service(host_name: str, service_name: str) -> str:
         for stack in stacks_by_host.get(host_name, ()):
@@ -547,7 +521,7 @@ def normalize_nixos(
             raise ValueError(
                 f"host '{host_name}' declares proxy engine '{engine}' but "
                 f"only traefik has a NixOS config delivery path -- keep this "
-                f"host on debian until that engine is ported (T-087)"
+                f"host on traefik until that engine is ported (T-087)"
             )
         if engine == "traefik":
             stack_name = _stack_with_service(host_name, "traefik")
@@ -794,8 +768,8 @@ def normalize_native(
     storage_model: StorageModel,
 ) -> NativeModel:
     """Validate + derive host-native services (currently SFTP; T-076). A native
-    service must target a ``platform: nixos`` host -- no Debian native-service
-    renderer exists, so other targets are rejected with a clear diagnostic.
+    service must target a ``platform: nixos`` host; other targets are rejected
+    with a clear diagnostic.
     Each user's storage ref resolves against storage.yaml and must sit under
     the derived, root-owned chroot (OpenSSH correctness). Authorized keys are
     public-key material carried verbatim as plain inventory data (T-078)."""
@@ -813,8 +787,8 @@ def normalize_native(
         if not host.is_nixos:
             raise ValueError(
                 f"native service '{service.type}' on host '{service.host}' "
-                f"requires platform: nixos (no Debian native-service renderer "
-                f"exists). Move the host to NixOS or drop the native service."
+                f"requires platform: nixos. Set the platform on the host or "
+                f"drop the native service."
             )
 
         host_mounts = {mount.id: mount for mount in mounts_by_host.get(service.host, ())}
@@ -929,8 +903,7 @@ def normalize_native(
 def _nixos_deploy_target(host: HostRecord) -> str | None:
     """SSH endpoint for `nixos-rebuild --target-host`, "<user>@<host>". None when
     the host has no managed SSH user (renderable but not reconcilable). Uses the
-    canonical fqdn so the controller reaches it the same way Ansible reaches
-    Debian hosts; falls back to the ip when no fqdn is declared. See T-075."""
+    canonical fqdn; falls back to the ip when no fqdn is declared. See T-075."""
     if host.deploy_user is None:
         return None
     endpoint = host.fqdns[0] if host.fqdns else host.ip
@@ -959,10 +932,9 @@ def _nixos_secrets_by_host(
     secret_ciphertexts: dict[str, str],
 ) -> dict[str, tuple]:
     """Reshape SecretSource records into the render-ready host-side-decryption
-    shapes (T-087): staged ciphertexts, env files grouped by destination (the
-    grouping the Debian decrypt script template does with Ansible vars), and
+    shapes (T-087): staged ciphertexts, env files grouped by destination, and
     whole-file secrets. Owner maps here: "service" -> the medusa runtime user,
-    "system" -> root (same mapping as the Debian secrets role)."""
+    "system" -> root."""
     by_host: dict[str, tuple] = {}
     for host in sorted({s.host for s in services_model.secret_sources}):
         if host not in nixos_names:
@@ -1021,8 +993,7 @@ def _nixos_secrets_by_host(
 def _external_names(resources: dict) -> tuple[str, ...]:
     """Names of stack-level networks/volumes declared ``external: true``.
 
-    Same discovery the Debian compose role performs on the rendered files;
-    derived here from the model so the NixOS stack unit's pre-create step stays
+    Derived from the model so the NixOS stack unit's pre-create step stays
     template-formatting only."""
     return tuple(
         sorted(
@@ -1307,25 +1278,6 @@ def normalize_services(
         raise ValueError(
             f"services target unmanaged hosts (no platform): {formatted}. "
             f"Set platform on the host record or move the services."
-        )
-
-    # A stack whose services straddle a Debian and a NixOS host has no
-    # coherent output target; reject it (T-073).
-    stack_platforms: dict[str, set[str]] = {}
-    for service in services:
-        if service.stack is None:
-            continue
-        stack_platforms.setdefault(service.stack, set()).add(
-            platform_by_host[service.host]
-        )
-    cross_platform = sorted(
-        stack for stack, platforms in stack_platforms.items() if len(platforms) > 1
-    )
-    if cross_platform:
-        formatted = ", ".join(cross_platform)
-        raise ValueError(
-            f"stacks span multiple host platforms (debian-docker + nixos): "
-            f"{formatted}. Split the stack so each stays on one platform."
         )
 
     mount_index = validate_service_mount_refs(services, storage_model)

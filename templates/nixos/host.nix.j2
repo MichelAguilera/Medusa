@@ -120,11 +120,11 @@
 {% if host.stacks %}
 
   # ---- Compose-on-NixOS (T-087) ---------------------------------------------
-  # The SAME generated stacks a Debian host runs; the docker daemon supervises
+  # The docker daemon supervises
   # containers (restart policies) -- the units below only reconcile.
   virtualisation.docker.enable = true;
 {% if host.insecure_registries %}
-  # In-fleet plain-HTTP registries; same trust Debian carries in daemon.json.
+  # In-fleet plain-HTTP registries.
   virtualisation.docker.daemon.settings."insecure-registries" = [{% for reg in host.insecure_registries %} "{{ reg }}"{% endfor %} ];
 {% endif %}
 {% if host.tunnel %}
@@ -133,7 +133,7 @@
   # Fail-closed split routing for `egress: tunnel` containers: gateway down =
   # drop, never a leak out the main default route. The asymmetric return path
   # needs loose reverse-path filtering -- both in the firewall's own check and
-  # the sysctls -- or marked flows are dropped (Debian role parity).
+  # the sysctls -- or marked flows are dropped.
   networking.firewall.checkReversePath = "loose";
   boot.kernel.sysctl = {
     "net.ipv4.conf.all.rp_filter" = 2;
@@ -141,7 +141,7 @@
   };
 {% endif %}
 
-  # medusa owns the stacks tree and runs compose (Debian-fleet parity);
+  # medusa owns the stacks tree and runs compose;
   # docker-group membership grants the socket.
   users.groups.medusa = { };
   users.users.medusa = {
@@ -159,7 +159,7 @@
   # ---- Shared WireGuard egress gateway (T-066, wireguard_gateway port) ------
   # Reverse-path checking off: return traffic arrives on
   # {{ host.egress_gateway.interface }} while the main table routes those
-  # sources via the LAN uplink (Debian rp_filter=0 parity, not a loosening).
+  # sources via the LAN uplink.
   boot.kernel.sysctl."net.ipv4.ip_forward" = 1;
   networking.firewall.checkReversePath = false;
 {% endif %}
@@ -174,8 +174,8 @@
 {% if host.nfs %}
 
   # ---- NFS export server (T-096) --------------------------------------------
-  # nfsd on the same generated exports file the Debian role ships to
-  # /etc/exports, staged byte-identical (the CoreDNS precedent).
+  # nfsd on the generated exports file, staged in-generation (the CoreDNS
+  # precedent).
 {% if host.nfs.zfs_pool %}
   boot.supportedFilesystems = [ "zfs" ];
   # Datasets carry their own mountpoints; the pool is not a fileSystems entry.
@@ -204,7 +204,7 @@
 {% if host.stacks or host.staged_secrets or host.deploy_configs or host.coredns %}
 
   # Staged in-generation: the sync unit materializes these into the writable
-  # Debian-identical tree at /home/medusa/medusa-stacks, so a rollback re-syncs
+  # tree at /home/medusa/medusa-stacks, so a rollback re-syncs
   # the previous generation's config.
   environment.etc = {
 {% if host.coredns %}
@@ -372,8 +372,7 @@
       };
     };
 
-    # The same generated script Debian installs at
-    # /usr/local/sbin/medusa-tunnel-routes.sh (fail-closed by construction).
+    # The generated tunnel-routes script (fail-closed by construction).
     medusa-tunnel-routes = {
       description = "Medusa tunnel policy routing";
       wantedBy = [ "multi-user.target" ];
@@ -433,7 +432,6 @@
         done
 {% endif %}
 {% if host.deploy_configs %}
-        # Same tree + modes as the Debian monitoring role.
         install -d -o medusa -g medusa -m 2775 /home/medusa/medusa
 {% for cfg in host.deploy_configs %}
         install -d -o medusa -g medusa -m 2775 "/home/medusa/medusa/{{ cfg.dest.rsplit('/', 1)[0] }}"
@@ -452,7 +450,7 @@
       wants = [ "network-online.target" ];
       restartTriggers = [ ../stacks/{{ host.name }}/{{ stack.name }} ];
       # Deploy users never get docker-group (root-equivalent) access; only
-      # medusa runs compose (Debian parity).
+      # medusa runs compose.
       serviceConfig = {
         Type = "oneshot";
         RemainAfterExit = true;
@@ -487,7 +485,7 @@
 
     # Decrypts with the host's own ssh host key (ssh-to-age): the controller
     # never sees plaintext; tmpfs is wiped on reboot and the unit re-runs.
-    # Destinations match Debian so compose references one path (T-080/T-087).
+    # Compose references these destinations by one fixed path (T-080/T-087).
     medusa-secrets = {
       description = "Decrypt Medusa secrets to tmpfs";
       wantedBy = [ "multi-user.target" ];

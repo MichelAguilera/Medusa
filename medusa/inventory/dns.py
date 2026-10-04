@@ -244,12 +244,9 @@ class HostInventory(BaseModel):
     # routing. Proxy hosts get a wildcard automatically regardless.
     wildcard: bool = False
     # Deploy platform (T-073). "nixos" renders to a Nix module/flake driven by
-    # nixos-rebuild (T-074/T-075); "debian-docker" is the legacy Compose +
-    # fstab render path. Unset = unmanaged: no deploy engine, no platform
-    # partition — a record must claim its platform explicitly to be
-    # deployable (T-108; the old debian-docker default let bare records
-    # silently claim a platform they never ran).
-    platform: Literal["debian-docker", "nixos"] | None = None
+    # nixos-rebuild (T-074/T-075). Unset = unmanaged: no deploy engine — a
+    # record must claim its platform explicitly to be deployable (T-108).
+    platform: Literal["nixos"] | None = None
     # Host lifecycle state (T-091). "dormant" declares expected downtime: DNS
     # records and artifacts still render, but deploy dispatch skips the host
     # and the deploy stays green. Downtime is DECLARED here, never detected at
@@ -380,8 +377,8 @@ class HostInventory(BaseModel):
 
     @model_validator(mode="after")
     def validate_nixos_guest_options(self) -> Self:
-        # nixos_guest / nixos_disko are nixos-only knobs; reject them on debian
-        # hosts so a misplaced field is a loud error, not a silent no-op.
+        # nixos_guest / nixos_disko are nixos-only knobs; reject them on
+        # unmanaged hosts so a misplaced field is a loud error, not a silent no-op.
         if self.platform != "nixos":
             if self.nixos_disko:
                 raise ValueError(

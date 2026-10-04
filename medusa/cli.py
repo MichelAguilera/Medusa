@@ -61,7 +61,6 @@ from medusa.model.homepage import HomepageModel
 from medusa.model.hosts import ManagedHostsModel
 from medusa.model.monitoring import MonitoringModel
 from medusa.model.native import NativeModel
-from medusa.model.network import NetworkModel
 from medusa.model.nixos import NixosModel
 from medusa.model.normalize import (
     normalize_managed_hosts,
@@ -71,7 +70,6 @@ from medusa.model.normalize import (
     resolve_auth_secrets,
     normalize_monitoring,
     normalize_native,
-    normalize_network,
     normalize_nixos,
     normalize_services,
     normalize_sops,
@@ -84,13 +82,11 @@ from medusa.model.storage import StorageModel
 from medusa.paths import ProjectPaths
 from medusa.render.auth import render_auth
 from medusa.render.caddy import render_caddy
-from medusa.render.compose import render_compose
 from medusa.render.egress import render_egress
 from medusa.render.coredns import render_coredns
 from medusa.render.docs import render_docs
 from medusa.render.homepage import render_homepage
 from medusa.render.monitoring import render_monitoring
-from medusa.render.network import render_network
 from medusa.render.nginx import render_nginx
 from medusa.render.nixos import render_nixos, stage_nixos_configs
 from medusa.render.secrets import render_secrets_manifest
@@ -139,7 +135,6 @@ class _Inventory:
     monitoring_model: MonitoringModel
     coredns_model: CorednsModel
     managed_hosts_model: ManagedHostsModel
-    network_model: NetworkModel
     native_model: NativeModel
     nixos_model: NixosModel
     sops_model: SopsConfigModel
@@ -199,7 +194,6 @@ def _load_all(
     )
     coredns_model = normalize_coredns(dns_model, services_model)
     managed_hosts_model = normalize_managed_hosts(dns_model)
-    network_model = normalize_network(dns_model)
     native_model = normalize_native(
         parse_native_inventory(load_optional_yaml(paths.native_inventory)),
         dns_model,
@@ -239,7 +233,6 @@ def _load_all(
         monitoring_model=monitoring_model,
         coredns_model=coredns_model,
         managed_hosts_model=managed_hosts_model,
-        network_model=network_model,
         native_model=native_model,
         nixos_model=nixos_model,
         sops_model=sops_model,
@@ -342,13 +335,11 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         **render_auth(services_model, templates_dir, generated_dir),
         **render_caddy(services_model, templates_dir, generated_dir),
         **render_nginx(services_model, templates_dir, generated_dir),
-        **render_compose(services_model, templates_dir, generated_dir),
         **render_egress(services_model, templates_dir, generated_dir),
         **render_monitoring(loaded.monitoring_model, templates_dir, generated_dir),
         **render_secrets_manifest(services_model, templates_dir, generated_dir),
         **render_sops_config(loaded.sops_model, templates_dir, generated_dir),
         **render_storage_manifest(loaded.storage_model, templates_dir, generated_dir),
-        **render_network(loaded.network_model, templates_dir, generated_dir),
         **render_nixos(loaded.nixos_model, templates_dir, generated_dir),
         **render_docs(
             loaded.dns_model,
@@ -359,8 +350,7 @@ def _render(loaded: _Inventory) -> dict[Path, str]:
         ),
     }
     # Copy the per-host traefik/homepage/monitoring artifacts into the NixOS
-    # staging trees from the entries above -- byte-identical to what the
-    # Debian roles ship, by construction (T-087 config-staging slice).
+    # staging trees from the entries above (T-087 config-staging slice).
     stage_nixos_configs(files, loaded.nixos_model, generated_dir)
     return files
 
@@ -568,9 +558,8 @@ def nixos_deploy_plan(
     the seat switches itself locally (it cannot --target-host itself, T-099)
     and takes the slot controller-apply held, before the fleet reconcile.
     Hosts with no deploy_user are warned to stderr and skipped. Prints
-    nothing (exit 0) when the fleet has no NixOS hosts, so a pure-Debian
-    deploy is a no-op. This is deploy dispatch seam 2 of the Platform Fork
-    Boundary; medusactl composes the invocation from these lines. See T-075.
+    nothing (exit 0) when the fleet has no NixOS hosts. medusactl composes
+    the invocation from these lines. See T-075.
     """
     paths = _paths(root)
     try:
@@ -637,12 +626,11 @@ def list_stacks_cmd(
     """List rendered Compose stacks, one per line.
 
     Tab-separated ``<stack>\\t<host>\\t<svc,svc,...>\\t<platform>\\t<state>``.
-    ``<stack>`` is the stack's path under generated/compose/ — the identity
+    ``<stack>`` is the stack's inventory name — the identity
     ``medusactl compose <verb> <stack>`` targets — falling back to the host
-    name for a stackless service group. Every platform's stacks are listed
-    (T-087): NixOS hosts' stacks deploy through the flake, and the compose
-    verbs resolve stack->host from this output to reach them over SSH; the
-    platform/state columns are what medusactl routes on (T-092). See T-082.
+    name for a stackless service group. The compose verbs resolve
+    stack->host from this output to reach hosts over SSH; the state column
+    is what medusactl routes on (T-092). See T-082.
     """
     paths = _paths(root)
     try:

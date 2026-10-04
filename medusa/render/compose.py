@@ -3,67 +3,8 @@ from pathlib import Path
 from medusa.model.services import (
     ComposeFile,
     GeneratedEnvFile,
-    ServicesModel,
 )
 from medusa.render.templates import render_template
-
-
-def render_compose(
-    model: ServicesModel,
-    templates_dir: Path,
-    generated_dir: Path,
-) -> dict[Path, str]:
-    compose_files = {
-        _compose_path(generated_dir, compose_file): _render_compose_file(
-            compose_file, templates_dir
-        )
-        for compose_file in model.compose
-    }
-    env_files = {
-        _env_file_path(generated_dir, env_file): _render_env_file(env_file)
-        for env_file in model.env_files
-    }
-    data_dirs = {
-        generated_dir / "compose-data-dirs.yaml": render_template(
-            templates_dir,
-            "compose/data-dirs.yaml.j2",
-            {"data_dirs": model.data_dirs},
-        )
-    }
-    # Stack->host manifest: generated/compose/ now carries every platform's
-    # stacks (T-087), so the Debian role needs to know which are its own.
-    # Sorted purely for stable output.
-    stacks = {
-        generated_dir / "compose-stacks.yaml": render_template(
-            templates_dir,
-            "compose/stacks.yaml.j2",
-            {
-                "stacks": sorted(
-                    (
-                        {"stack": c.stack, "host": c.host}
-                        for c in model.compose
-                        if c.stack is not None
-                    ),
-                    key=lambda item: item["stack"],
-                )
-            },
-        )
-    }
-    return {**compose_files, **env_files, **data_dirs, **stacks}
-
-
-def _compose_path(generated_dir: Path, compose_file: ComposeFile) -> Path:
-    if compose_file.stack is None:
-        return generated_dir / "compose" / f"{compose_file.host}.yaml"
-
-    return generated_dir / "compose" / compose_file.stack / "docker-compose.yml"
-
-
-def _env_file_path(generated_dir: Path, env_file: GeneratedEnvFile) -> Path:
-    if env_file.stack is None:
-        return generated_dir / "compose" / env_file.host / env_file.path
-
-    return generated_dir / "compose" / env_file.stack / env_file.path
 
 
 def _render_env_file(env_file: GeneratedEnvFile) -> str:
