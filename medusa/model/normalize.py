@@ -29,7 +29,12 @@ from medusa.model.coredns import CorednsModel
 from medusa.model.dns import DnsModel, DnsZone, HostNetwork, HostRecord
 from medusa.model.homepage import HomepageCard, HomepageGroup, HomepageModel
 from medusa.model.hosts import BootstrapHost, ManagedHost, ManagedHostsModel
-from medusa.model.monitoring import MonitoringModel, MonitoringTarget
+from medusa.model.monitoring import (
+    NODE_EXPORTER_PORT,
+    MonitoringJob,
+    MonitoringModel,
+    MonitoringTarget,
+)
 from medusa.model.native import (
     NativeModel,
     NativeSftpService,
@@ -548,6 +553,14 @@ def normalize_nixos(
                     dest="homepage/config/services.yaml",
                 )
             )
+        if monitoring_model and host_name in monitoring_model.datasource_hosts:
+            stack_name = _stack_with_service(host_name, "grafana")
+            stack_configs.setdefault((host_name, stack_name), []).append(
+                NixosStagedConfig(
+                    source=f"monitoring/{host_name}/grafana-datasources.yaml",
+                    dest="grafana/provisioning/datasources/medusa.yaml",
+                )
+            )
         if host_name in monitoring_hosts:
             deploy_configs_by_host.setdefault(host_name, []).append(
                 NixosStagedConfig(
@@ -698,6 +711,7 @@ def normalize_nixos(
             data_dirs=tuple(data_dirs_by_host.get(host.name, ())),
             egress_gateway=egress_gateway_by_host.get(host.name),
             coredns=host.name in nixos_coredns_hosts,
+            node_exporter_port=NODE_EXPORTER_PORT,
             nfs=nfs_by_host.get(host.name),
             tunnel=tunnel_by_host.get(host.name),
             deploy_configs=tuple(deploy_configs_by_host.get(host.name, ())),
@@ -2054,14 +2068,14 @@ def _build_homepage_card(service, zones: dict[str, DnsZone]) -> HomepageCard:
 def normalize_monitoring(
     services_inventory: ServicesInventory,
     dormant_hosts: frozenset[str] = frozenset(),
+    dns_model: DnsModel | None = None,
 ) -> MonitoringModel:
     effective_services = _effective_services(services_inventory)
     targets: list[MonitoringTarget] = []
     for service in effective_services:
         if service.monitoring is None:
             continue
-        # Services on dormant hosts leave the scrape set (T-091): dormancy IS
-        # the acknowledgment, so prometheus must not alert "down" on them.
+        # Dormancy is the acknowledgment (T-091): never alert "down" on it.
         if service.host in dormant_hosts:
             continue
 
@@ -2086,12 +2100,55 @@ def normalize_monitoring(
             )
         )
 
-    targets.sort(key=lambda item: item.job)
+    # Host metrics scrape by IP so the scrape set survives a DNS outage.
+    if dns_model is not None:
+        for host in dns_model.hosts_by_platform("nixos"):
+            if host.is_dormant:
+                continue
+            targets.append(
+                MonitoringTarget(
+                    job="node",
+                    target=f"{host.ip}:{NODE_EXPORTER_PORT}",
+                    metrics_path="/metrics",
+                    labels=(("host", host.name),),
+                )
+            )
+
+    targets.sort(key=lambda item: (item.job, item.target))
+    jobs: list[MonitoringJob] = []
+    for target in targets:
+        if jobs and jobs[-1].job == target.job:
+            if jobs[-1].metrics_path != target.metrics_path:
+                raise ValueError(
+                    f"monitoring job '{target.job}' is declared with two "
+                    f"metrics paths ('{jobs[-1].metrics_path}' and "
+                    f"'{target.metrics_path}'); one job scrapes one path"
+                )
+            jobs[-1] = jobs[-1].model_copy(
+                update={"targets": jobs[-1].targets + (target,)}
+            )
+        else:
+            jobs.append(
+                MonitoringJob(
+                    job=target.job,
+                    metrics_path=target.metrics_path,
+                    targets=(target,),
+                )
+            )
+
+    grafana_hosts = set(
+        _platform_hosts_from_inventory(effective_services, {"grafana"})
+    )
+    prometheus_hosts = set(
+        _platform_hosts_from_inventory(effective_services, {"prometheus"})
+    )
     return MonitoringModel(
         hosts=_platform_hosts_from_inventory(
             effective_services, {"grafana", "prometheus"}
         ),
         targets=tuple(targets),
+        jobs=tuple(jobs),
+        datasource_hosts=tuple(sorted(grafana_hosts & prometheus_hosts)),
     )
 
 

@@ -25,4 +25,12 @@ def render_monitoring(
                 {"monitoring": monitoring_model},
             )
         )
+    for host in monitoring_model.datasource_hosts:
+        files[
+            generated_dir / "monitoring" / host / "grafana-datasources.yaml"
+        ] = render_template(
+            templates_dir,
+            "monitoring/grafana-datasources.yaml.j2",
+            {"monitoring": monitoring_model},
+        )
     return files

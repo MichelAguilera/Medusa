@@ -191,6 +191,7 @@ def _load_all(
         dormant_hosts=frozenset(
             host.name for host in dns_model.hosts if host.is_dormant
         ),
+        dns_model=dns_model,
     )
     coredns_model = normalize_coredns(dns_model, services_model)
     managed_hosts_model = normalize_managed_hosts(dns_model)

@@ -235,6 +235,8 @@ class NixosHost(BaseModel):
     # resolver. Runs CoreDNS on the generated Corefile + lan.hosts, staged
     # in-generation.
     coredns: bool = False
+    # Host metrics endpoint for the fleet prometheus; None = not exported.
+    node_exporter_port: int | None = None
     # Set when this host serves NFS exports (T-096); None everywhere else.
     nfs: NixosNfsServer | None = None
     # Tunnel-routing client (T-087/D6): set when this host runs at least one

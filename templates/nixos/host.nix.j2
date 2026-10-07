@@ -201,6 +201,15 @@
   networking.firewall.allowedUDPPorts = [ 53 ];
 {% endif %}
 {% endif %}
+{% if host.node_exporter_port %}
+
+  services.prometheus.exporters.node = {
+    enable = true;
+    port = {{ host.node_exporter_port }};
+    enabledCollectors = [ "systemd" "processes" ];
+    openFirewall = true;
+  };
+{% endif %}
 {% if host.stacks or host.staged_secrets or host.deploy_configs or host.coredns %}
 
   # Staged in-generation: the sync unit materializes these into the writable
