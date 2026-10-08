@@ -71,14 +71,16 @@ class NfsServerInventory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    # Mountpoint of the ZFS pool root for this server (e.g. "/tank"). When set,
-    # Medusa auto-creates missing export paths following the operator's
+    # Mountpoints of the ZFS pool roots on this server (e.g. ["/tank"]). Under
+    # a root, Medusa auto-creates missing export paths following the operator's
     # convention: the first path segment below the pool root is provisioned as a
     # ZFS dataset, every deeper segment as a plain directory inside it. The pool
     # root dataset NAME is assumed to equal the mountpoint without its leading
     # slash (the `zpool create tank` default => dataset "tank" at "/tank"); a
-    # pool mounted somewhere other than "/<dataset>" is out of scope. When unset,
+    # pool mounted somewhere other than "/<dataset>" is out of scope. When empty,
     # export paths are created as plain directories (no dataset). See T-071.
+    zfs_roots: list[str] = Field(default_factory=list)
+    # `zfs_root: /tank` is shorthand for `zfs_roots: [/tank]`.
     zfs_root: str | None = None
 
     @field_validator("name")
@@ -103,6 +105,23 @@ class NfsServerInventory(BaseModel):
         if normalized == "/":
             raise ValueError("zfs_root cannot be the filesystem root")
         return normalized
+
+    @field_validator("zfs_roots")
+    @classmethod
+    def normalize_zfs_roots(cls, value: list[str]) -> list[str]:
+        normalized = [cls.normalize_zfs_root(item) for item in value]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("zfs_roots cannot contain duplicates")
+        return normalized
+
+    @model_validator(mode="after")
+    def fold_zfs_root_shorthand(self) -> Self:
+        if self.zfs_root is not None:
+            if self.zfs_roots:
+                raise ValueError("declare zfs_root or zfs_roots, not both")
+            self.zfs_roots = [self.zfs_root]
+            self.zfs_root = None
+        return self
 
 
 class NfsMountInventory(BaseModel):

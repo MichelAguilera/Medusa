@@ -97,15 +97,15 @@ class NixosNfsServer(BaseModel):
 
     Renders to: nfsd on the byte-identically staged exports file, the
     guarded create-only medusa-nfs-provision unit (T-071/T-085 contract;
-    ADR ZFS verb fence), and the pool import when ``zfs_pool`` is set."""
+    ADR ZFS verb fence), and the pool imports when ``zfs_pools`` is set."""
 
     model_config = ConfigDict(frozen=True)
 
     exports: tuple[NfsServerExport, ...]
-    # ZFS pool imported at boot (``boot.zfs.extraPools``), from the server's
-    # declared zfs_root by the T-071 convention (pool name = mountpoint sans
-    # leading slash). None when the server exports plain directories.
-    zfs_pool: str | None
+    # ZFS pools imported at boot (``boot.zfs.extraPools``), from the server's
+    # declared pool roots by the T-071 convention (pool name = mountpoint sans
+    # leading slash). Empty when the server exports plain directories.
+    zfs_pools: tuple[str, ...]
     # networking.hostId — the NixOS ZFS module refuses to build without it.
     # Derived deterministically from the host name so rebuilds keep the same
     # id (a changed hostid makes `zpool import` demand -f). None when no

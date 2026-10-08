@@ -176,10 +176,10 @@
   # ---- NFS export server (T-096) --------------------------------------------
   # nfsd on the generated exports file, staged in-generation (the CoreDNS
   # precedent).
-{% if host.nfs.zfs_pool %}
+{% if host.nfs.zfs_pools %}
   boot.supportedFilesystems = [ "zfs" ];
-  # Datasets carry their own mountpoints; the pool is not a fileSystems entry.
-  boot.zfs.extraPools = [ "{{ host.nfs.zfs_pool }}" ];
+  # Datasets carry their own mountpoints; the pools are not fileSystems entries.
+  boot.zfs.extraPools = [ "{{ host.nfs.zfs_pools | join('" "') }}" ];
   # Never force an import past the in-use-elsewhere check.
   boot.zfs.forceImportRoot = false;
   # ZFS module requires it; must be stable -- a changed hostid forces
@@ -265,7 +265,7 @@
     medusa-nfs-provision = {
       description = "Provision Medusa NFS export datasets and directories";
       wantedBy = [ "multi-user.target" ];
-{% if host.nfs.zfs_pool %}
+{% if host.nfs.zfs_pools %}
       # Pool imported + datasets mounted before we look.
       after = [ "zfs.target" ];
       path = [ pkgs.zfs ];

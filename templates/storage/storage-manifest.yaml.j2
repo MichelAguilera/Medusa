@@ -52,8 +52,9 @@ servers: {}
 {% endif %}
 {% if storage.zfs_roots %}
 zfs_roots:
-{% for server, root in storage.zfs_roots %}
-  {{ server }}: {{ root }}
+{# the frozen ansible role knows one pool per server #}
+{% for server, roots in storage.zfs_roots %}
+  {{ server }}: {{ roots[0] }}
 {% endfor %}
 {% else %}
 zfs_roots: {}

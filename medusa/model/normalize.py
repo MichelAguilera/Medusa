@@ -395,20 +395,20 @@ def normalize_nixos(
     }
 
     # NFS export server on NixOS (T-096).
-    zfs_root_by_server = dict(storage_model.zfs_roots)
+    zfs_roots_by_server = dict(storage_model.zfs_roots)
     nfs_by_host: dict[str, NixosNfsServer] = {}
     for server, server_exports in storage_model.exports_by_server:
         if server not in nixos_names:
             continue
-        zfs_root = zfs_root_by_server.get(server)
+        zfs_roots = zfs_roots_by_server.get(server, ())
         nfs_by_host[server] = NixosNfsServer(
             exports=server_exports,
-            zfs_pool=zfs_root.lstrip("/") if zfs_root else None,
+            zfs_pools=tuple(root.lstrip("/") for root in zfs_roots),
             # Must be stable across rebuilds: a changed hostid forces
             # `zpool import -f` (T-096).
             host_id=(
                 hashlib.sha256(server.encode()).hexdigest()[:8]
-                if zfs_root
+                if zfs_roots
                 else None
             ),
         )
@@ -1019,7 +1019,7 @@ def _external_names(resources: dict) -> tuple[str, ...]:
 
 
 def _export_path_plan(
-    path: str, zfs_root: str | None
+    path: str, zfs_roots: tuple[str, ...]
 ) -> tuple[str | None, tuple[str, ...]]:
     """Derive the (dataset, directories) provisioning plan for an export path.
 
@@ -1029,16 +1029,19 @@ def _export_path_plan(
     dataset mountpoint plus deeper dirs, or just the export path when the server
     has no pool root).
     """
-    if zfs_root is None:
+    if not zfs_roots:
         return None, (path,)
-    if path == zfs_root:
-        # The export targets the pool root itself; it already exists.
+    if path in zfs_roots:
+        # The export targets a pool root itself; it already exists.
         return None, ()
-    prefix = zfs_root + "/"
-    if not path.startswith(prefix):
+    matches = [root for root in zfs_roots if path.startswith(root + "/")]
+    if not matches:
+        formatted = ", ".join(zfs_roots)
         raise ValueError(
-            f"export path {path} is outside the declared zfs_root {zfs_root}"
+            f"export path {path} is outside the declared zfs_roots {formatted}"
         )
+    zfs_root = matches[0]
+    prefix = zfs_root + "/"
     segments = path[len(prefix):].split("/")
     dataset = f"{zfs_root.lstrip('/')}/{segments[0]}"
     directories: list[str] = []
@@ -1113,8 +1116,10 @@ def normalize_storage(
         for export in inventory.exports
     }
 
-    zfs_root_by_server = {
-        server.name: server.zfs_root for server in inventory.servers
+    zfs_roots_by_server = {
+        server.name: tuple(server.zfs_roots)
+        for server in inventory.servers
+        if server.zfs_roots
     }
 
     def _realize_mount(mount, host: str) -> NfsMount:
@@ -1135,7 +1140,7 @@ def normalize_storage(
                 type="none",
                 options=(
                     ("bind", "x-systemd.requires=zfs-mount.service")
-                    if zfs_root_by_server.get(export.server)
+                    if zfs_roots_by_server.get(export.server)
                     else ("bind",)
                 ),
                 source=export.path,
@@ -1208,7 +1213,7 @@ def normalize_storage(
             for host in client_hosts
         )
         dataset, directory_paths = _export_path_plan(
-            export.path, zfs_root_by_server.get(export.server)
+            export.path, zfs_roots_by_server.get(export.server, ())
         )
         # The export path itself converges to the declared ownership; any
         # intermediate dirs (dataset mountpoint above a deeper export) stay
@@ -1239,20 +1244,12 @@ def normalize_storage(
         for server in sorted(exports_by_server)
     )
 
-    zfs_roots_tuple = tuple(
-        sorted(
-            (server.name, server.zfs_root)
-            for server in inventory.servers
-            if server.zfs_root is not None
-        )
-    )
-
     return StorageModel(
         exports=tuple(sorted(exports.values(), key=lambda item: item.id)),
         exports_by_server=exports_by_server_tuple,
         mounts=mounts,
         mounts_by_host=mounts_by_host_tuple,
-        zfs_roots=zfs_roots_tuple,
+        zfs_roots=tuple(sorted(zfs_roots_by_server.items())),
     )
 
 

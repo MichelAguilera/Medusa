@@ -86,7 +86,7 @@ class StorageModel(BaseModel):
     exports_by_server: tuple[tuple[str, tuple[NfsServerExport, ...]], ...]
     mounts: tuple[NfsMount, ...]
     mounts_by_host: tuple[tuple[str, tuple[NfsMount, ...]], ...]
-    # (server, zfs_root mountpoint) for servers that declared a ZFS pool root.
+    # (server, pool root mountpoints) for servers that declared ZFS pools.
     # Carried into the manifest so the nfs_exports role can warn about datasets
     # under the pool root that back no declared export (T-072).
-    zfs_roots: tuple[tuple[str, str], ...] = ()
+    zfs_roots: tuple[tuple[str, tuple[str, ...]], ...] = ()
