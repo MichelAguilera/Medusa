@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-VERSION="0.44.0"
+VERSION="0.45.0"
 MEDUSA_INSTALL_REF="${MEDUSA_INSTALL_REF:-main}"
 MEDUSA_GITHUB_REPO="${MEDUSA_GITHUB_REPO:-MichelAguilera/Medusa}"
 MEDUSA_BOOTSTRAP_URL="${MEDUSA_BOOTSTRAP_URL:-https://raw.githubusercontent.com/MichelAguilera/Medusa/${MEDUSA_INSTALL_REF}/tools/bootstrap-controller.sh}"
@@ -57,6 +57,7 @@ Usage:
     medusactl deploy [--check] [--limit <pattern>]
     medusactl compose <up|down|restart|pull|list> [stack]
                       [--service <name>] [--host <pattern>] [--check] [--pull]
+    medusactl dcv [host]   (container TUI for one stack host, run on the seat)
 
   Hosts:
     medusactl add-target <name> --ip <ip> [--bootstrap-ip <addr>]
@@ -1166,6 +1167,50 @@ REMOTE
          bash -c $(printf %q "$remote")"
 }
 
+# Container TUI for one stack host. dcv runs ON the seat and reaches the
+# host's docker socket through docker's ssh:// transport over the seat's
+# fleet aliases -- the seat key stays the only credential into the fleet
+# (T-099); no workstation key reaches a host. Closed verb: dcv only.
+cmd_dcv() {
+    if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+        cat <<EOF
+medusactl dcv [host]
+
+Open dcv (docker container TUI) against one stack host. Runs on the
+controller seat, which reaches the host over its fleet ssh alias.
+Without a host, lists the hosts that carry stacks.
+
+Examples:
+  medusactl dcv
+  medusactl dcv host01
+EOF
+        return 0
+    fi
+    load_config
+    [[ $# -le 1 ]] || fail "dcv: unexpected argument '$2' (usage: medusactl dcv [host])"
+    local host="${1:-}"
+    local rows
+    rows=$(fetch_stacks | awk -F'\t' '{print $2 "\t" $5}' | sort -u) \
+        || fail "dcv: could not fetch the stack table from the controller"
+    if [[ -z "$host" ]]; then
+        echo "dcv: pick a host:" >&2
+        awk -F'\t' '{printf "  %s%s\n", $1, ($2=="dormant" ? "  (dormant)" : "")}' <<< "$rows" >&2
+        exit 2
+    fi
+    local state
+    state=$(awk -F'\t' -v h="$host" '$1==h{print $2; exit}' <<< "$rows")
+    [[ -n "$state" ]] || fail "dcv: '$host' carries no stacks (run 'medusactl dcv' for the list)"
+    [[ "$state" != "dormant" ]] || fail "dcv: '$host' is declared dormant (T-091); wake it in dns.yaml first"
+    [[ -t 0 ]] || fail "dcv requires an interactive terminal"
+    local target
+    local -a ssh_opts
+    target=$(ssh_target)
+    mapfile -t ssh_opts < <(ssh_base_opts)
+    printf "%s==>%s dcv %s\n" "$color_blue" "$color_reset" "$host" >&2
+    ssh -t "${ssh_opts[@]}" "$target" \
+        "DOCKER_HOST=ssh://$(printf %q "$host") exec dcv"
+}
+
 cmd_compose() {
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" || -z "${1:-}" ]]; then
         cat <<EOF
@@ -2205,7 +2250,7 @@ _medusactl_complete() {
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    commands="status controller-status shell check render deploy compose add-target install-nixos-target build-installer lock-update remove-target promote-target list-targets repin-target update self-update completion ssh-disconnect undo history uninstall config version diff commit push publish discard"
+    commands="status controller-status shell check render deploy compose dcv add-target install-nixos-target build-installer lock-update remove-target promote-target list-targets repin-target update self-update completion ssh-disconnect undo history uninstall config version diff commit push publish discard"
 
     if [[ "$COMP_CWORD" -eq 1 ]]; then
         COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -2259,6 +2304,7 @@ _medusactl() {
         'deploy:render and reconcile the fleet'
         'compose:bring managed Compose stacks up or down'
         'add-target:add a host to inventory'
+        'dcv:open the dcv container TUI on a stack host (via the seat)'
         'install-nixos-target:first-time NixOS install via nixos-anywhere'
         'build-installer:build the installer ISO on the seat'
         'remove-target:strip a host from inventory'
@@ -2343,6 +2389,7 @@ complete -c medusactl -n '__fish_use_subcommand' -a 'check' -d 'Run medusa check
 complete -c medusactl -n '__fish_use_subcommand' -a 'render' -d 'Run medusa render on the controller'
 complete -c medusactl -n '__fish_use_subcommand' -a 'deploy' -d 'Run controller deployment'
 complete -c medusactl -n '__fish_use_subcommand' -a 'compose' -d 'Bring managed Compose stacks up or down'
+complete -c medusactl -n '__fish_use_subcommand' -a 'dcv' -d 'Open the dcv container TUI on a stack host'
 complete -c medusactl -n '__fish_use_subcommand' -a 'add-target' -d 'Add a host to inventory and apply bootstrap blocks'
 complete -c medusactl -n '__fish_use_subcommand' -a 'remove-target' -d 'Strip a host from inventory + bootstrap blocks'
 complete -c medusactl -n '__fish_use_subcommand' -a 'promote-target' -d 'Clear bootstrap_ip so the host drops out of /etc/hosts'
@@ -2734,6 +2781,10 @@ case "${1:-}" in
     compose)
         shift
         cmd_compose "$@"
+        ;;
+    dcv)
+        shift
+        cmd_dcv "$@"
         ;;
     install-nixos-target)
         shift
